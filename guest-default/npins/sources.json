@@ -1,0 +1,31 @@
+{
+  "pins": {
+    "llm-agents.nix": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "numtide",
+        "repo": "llm-agents.nix"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "26c3794de36bba9afdb0cb269fa4ab390e09f9ca",
+      "url": "https://github.com/numtide/llm-agents.nix/archive/26c3794de36bba9afdb0cb269fa4ab390e09f9ca.tar.gz",
+      "hash": "sha256-rqeK3hPxa6960ivXTRb+wO74tKKecqeH2CiKIxxFJuU="
+    },
+    "nixpkgs": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "NixOS",
+        "repo": "nixpkgs"
+      },
+      "branch": "nixos-unstable",
+      "submodules": false,
+      "revision": "3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2",
+      "url": "https://github.com/NixOS/nixpkgs/archive/3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2.tar.gz",
+      "hash": "sha256-bc7rSpXIdn9QWGNqfWcPZWOhEVF8NoeAZkWq0XWnf/k="
+    }
+  },
+  "version": 8
+}

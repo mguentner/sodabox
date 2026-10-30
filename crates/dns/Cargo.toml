@@ -1,0 +1,11 @@
+[package]
+name = "sodabox-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sodabox-common.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

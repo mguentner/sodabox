@@ -1,0 +1,12 @@
+# sodabox vendor profile — MANAGED BY SODABOX. Do not edit: sodabox overwrites
+# this file whenever it differs from the copy shipped with the binary. To
+# customise, copy it to a new name in this dir and apply that profile instead.
+#
+# Applying a profile copies its rules into the VM's policy.toml, so later
+# changes here don't affect VMs it was already applied to.
+description = "GitHub: web, API and git over HTTPS/SSH"
+
+[[rules]]
+kind = "domain"
+name = "github.com"
+scope = "subdomains"
