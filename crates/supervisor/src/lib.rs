@@ -1,4 +1,4 @@
-//! Per-VM supervisor (ADR-0007). No central daemon: `sodabox start <vm>` spawns
+//! Per-VM supervisor (ADR-0007). No central daemon: `soda start <vm>` spawns
 //! one of these, which creates and owns the user+network namespace (spike
 //! 0002), launches cloud-hypervisor (spike 0001:
 //! docs/spikes/0001-rootless-chv-boot.md) + passt + the in-process filter proxy

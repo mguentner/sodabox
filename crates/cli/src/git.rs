@@ -1,6 +1,6 @@
 //! Git-native host↔guest sync (ADR-0013): the host's own `git` treats a VM as
 //! a plain remote via git's `ext::` helper, routed through the same hardened
-//! SSH identity as `sodabox ssh`/sync (ADR-0011). `sodabox git-remote`
+//! SSH identity as `soda ssh`/sync (ADR-0011). `soda git-remote`
 //! configures the remote; push/pull are plain, unwrapped `git push <vm>` /
 //! `git pull <vm>` — no confirm/dry-run layer (ADR-0013: git's own
 //! non-fast-forward + `updateInstead` refusals already cover what rsync's
@@ -18,7 +18,7 @@ use sodabox_common::ssh::{hardened_ssh_opts, ssh_bin, tool_key_path, SshEndpoint
 /// sodabox itself (git supplies it).
 const ALLOWED_SERVICES: [&str; 2] = ["git-upload-pack", "git-receive-pack"];
 
-/// `sodabox git-proxy`: build the ssh argv and `exec()` it — git-remote-ext
+/// `soda git-proxy`: build the ssh argv and `exec()` it — git-remote-ext
 /// has already wired this process's stdio straight to the local `git`
 /// process, so exec splices it into the ssh session (same pattern as
 /// `ssh::run`).
@@ -61,7 +61,7 @@ fn build_proxy_argv(vm: &str, ep: &SshEndpoint, user: &str, service: &str) -> Ve
     argv
 }
 
-/// `sodabox git-remote`: configure (add/repoint) or remove the cwd repo's
+/// `soda git-remote`: configure (add/repoint) or remove the cwd repo's
 /// `<vm>` remote. Idempotent — see `plan_remote_write`.
 pub fn git_remote(vm: &str, user: &str, force: bool, remove: bool) -> anyhow::Result<()> {
     if remove {
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn plan_remote_write_covers_all_branches() {
-        let desired = "ext::sodabox git-proxy web --user root";
+        let desired = "ext::soda git-proxy web --user root";
         assert!(matches!(
             plan_remote_write(None, desired, false),
             RemoteAction::Add

@@ -1,6 +1,6 @@
 //! Detaching a background supervisor from the launching shell.
 //!
-//! ADR-0007 makes background start the default: `sodabox start <vm>` should spawn
+//! ADR-0007 makes background start the default: `soda start <vm>` should spawn
 //! the per-VM supervisor and return, leaving it running independently of the
 //! terminal. We do that in-process: [`daemonize`] forks once, `setsid`s the child
 //! into its own session (so a terminal hang-up won't kill it) and points its stdin

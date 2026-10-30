@@ -63,7 +63,7 @@ pub fn build_guest(guest_dir: &Path) -> anyhow::Result<BuiltGuest> {
     }
     if !guest_dir.join("configuration.nix").is_file() {
         anyhow::bail!(
-            "no guest configuration at {} — run `sodabox create` first",
+            "no guest configuration at {} — run `soda create` first",
             guest_dir.display()
         );
     }

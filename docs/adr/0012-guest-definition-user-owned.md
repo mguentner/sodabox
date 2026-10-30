@@ -102,10 +102,10 @@ the launch live in sodabox's flake + Rust.*
 
 ### VM creation flow
 
-- `sodabox create <vm>` — write the per-VM data dir (`data.img`, `policy.toml`,
+- `soda create <vm>` — write the per-VM data dir (`data.img`, `policy.toml`,
   `meta.toml`, ADR-0008) and, if absent, materialize the **default guest input**
   (`configuration.nix` + `npins`) into the config dir. Never overwrites user edits.
-- `sodabox start <vm>` — resolve the guest input dir (per-VM override else shared
+- `soda start <vm>` — resolve the guest input dir (per-VM override else shared
   default) → run sodabox's build function → get `{ kernel, store }` → supervisor
   brings up the netns/chv/passt/proxy/DNS and boots the VM.
 

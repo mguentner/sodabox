@@ -19,7 +19,7 @@ pub fn runtime_dir(vm: &str) -> PathBuf {
 
 /// `$XDG_RUNTIME_DIR/sodabox/<vm>/ssh.endpoint` — the live `host:port` the SSH
 /// forward listens on (ADR-0011). Written by the supervisor once the
-/// host-loopback listener is bound; read by `sodabox ssh`/`sync`.
+/// host-loopback listener is bound; read by `soda ssh`/`sync`.
 pub fn ssh_endpoint_path(vm: &str) -> PathBuf {
     runtime_dir(vm).join("ssh.endpoint")
 }
@@ -105,7 +105,7 @@ pub fn data_dir(vm: &str) -> PathBuf {
 }
 
 /// `$XDG_DATA_HOME/sodabox/<vm>/events.log` — the persisted event stream for
-/// post-hoc audit and `sodabox logs` (ADR-0009). Lives in the
+/// post-hoc audit and `soda logs` (ADR-0009). Lives in the
 /// persistent data dir (not the wiped runtime dir) so it survives VM restarts;
 /// newline-delimited JSON [`crate::event::Event`] records.
 pub fn event_log_path(vm: &str) -> PathBuf {

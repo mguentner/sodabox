@@ -135,7 +135,7 @@
   # The data disk (ADR-0008/0011): the guest's third virtio-blk
   # device (/dev/vdc, RW), mounted at /persistent. It carries the writable-store
   # upper (`nix-store/`) and the sync work tree (`work/project`,
-  # sodabox sync-vm/sync-host). The host provisions it as a blank sparse raw file
+  # soda sync-vm/sync-host). The host provisions it as a blank sparse raw file
   # — once for a `full` VM, at every start for a `home`/`none` VM, whose data disk
   # is scratch (ADR-0014) — so it may carry no filesystem: `x-systemd.makefs`
   # makes systemd mkfs it (ext4) when blank, and otherwise just mounts it.
@@ -234,7 +234,7 @@
 
   # Log in *into the work tree*, not into $HOME: /var/work is where the user's
   # project lives, and /root is now just where tool state happens to sit. Login
-  # shells only (/etc/profile), which covers `sodabox ssh` and the serial console
+  # shells only (/etc/profile), which covers `soda ssh` and the serial console
   # autologin; `ssh <vm> -- cmd` and rsync's non-login shell are untouched — which
   # matters, because a profile that emits output breaks rsync (a bare `cd` emits
   # none).

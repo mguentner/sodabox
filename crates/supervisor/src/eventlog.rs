@@ -2,7 +2,7 @@
 //!
 //! Every [`Event`] broadcast on a VM's live stream is also appended to a
 //! newline-delimited JSON log under the persistent data dir
-//! ([`paths::event_log_path`]) so `sodabox logs <vm>` can show the history for
+//! ([`paths::event_log_path`]) so `soda logs <vm>` can show the history for
 //! post-hoc audit after the VM (and its runtime dir) are gone.
 //!
 //! The writer is a plain broadcast subscriber like the TUI: it drains the same

@@ -189,7 +189,7 @@ impl Rule {
 
 /// Header written into a freshly-created `policy.toml`.
 pub const POLICY_HEADER: &str =
-    "# sodabox egress policy (deny-by-default). Edit via `sodabox allow/deny/policy edit`.\n\
+    "# sodabox egress policy (deny-by-default). Edit via `soda allow/deny/policy edit`.\n\
      # `version` is managed automatically — it bumps on every change.\n";
 
 /// `policy.toml` as a format-preserving document (ADR-0006, ADR-0015).

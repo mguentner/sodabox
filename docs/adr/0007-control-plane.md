@@ -15,7 +15,7 @@ CLI is another.
 
 ## Decision
 
-**No central daemon.** `sodabox start <vm>` spawns a **per-VM supervisor
+**No central daemon.** `soda start <vm>` spawns a **per-VM supervisor
 process** that owns that VM's entire runtime — the network namespace,
 cloud-hypervisor, passt, the filter proxy, and the DNS filter — and exposes a
 **per-VM control + event unix socket**. The CLI and TUI are thin clients that
@@ -26,7 +26,7 @@ connect to that socket. Multiple VMs = multiple independent supervisors.
 ### Process tree (per VM)
 
 ```
-sodabox start vm1
+soda start vm1
    └─ supervisor(vm1)                      # long-lived, owns the userns+netns
         ├─ cloud-hypervisor(vm1)
         ├─ passt(vm1)          (in netns)
@@ -48,7 +48,7 @@ sodabox start vm1
   console socket, passt/chv sockets.
 - Persistent state under `$XDG_DATA_HOME/sodabox/<vm>/`: disk image, policy,
   metadata ([ADR-0008](0008-persistent-storage.md)).
-- `sodabox ls` enumerates VMs by scanning these dirs and probing sockets.
+- `soda ls` enumerates VMs by scanning these dirs and probing sockets.
 
 ### Control protocol
 

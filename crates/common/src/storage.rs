@@ -1,7 +1,7 @@
 //! Per-VM persistent data disk (ADR-0008).
 //!
 //! The data disk is a plain, user-owned **sparse raw** file — no loop devices,
-//! no LVM, no qcow2. It is created at `sodabox create` with a user-specified
+//! no LVM, no qcow2. It is created at `soda create` with a user-specified
 //! size, attached read-write over virtio-blk by the supervisor (via
 //! `chv::Disk::data`), and can be grown later. Being sparse, an 8G disk that is
 //! mostly empty costs only its actually-written blocks on the host.

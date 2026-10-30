@@ -120,7 +120,7 @@ pub enum Serial {
     Stdio,
     /// Append the console to a file (default for a backgrounded VM).
     File(PathBuf),
-    /// Expose the console on a unix socket (for `sodabox tui`/attach).
+    /// Expose the console on a unix socket (for `soda tui`/attach).
     Socket(PathBuf),
     /// Discard console output.
     Null,
@@ -284,12 +284,12 @@ impl Chv {
                     Ok(status) => return status,
                     Err(_) => {
                         eprintln!(
-                            "sodabox: guest did not power off within {}s of ACPI power-button; forcing",
+                            "soda: guest did not power off within {}s of ACPI power-button; forcing",
                             grace.as_secs()
                         );
                     }
                 },
-                Err(e) => eprintln!("sodabox: ACPI power-off failed ({e}); forcing"),
+                Err(e) => eprintln!("soda: ACPI power-off failed ({e}); forcing"),
             }
         }
         crate::proc::graceful_shutdown(&mut self.child, grace).await

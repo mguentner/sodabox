@@ -89,7 +89,7 @@
                 mkdir -p $out/share/sodabox
                 cp -r ${./nix/guest} $out/share/sodabox/guest
 
-                wrapProgram $out/bin/sodabox \
+                wrapProgram $out/bin/soda \
                   --set-default SODABOX_GUEST_NIX_DIR    $out/share/sodabox/guest \
                   --set-default SODABOX_CLOUD_HYPERVISOR ${getExe pkgs.cloud-hypervisor} \
                   --set-default SODABOX_CH_REMOTE        ${getExe' pkgs.cloud-hypervisor "ch-remote"} \
@@ -111,7 +111,7 @@
 
             meta = with pkgs.lib; {
               description = "Rootless microVM sandbox with deny-by-default egress";
-              mainProgram = "sodabox";
+              mainProgram = "soda";
               platforms = platforms.linux;
             };
           };
@@ -123,7 +123,7 @@
         system: _pkgs: rec {
           sodabox = {
             type = "app";
-            program = "${self.packages.${system}.sodabox}/bin/sodabox";
+            program = "${self.packages.${system}.sodabox}/bin/soda";
           };
           default = sodabox;
         }

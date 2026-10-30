@@ -30,17 +30,17 @@ that `subscribe`s to a VM's event stream and renders it live.
 ### CLI surface (initial)
 
 ```
-sodabox create <vm> [--cpus N --mem M --disk SIZE]
-sodabox start <vm> [--foreground]
-sodabox stop <vm>
-sodabox ls
-sodabox allow ip <cidr> [--ports …] [--vm <vm>]
-sodabox allow domain <name> [--exact|--wildcard] [--vm <vm>]
-sodabox deny <rule>
-sodabox policy show|edit
-sodabox tui <vm>          # live monitor
-sodabox logs <vm>
-sodabox rm <vm> [--keep-disk]
+soda create <vm> [--cpus N --mem M --disk SIZE]
+soda start <vm> [--foreground]
+soda stop <vm>
+soda ls
+soda allow ip <cidr> [--ports …] [--vm <vm>]
+soda allow domain <name> [--exact|--wildcard] [--vm <vm>]
+soda deny <rule>
+soda policy show|edit
+soda tui <vm>          # live monitor
+soda logs <vm>
+soda rm <vm> [--keep-disk]
 ```
 
 ### TUI (ratatui)
@@ -67,7 +67,7 @@ Event =
   | Lifecycle{ ts, state }
 ```
 
-- Events are also written to a per-VM log for `sodabox logs` and post-hoc audit.
+- Events are also written to a per-VM log for `soda logs` and post-hoc audit.
 
 ## Consequences
 
@@ -77,7 +77,7 @@ Event =
 - **Negative / costs:** TUI work is non-trivial; must handle backpressure/volume
   on busy VMs (bounded ring buffers, sampling).
 - **Risks & open questions:**
-  - Cross-VM overview (a top-level `sodabox tui` with no VM arg) fans out over
+  - Cross-VM overview (a top-level `soda tui` with no VM arg) fans out over
     all sockets — define layout later.
   - Event volume/rate limiting under a chatty or hostile guest.
 

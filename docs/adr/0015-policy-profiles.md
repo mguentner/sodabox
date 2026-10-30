@@ -9,7 +9,7 @@
 
 Most VMs run one or more coding agents, and each agent needs the same few
 endpoints: Claude Code needs `api.anthropic.com` plus its login hosts, Mistral
-tools need `api.mistral.ai`, and so on. Typing these in with `sodabox allow` for
+tools need `api.mistral.ai`, and so on. Typing these in with `soda allow` for
 every VM is tedious and error-prone, and the resulting `policy.toml` doesn't
 record why a rule is there. The policy must stay auditable: looking at one VM's
 `policy.toml` should show exactly what that VM may reach, and why.
@@ -20,7 +20,7 @@ A **profile** is a named set of allow rules in
 `$XDG_CONFIG_HOME/sodabox/profiles/<name>.toml`. sodabox ships **vendor**
 profiles and keeps them current there. Users add their own files next to them.
 Profiles are **merged into** a VM's `policy.toml`, at `create --profiles a,b` or
-later with `sodabox profile add a,b`. Each merged rule is preceded by a
+later with `soda profile add a,b`. Each merged rule is preceded by a
 `# from profile '<name>'` comment. All policy edits preserve comments, so that
 provenance survives later edits.
 
@@ -61,7 +61,7 @@ proto = "tcp"
   file that is missing or differs from the shipped copy is rewritten atomically,
   and a warning is printed if local changes were discarded. Each file's header
   says so and tells the user to copy it under a new name to customise it.
-- A user file with a vendor name is overwritten. `sodabox profile ls` labels each
+- A user file with a vendor name is overwritten. `soda profile ls` labels each
   profile `vendor` or `user`. A vendor profile a later release stops shipping is
   left in place, since it can't be told apart from a user file.
 
@@ -79,7 +79,7 @@ proto = "tcp"
   unknown profile creates nothing. `create --profiles` on a VM that already has a
   `policy.toml` is an error pointing at `profile add`.
 - `profile add` goes through the same persist-then-push-live path as
-  `sodabox allow`: version bump, `PolicySet` to a running supervisor.
+  `soda allow`: version bump, `PolicySet` to a running supervisor.
 - **Snapshot semantics:** a VM's policy holds copies of the rules. Changing or
   updating a profile later doesn't affect VMs it was already applied to. That's
   what keeps each `policy.toml` a complete, self-contained record.
@@ -107,10 +107,10 @@ The config dir holds one `<vm>/` per VM next to the shared `guest/` and
 ### CLI
 
 ```
-sodabox create <vm> --profiles claudecode,mistral
-sodabox profile ls
-sodabox profile show <name>
-sodabox profile add <name>[,<name>…] [--vm <vm>]
+soda create <vm> --profiles claudecode,mistral
+soda profile ls
+soda profile show <name>
+soda profile add <name>[,<name>…] [--vm <vm>]
 ```
 
 ## Consequences

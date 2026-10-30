@@ -1,6 +1,6 @@
 # This VM's guest configuration — this file is YOURS (ADR-0012).
 #
-# `sodabox create` writes it once per VM, to <config-dir>/<vm>/guest/, and never
+# `soda create` writes it once per VM, to <config-dir>/<vm>/guest/, and never
 # rewrites it. It layers on top of the shared guest configuration, so:
 #
 #   - "all VMs" settings go in the shared <config-dir>/guest/configuration.nix
@@ -13,6 +13,6 @@
 {
   imports = [ ../../guest/configuration.nix ];
 
-  # Chosen by `sodabox create --hostname name|static|random`; edit freely.
+  # Chosen by `soda create --hostname name|static|random`; edit freely.
   networking.hostName = "@HOSTNAME@";
 }

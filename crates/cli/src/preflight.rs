@@ -1,4 +1,4 @@
-//! `sodabox preflight` (ADR-0010): check the two hard host prerequisites —
+//! `soda preflight` (ADR-0010): check the two hard host prerequisites —
 //! access to `/dev/kvm` (ADR-0002) and the ability to create unprivileged
 //! user + network namespaces (ADR-0004) — plus report the bundled helper tools.
 //!
@@ -27,7 +27,7 @@ pub fn probe_namespaces() -> i32 {
 }
 
 pub fn run() -> anyhow::Result<()> {
-    println!("sodabox preflight — host prerequisites\n");
+    println!("soda preflight — host prerequisites\n");
     let mut ok = true;
     ok &= check_kvm();
     ok &= check_namespaces();

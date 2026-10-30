@@ -1,4 +1,4 @@
-//! `sodabox tui <vm>` — live terminal monitor (ADR-0009).
+//! `soda tui <vm>` — live terminal monitor (ADR-0009).
 //!
 //! Built on a control-socket `subscribe`, a ratatui render loop and bounded
 //! buffers for backpressure, it shows four panels:
@@ -12,7 +12,7 @@
 //! (`Tab` switches panels, `↑`/`↓` move it), and `a`/`Enter` allows the
 //! highlighted **blocked** destination on the spot — an egress `BLOCK` becomes
 //! an `ip` allow of its dst, a DNS `REFUSED` becomes a `domain` allow of its
-//! name. Like `sodabox allow`, that edits `policy.toml` and pushes the whole new
+//! name. Like `soda allow`, that edits `policy.toml` and pushes the whole new
 //! policy via `PolicySet` (the supervisor rejects raw single-rule edits so the
 //! CLI stays the sole writer of `policy.toml`); the result shows in the footer.
 //! While a row is held the panel is frozen on it: new events land below the
@@ -541,7 +541,7 @@ fn strip_trailing_dot(name: &str) -> String {
     name.strip_suffix('.').unwrap_or(name).to_string()
 }
 
-/// `sodabox tui <vm>` entry point. Builds a small runtime, connects + subscribes,
+/// `soda tui <vm>` entry point. Builds a small runtime, connects + subscribes,
 /// then runs the render loop until the user quits.
 pub fn run(vm: &str) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -568,7 +568,7 @@ pub fn run(vm: &str) -> anyhow::Result<()> {
         let client = match ControlClient::connect(vm).await {
             Ok(c) => c,
             Err(e) => anyhow::bail!(
-                "cannot connect to '{vm}' — is it running? (`sodabox start {vm} --net`): {e}"
+                "cannot connect to '{vm}' — is it running? (`soda start {vm} --net`): {e}"
             ),
         };
         let (ack, stream) = client.subscribe().await?;
@@ -619,7 +619,7 @@ async fn fetch_policy(vm: &str) -> Option<VmPolicy> {
 
 /// Apply a quick-action: add `target` to `vm`'s persisted policy, validate,
 /// version-bump, save `policy.toml`, and push the whole new policy live via
-/// `PolicySet` — the same edit-then-push path as `sodabox allow`, so the file and
+/// `PolicySet` — the same edit-then-push path as `soda allow`, so the file and
 /// the live allowlist never split-brain. Returns the new policy (so the panel can
 /// refresh without a round trip) and a human summary. An add that duplicates an
 /// existing rule short-circuits with no version bump.
@@ -679,7 +679,7 @@ fn save_bumped(vm: &str, file: &mut PolicyFile) -> anyhow::Result<VmPolicy> {
 /// Apply a deny quick-action: remove every rule matching `spec` from
 /// `vm`'s persisted policy, validate, version-bump, save `policy.toml`, and push
 /// the whole new policy live via `PolicySet` — the same edit-then-push path as
-/// `sodabox deny`, so the file and the live allowlist never split-brain (the live
+/// `soda deny`, so the file and the live allowlist never split-brain (the live
 /// swap also purges a removed domain's ephemerals). Returns the new policy
 /// (so the panel refreshes without a round trip) and a human summary. A `spec`
 /// that matches nothing short-circuits with no version bump.

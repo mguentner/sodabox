@@ -87,7 +87,7 @@ per kind of persisted state; the root filesystem itself stays tmpfs:
 
 - **raw, sparse** by default (overhead = blocks actually written); qcow2 optional
   where snapshots/backing files are wanted. cloud-hypervisor supports both.
-- Created at `sodabox create` with a user-specified size; the file is sparse so a
+- Created at `soda create` with a user-specified size; the file is sparse so a
   large logical size costs little until used. Resizable later.
 - Rootless: a plain file owned by the user; no loop devices, LVM, or privileged
   block setup.
@@ -143,7 +143,7 @@ per kind of persisted state; the root filesystem itself stays tmpfs:
 
 ### Lifecycle
 
-- `sodabox rm <vm>` removes runtime + data (confirm); `--keep-disk` retains data.
+- `soda rm <vm>` removes runtime + data (confirm); `--keep-disk` retains data.
 - A running VM holds a lockfile on its `data.img` so two supervisors can't attach
   the same image.
 - At-rest encryption of `data.img` deferred to a future ADR.

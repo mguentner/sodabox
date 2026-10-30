@@ -74,7 +74,7 @@ impl Profile {
         let path = paths::profile_path(name);
         let text = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
-                format!("no such profile '{name}' (see `sodabox profile ls`)")
+                format!("no such profile '{name}' (see `soda profile ls`)")
             }
             _ => format!("reading {}: {e}", path.display()),
         })?;

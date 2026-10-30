@@ -1,7 +1,7 @@
-//! `sodabox cp <src> <dst>` — copy individual files between the host and a VM.
+//! `soda cp <src> <dst>` — copy individual files between the host and a VM.
 //!
 //! Exactly one side is `<vm>:<path>`. Shells out to the system `scp` with the
-//! same hardened, pinned-identity option set as `sodabox ssh` and sync
+//! same hardened, pinned-identity option set as `soda ssh` and sync
 //! ([`sodabox_common::ssh::hardened_ssh_opts`], ADR-0011). Whole-tree transfer
 //! stays with `sync-vm`/`sync-host`; this is for the odd single file. Relative
 //! guest paths resolve against the guest work dir, not the login user's home.
@@ -113,7 +113,7 @@ fn pull_target(remote_path: &str, dst: &Path) -> PathBuf {
     }
 }
 
-/// `sodabox cp`: copy `src` to `dst`, one of which is `<vm>:<path>`, as `user`.
+/// `soda cp`: copy `src` to `dst`, one of which is `<vm>:<path>`, as `user`.
 /// Replaces this process with `scp`.
 pub fn run(src: &str, dst: &str, user: &str, recursive: bool, yes: bool) -> anyhow::Result<()> {
     let is_vm = |n: &str| VmMeta::path(n).is_file();

@@ -1,6 +1,6 @@
-//! `sodabox sync-vm` / `sodabox sync-host` (ADR-0011).
+//! `soda sync-vm` / `soda sync-host` (ADR-0011).
 //!
-//! File sync is `rsync` over the *same* hardened SSH transport as `sodabox ssh`
+//! File sync is `rsync` over the *same* hardened SSH transport as `soda ssh`
 //! ([`sodabox_common::ssh::ssh_rsh_command`]). It is deliberately **asymmetric**
 //! and **delete-free** so a hostile or messy guest can never silently trash the
 //! host:
@@ -68,7 +68,7 @@ fn exclude_args(patterns: &[String]) -> Vec<OsString> {
         .collect()
 }
 
-/// `sodabox sync-vm`: push the host cwd into the guest work dir. No confirmation
+/// `soda sync-vm`: push the host cwd into the guest work dir. No confirmation
 /// (the source is the user's own tree); `.git` is included.
 pub fn sync_vm(args: &SyncArgs) -> anyhow::Result<()> {
     let remote = Remote::resolve(args)?;
@@ -87,7 +87,7 @@ pub fn sync_vm(args: &SyncArgs) -> anyhow::Result<()> {
     run_rsync(&argv)
 }
 
-/// `sodabox sync-host`: pull the guest work dir into the host cwd, carefully.
+/// `soda sync-host`: pull the guest work dir into the host cwd, carefully.
 pub fn sync_host(args: &SyncArgs) -> anyhow::Result<()> {
     let remote = Remote::resolve(args)?;
 

@@ -25,7 +25,7 @@ pub fn git_bin() -> OsString {
 /// own, so the placeholder must be given explicitly.
 pub fn remote_ext_url(vm: &str, user: &str) -> String {
     format!(
-        "ext::sodabox git-proxy {} --user {} %S",
+        "ext::soda git-proxy {} --user {} %S",
         remote_ext_escape(vm),
         remote_ext_escape(user)
     )
@@ -45,7 +45,7 @@ mod tests {
     #[test]
     fn remote_ext_url_carries_vm_and_user_and_ends_with_service_placeholder() {
         let url = remote_ext_url("web", "dev");
-        assert_eq!(url, "ext::sodabox git-proxy web --user dev %S");
+        assert_eq!(url, "ext::soda git-proxy web --user dev %S");
     }
 
     #[test]

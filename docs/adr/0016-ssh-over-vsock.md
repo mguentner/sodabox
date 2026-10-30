@@ -23,7 +23,7 @@ pieces:
 
 The port also leaks into git. A remote can't hard-code a port the supervisor
 owns, so [ADR-0013](0013-git-sync.md) routes git through
-`ext::sodabox git-proxy <vm> …`, which looks up the endpoint again on every
+`ext::soda git-proxy <vm> …`, which looks up the endpoint again on every
 push and fetch.
 
 cloud-hypervisor supports virtio-vsock in "hybrid" mode: the device is backed by
@@ -66,7 +66,7 @@ Host sodabox-<vm>
   # ... hardened_ssh_opts, pinned identity, known_hosts ...
 ```
 
-`sodabox git-remote` then sets an ordinary remote,
+`soda git-remote` then sets an ordinary remote,
 `sodabox-<vm>:/var/work/project`, and `git-proxy` and the `ext::` URL go away.
 If the VM is down, the error still comes from the ProxyCommand ("socket not
 found"), not a connection refused on some port.
@@ -81,7 +81,7 @@ found"), not a connection refused on some port.
   - git remotes are plain `ssh` remotes that other tools understand.
 - **Negative / costs:**
   - a ProxyCommand is still needed for the hybrid-vsock handshake;
-  - existing `ext::sodabox git-proxy` remotes need migrating (`git-remote` can
+  - existing `ext::soda git-proxy` remotes need migrating (`git-remote` can
     rewrite them, but today it refuses to replace a different URL without
     `--force`, so the old `ext::` form needs to be recognised as safe to replace);
   - the generated ssh_config fragment has to be kept current and included.

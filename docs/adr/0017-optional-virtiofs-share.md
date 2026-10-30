@@ -32,7 +32,7 @@ rsync and git stay the default transports.
 
 ## Details
 
-- **Configuration:** `sodabox create <vm> --share <hostdir>[:ro|:rw]`, stored in
+- **Configuration:** `soda create <vm> --share <hostdir>[:ro|:rw]`, stored in
   `meta.toml`. With no `--share`, nothing changes: no virtiofsd, no shared
   memory.
 - **Host:** the supervisor runs one rootless virtiofsd per VM
@@ -51,7 +51,7 @@ rsync and git stay the default transports.
     canonicalised before they're checked.
   - The default is read-only, so the guest can't write to the host without an
     explicit `:rw`.
-  - `sodabox ls` and `status` show when a share is active, and whether it's
+  - `soda ls` and `status` show when a share is active, and whether it's
     read-write.
 
 ## Consequences

@@ -25,7 +25,7 @@ the read-only config disk, which is rebuilt at every launch (ADR-0011).
 ## Decision
 
 A **collection** is a folder under `$XDG_CONFIG_HOME/sodabox/dotfiles/<name>/`
-holding files for `/root`. `sodabox create <vm> --dotfiles a,b` merges the
+holding files for `/root`. `soda create <vm> --dotfiles a,b` merges the
 named collections in order and copies the result into the VM's data dir (later
 collections win, and every conflict prints a warning). Every start ships that
 copy to the guest on the config disk. A guest service copies it into `/root`

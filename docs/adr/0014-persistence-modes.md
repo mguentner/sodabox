@@ -30,7 +30,7 @@ them.
 
 Every VM gets **two read-write disks with a fixed guest layout**: the data disk
 and a small home disk. A per-VM `persist` mode (`full` | `home` | `none`, set
-at `sodabox create --persist`) decides which of them are **kept** and which are
+at `soda create --persist`) decides which of them are **kept** and which are
 **scratch**. A scratch disk is a fresh sparse file made at every start and
 deleted at stop.
 
@@ -123,7 +123,7 @@ at start.
 - **Risks & open questions:**
   - Changing the mode of an existing VM isn't supported (recreate it).
   - Scratch disks left by a supervisor crash are only reclaimed at that VM's
-    next start or by `sodabox rm`.
+    next start or by `soda rm`.
 
 *Verified live on KVM (2026-10-21):*
 - `home` keeps `/root` across a restart, drops `/var/work` and store-overlay

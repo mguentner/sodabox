@@ -34,10 +34,10 @@ delete-free.
 - **Tool-owned key.** An ed25519 keypair at `$XDG_DATA_HOME/sodabox/sodabox_ed25519`
   (private key host-only, never mounted into a VM), reused across instances. Its
   public key is the **only** entry in each guest's `authorized_keys`, so
-  `sodabox ssh` works out of the box and no other identity can log in.
+  `soda ssh` works out of the box and no other identity can log in.
 - **No user keys.** The user's own keys (`~/.ssh/*.pub`, agent identities) are
   never injected, and there is no per-instance override: access to a guest goes
-  through `sodabox ssh`, i.e. the tool key.
+  through `soda ssh`, i.e. the tool key.
 - **Delivery — read-only config disk.** The `authorized_keys` file is
   written into a small **read-only erofs image built at launch** (the *config
   disk*) and attached as the guest's **second** virtio-blk disk (`/dev/vdb`,
@@ -63,7 +63,7 @@ delete-free.
   The live `host:port` is written to the instance runtime dir
   (`ssh.endpoint`) for the CLI to read, and removed on teardown.
 - **Port assignment — state, not a per-boot choice.** Each VM's host-loopback
-  port is **allocated once at `sodabox create` and stored in its `meta.toml`**
+  port is **allocated once at `soda create` and stored in its `meta.toml`**
   (`ssh_port`), from the range **`3522..3585`** (above the crowded 2000–3000
   band the old `2222` base sat in). The allocator is the lowest port in that
   range no *other* VM's `meta.toml` claims — DHCP-like, minus the lease: there
@@ -120,14 +120,14 @@ delete-free.
 SSH is **inbound** (host → guest); it does **not** traverse the egress allowlist
 or the per-VM filter proxy ([ADR-0004](0004-egress-enforcement.md)), which govern
 **guest → outside**. passt delivers the forwarded connection to the guest and the
-guest's replies ride back on that established flow. So `sodabox ssh` and sync work
+guest's replies ride back on that established flow. So `soda ssh` and sync work
 **regardless of egress policy — including `network none`** — which is exactly how
 a locked-down VM is still reachable/operable.
 
 ### File sync
 
 - **Transport:** `rsync -e "ssh <the hardened opts above>"` — no extra setup,
-  same identity as `sodabox ssh` (one builder, `ssh_rsh_command`). Requires
+  same identity as `soda ssh` (one builder, `ssh_rsh_command`). Requires
   `rsync` on both host and guest (pinned host-side, in the guest's base module).
 - **Work dir.** The user-owned persistent disk (`/dev/vdc`) is a blank
   sparse raw file at `create`; the base guest module mounts it at `/persistent`
@@ -142,9 +142,9 @@ a locked-down VM is still reachable/operable.
   `/root/work` mount point; the `/persistent` + `/var/work` layout is unverified
   until the next guest rebuild and relaunch.*
 - **Asymmetric by design:**
-  - `sodabox sync-vm` — push host cwd → the guest work dir. **No confirmation**:
+  - `soda sync-vm` — push host cwd → the guest work dir. **No confirmation**:
     the source is the user's own tree.
-  - `sodabox sync-host` — pull guest work dir → host cwd. **Careful**: print a
+  - `soda sync-host` — pull guest work dir → host cwd. **Careful**: print a
     dry-run summary (rsync `--out-format=%n`), then offer sync-all / interactive
     (per-entry y/N/q, a declined dir suppressing its children) / no. This is the
     only direction that overwrites host files.

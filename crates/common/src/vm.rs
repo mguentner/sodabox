@@ -1,4 +1,4 @@
-//! Per-VM metadata (`meta.toml`), written by `sodabox create` and read by
+//! Per-VM metadata (`meta.toml`), written by `soda create` and read by
 //! `start`/`ls` (ADR-0007/0008). Human-editable TOML, one file per VM.
 
 use std::fmt;
@@ -180,7 +180,7 @@ impl VmMeta {
         toml::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    /// Enumerate all VMs under the data root (`sodabox ls`), sorted by name. A
+    /// Enumerate all VMs under the data root (`soda ls`), sorted by name. A
     /// directory is a VM iff it holds a readable `meta.toml`; anything else is
     /// skipped. A missing data root just means no VMs yet.
     pub fn list() -> io::Result<Vec<VmMeta>> {
@@ -222,7 +222,7 @@ impl VmMeta {
             || {
                 io::Error::other(format!(
                     "no free host SSH port for '{}' in {}..{} — {} already taken; \
-                     remove an unused VM (`sodabox rm`) to free one",
+                     remove an unused VM (`soda rm`) to free one",
                     name,
                     ssh::HOST_SSH_BASE_PORT,
                     ssh::HOST_SSH_BASE_PORT + ssh::HOST_SSH_PORTS - 1,

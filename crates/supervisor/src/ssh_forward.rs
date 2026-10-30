@@ -26,7 +26,7 @@
 //!
 //! # Which host port
 //!
-//! `<host_port>` is **not** chosen here. It is allocated once at `sodabox create`
+//! `<host_port>` is **not** chosen here. It is allocated once at `soda create`
 //! and stored in the VM's `meta.toml` ([`VmMeta::ssh_port`]), so it is stable for
 //! the VM's lifetime and unique across VMs — see [`bind_vm_forward`] and
 //! ADR-0011's *Port assignment*.
@@ -66,7 +66,7 @@ pub fn bind_vm_forward(vm: &str, assigned: u16) -> io::Result<(TcpListener, u16)
                     meta.ssh_port = want;
                     meta.save()?;
                     println!(
-                        "sodabox: ssh port {assigned} is held by another process; \
+                        "soda: ssh port {assigned} is held by another process; \
                          '{vm}' reassigned to {want} (saved)"
                     );
                 }
@@ -119,7 +119,7 @@ pub fn serve_netns_relay(fd_sock: UnixStream, passt_port: u16) {
         let Some(fd) = fds.pop() else { continue };
         thread::spawn(move || {
             if let Err(e) = splice_to_passt(fd, passt_port) {
-                eprintln!("sodabox ssh relay: {e}");
+                eprintln!("soda ssh relay: {e}");
             }
         });
     }

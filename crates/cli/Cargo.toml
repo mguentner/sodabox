@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "sodabox"
+name = "soda"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,4 +1,4 @@
-//! `sodabox logs <vm>` — print a VM's persisted event log
+//! `soda logs <vm>` — print a VM's persisted event log
 //! (ADR-0009). The supervisor appends every stream event as newline-delimited
 //! JSON to `events.log` in the persistent data dir (see
 //! `sodabox_supervisor::eventlog`); this reads that log — including the rotated
@@ -10,12 +10,12 @@ use std::path::Path;
 use sodabox_common::event::{DnsVerdict, Event, Verdict};
 use sodabox_common::{paths, vm::VmMeta};
 
-/// `sodabox logs <vm> [-n N] [--json]`. Prints oldest-first. `lines` limits to the
+/// `soda logs <vm> [-n N] [--json]`. Prints oldest-first. `lines` limits to the
 /// last N records (across both files); `json` passes the raw JSON lines through
 /// instead of the human-readable rendering.
 pub fn run(name: &str, lines: Option<usize>, json: bool) -> anyhow::Result<()> {
     if !VmMeta::path(name).is_file() {
-        anyhow::bail!("no such VM '{name}' — run `sodabox create {name}` first");
+        anyhow::bail!("no such VM '{name}' — run `soda create {name}` first");
     }
 
     // Oldest first: the rotated predecessor precedes the current log.

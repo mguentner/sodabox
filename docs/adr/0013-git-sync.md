@@ -22,7 +22,7 @@ exact SSH identity ADR-0011 established.
 
 ## Decision
 
-The host's **git** can treat a VM as a plain remote. `sodabox git-remote
+The host's **git** can treat a VM as a plain remote. `soda git-remote
 <vm>` configures a git remote named after the VM in the cwd's repo, routed
 through git's `ext::` helper and sodabox's existing hardened SSH identity;
 from then on the user runs **unwrapped** `git push <vm>` / `git pull <vm>` —
@@ -50,11 +50,11 @@ the port **per-VM state** (`meta.toml: ssh_port`), so it is now stable — but
 - The remote needs no path component, no port, and no reconfiguration ever.
 
 git's `ext::` helper
-re-execs an arbitrary command **once per push/fetch**: `sodabox git-remote`
+re-execs an arbitrary command **once per push/fetch**: `soda git-remote`
 configures
 
 ```
-ext::sodabox git-proxy <vm> --user <user> %S
+ext::soda git-proxy <vm> --user <user> %S
 ```
 
 once, ever — git-remote-ext(1) splits this on unescaped spaces (no shell
@@ -62,7 +62,7 @@ involved; `vm`/`user` are escaped per its own `%%`/`% ` grammar, not shell
 quoting) and substitutes the trailing `%S` with the long service name
 (`git-upload-pack`/`git-receive-pack`) itself — it does **not** append the
 service as an extra argument on its own, so the placeholder has to be given
-explicitly. `sodabox git-proxy` (hidden; never run by hand) resolves a **fresh**
+explicitly. `soda git-proxy` (hidden; never run by hand) resolves a **fresh**
 `SshEndpoint` on every invocation and `exec()`s `ssh` with the exact
 hardened, pinned-identity option set shared verbatim with `ssh`/sync
 (`hardened_ssh_opts`), running `<service> /var/work/project` on the guest.
@@ -101,7 +101,7 @@ In practice it was also bypassed entirely: `sync-vm` rsyncs the host's
 `sodabox-git-init` applied at boot, so pushes failed with the stock
 "refusing to update checked out branch".
 
-`sodabox git-remote` therefore also pins
+`soda git-remote` therefore also pins
 
 ```
 remote.<vm>.push = +refs/heads/*:refs/remotes/host/*
@@ -129,7 +129,7 @@ Unlike rsync's asymmetric, careful-pull design (ADR-0011), git push/pull get
 content-aware safety property that is strictly stronger than rsync's
 dry-run-and-confirm UX (which exists only because a raw-file overwrite can
 silently destroy data with no trace — commits can't be silently lost the same
-way). `sodabox git-remote` itself still refuses to silently repoint an
+way). `soda git-remote` itself still refuses to silently repoint an
 existing differently-configured remote of the same name (needs `--force`).
 
 ### Composition with the egress model and rsync
@@ -141,7 +141,7 @@ hardened SSH identity; a VM can use either, both, or switch between them
 freely (rsync for the full tree including untracked scratch files when
 wanted, git for the "just the deliverable commits" path this ADR adds).
 
-`sodabox rm` deliberately does not try to remove any host-side git remote —
+`soda rm` deliberately does not try to remove any host-side git remote —
 the remote lives in whichever repo the user ran `git-remote` from, which `rm`
 has no way to locate.
 

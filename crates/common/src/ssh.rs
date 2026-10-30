@@ -1,7 +1,7 @@
 //! Tool-owned SSH identity (ADR-0011).
 //!
 //! sodabox owns a single ed25519 keypair whose *public* half is injected into
-//! every guest's `authorized_keys` at launch, so `sodabox ssh` and sync work out
+//! every guest's `authorized_keys` at launch, so `soda ssh` and sync work out
 //! of the box. The private half lives only on the host (mode 0600) and is never
 //! mounted into a VM. Key material is generated on demand with the system
 //! `ssh-keygen` (shelling out, per ADR-0011's "reuse the OpenSSH tooling").
@@ -49,7 +49,7 @@ pub fn rsync_bin() -> OsString {
 
 /// The value for rsync's `-e` (remote-shell) flag: the `ssh` binary plus the
 /// shared hardened options (ADR-0011), so sync authenticates exactly like
-/// `sodabox ssh`. rsync word-splits `-e` on whitespace without shell quoting, so
+/// `soda ssh`. rsync word-splits `-e` on whitespace without shell quoting, so
 /// this relies on the tool key path (under `$XDG_DATA_HOME/sodabox`) containing
 /// no spaces — which sodabox controls.
 pub fn ssh_rsh_command(vm: &str) -> String {
@@ -76,7 +76,7 @@ pub fn known_hosts_path(vm: &str) -> PathBuf {
 }
 
 /// The single, hardened, pinned-identity SSH option set for VM `vm` (ADR-0011),
-/// shared verbatim by `sodabox ssh` and `sync` so both authenticate and verify
+/// shared verbatim by `soda ssh` and `sync` so both authenticate and verify
 /// identically. These are only the `-F`/`-o`/`-i` flags; the caller adds the
 /// `ssh` binary, `-p <port>`, the `user@host`, and any remote command (sync
 /// splices them into rsync's `-e`).
@@ -160,7 +160,7 @@ impl SshEndpoint {
             io::ErrorKind::NotFound => io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
-                    "no SSH endpoint for VM '{vm}' at {} — start it with networking first (`sodabox start {vm} --net --foreground`)",
+                    "no SSH endpoint for VM '{vm}' at {} — start it with networking first (`soda start {vm} --net --foreground`)",
                     path.display()
                 ),
             ),
@@ -304,7 +304,7 @@ fn harden_perms(_path: &Path) -> io::Result<()> {
 }
 
 /// The guest `authorized_keys` body (ADR-0011): the tool key and nothing else,
-/// so `sodabox ssh` and sync work and no other identity can log in. Generates
+/// so `soda ssh` and sync work and no other identity can log in. Generates
 /// the key on first use; rebuilt each launch (the config disk is).
 pub fn authorized_keys() -> io::Result<String> {
     Ok(format!("{}\n", ensure_tool_key()?))

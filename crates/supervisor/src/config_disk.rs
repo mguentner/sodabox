@@ -28,7 +28,7 @@ fn mkfs_erofs_bin() -> std::ffi::OsString {
 /// sshd enforces `StrictModes`, which refuses an `authorized_keys` (or a parent
 /// dir) not owned by root or the login user — so without `--all-root` the image
 /// carries the invoking user's uid, which is not root inside the guest, and every
-/// `sodabox ssh` fails with `Permission denied (publickey)`.
+/// `soda ssh` fails with `Permission denied (publickey)`.
 fn mkfs_erofs_args(out: &Path, staging: &Path) -> Vec<std::ffi::OsString> {
     vec![
         "--all-root".into(),

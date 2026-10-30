@@ -1,4 +1,4 @@
-//! Vendor policy profiles and the `sodabox profile` verbs (ADR-0015).
+//! Vendor policy profiles and the `soda profile` verbs (ADR-0015).
 //!
 //! sodabox ships a few profiles embedded in the binary and keeps them current
 //! in the profiles dir: unlike the guest input (ADR-0012), a vendor profile is
@@ -73,7 +73,7 @@ pub fn sync_vendor() -> io::Result<()> {
         fs::rename(&tmp, &path)?;
         if existed {
             eprintln!(
-                "sodabox: updated vendor profile '{name}' at {} (local changes discarded; \
+                "soda: updated vendor profile '{name}' at {} (local changes discarded; \
                  copy it to a new name to customise)",
                 path.display()
             );
@@ -93,7 +93,7 @@ pub fn load_all(names: &[String]) -> anyhow::Result<Vec<Profile>> {
         .collect()
 }
 
-/// `sodabox profile ls`.
+/// `soda profile ls`.
 pub fn ls() -> anyhow::Result<()> {
     sync_vendor()?;
     let names = profile::list()?;
@@ -110,7 +110,7 @@ pub fn ls() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `sodabox profile show <name>` — the file as written, comments included.
+/// `soda profile show <name>` — the file as written, comments included.
 pub fn show(name: &str) -> anyhow::Result<()> {
     sync_vendor()?;
     let p = Profile::load(name).map_err(|e| anyhow::anyhow!(e))?;

@@ -2,7 +2,7 @@
 #
 #   { "<path under /root>" = { text = "…"; mode = "0644"; }; … }
 #
-# Embedded in the sodabox binary and run with `nix-instantiate --eval --strict
+# Embedded in the soda binary and run with `nix-instantiate --eval --strict
 # --json`; nothing is built. The collection gets only `lib`, taken from the
 # shared guest's pinned nixpkgs (ADR-0012), so a generated file is plain text by
 # construction. Text with store-path context (`${pkgs.foo}`, `${./file}`) is

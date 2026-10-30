@@ -31,7 +31,7 @@
 //!
 //! The pure wiring ([`LaunchPlan::wire`]) and the control handler
 //! ([`SupervisorState`]) are unit-tested here; the fork/live path needs a real
-//! userns + KVM + passt + nft and is exercised by `sodabox start --net` on a host.
+//! userns + KVM + passt + nft and is exercised by `soda start --net` on a host.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -126,7 +126,7 @@ impl LaunchPlan {
     pub fn build(name: &str) -> anyhow::Result<LaunchPlan> {
         let meta = VmMeta::load(name).map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => {
-                anyhow::anyhow!("no such VM '{name}' — run `sodabox create {name}` first")
+                anyhow::anyhow!("no such VM '{name}' — run `soda create {name}` first")
             }
             _ => anyhow::anyhow!("reading meta.toml for '{name}': {e}"),
         })?;
@@ -286,7 +286,7 @@ pub fn run_with_log(name: &str, log: Option<PathBuf>) -> anyhow::Result<()> {
     // forked child exits inside `launch_locked`.
     if let Ok(meta) = VmMeta::load(name) {
         if let Err(e) = meta.discard_scratch() {
-            eprintln!("sodabox: could not delete the scratch disk of '{name}': {e}");
+            eprintln!("soda: could not delete the scratch disk of '{name}': {e}");
         }
     }
     // The VM is gone; release the data-disk lock explicitly.
@@ -350,7 +350,7 @@ fn launch_locked(
             let code = match child_main(&plan, child_sock, inj_child, ssh_fd_child) {
                 Ok(()) => 0,
                 Err(e) => {
-                    eprintln!("sodabox supervisor child: {e}");
+                    eprintln!("soda supervisor child: {e}");
                     1
                 }
             };
@@ -402,7 +402,7 @@ fn child_main(
     // closes (parent gone) — and PDEATHSIG collapses us first anyway.
     std::thread::spawn(move || {
         if let Err(e) = crate::udp_inject::run_injector(inj_child) {
-            eprintln!("sodabox udp injector: {e}");
+            eprintln!("soda udp injector: {e}");
         }
     });
 
@@ -627,13 +627,10 @@ async fn serve(
                 let endpoint = format!("{}:{port}", Ipv4Addr::LOCALHOST);
                 let path = paths::ssh_endpoint_path(&plan.name);
                 if let Err(e) = std::fs::write(&path, format!("{endpoint}\n")) {
-                    eprintln!(
-                        "sodabox: could not write ssh endpoint {}: {e}",
-                        path.display()
-                    );
+                    eprintln!("soda: could not write ssh endpoint {}: {e}", path.display());
                 }
                 println!(
-                    "ssh forward: {endpoint} -> guest:22 (sodabox ssh {})",
+                    "ssh forward: {endpoint} -> guest:22 (soda ssh {})",
                     plan.name
                 );
                 std::thread::spawn(move || {
@@ -643,7 +640,7 @@ async fn serve(
             Err(e) => {
                 // Non-fatal: the guest still runs (console/other access remains);
                 // only the SSH forward is unavailable.
-                eprintln!("sodabox: SSH forward disabled (no host loopback port): {e}");
+                eprintln!("soda: SSH forward disabled (no host loopback port): {e}");
                 drop(ssh_fd_parent);
             }
         }
@@ -856,11 +853,11 @@ impl ControlHandler for SupervisorState {
     // rule, updates the file, and pushes the whole new policy via `PolicySet`
     // (see `policy_set`). Keeping one writer avoids file/live split-brain.
     fn allow(&self, _rule: &str) -> Result<(), String> {
-        Err("use `sodabox allow …` (it edits policy.toml and pushes PolicySet)".to_string())
+        Err("use `soda allow …` (it edits policy.toml and pushes PolicySet)".to_string())
     }
 
     fn deny(&self, _rule: &str) -> Result<(), String> {
-        Err("use `sodabox deny …` (it edits policy.toml and pushes PolicySet)".to_string())
+        Err("use `soda deny …` (it edits policy.toml and pushes PolicySet)".to_string())
     }
 
     fn stop(&self) {

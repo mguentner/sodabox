@@ -14,7 +14,7 @@ mod tui;
 
 #[derive(Parser)]
 #[command(
-    name = "sodabox",
+    name = "soda",
     version,
     about = "🍋 - rootless microVMs based on NixOS"
 )]
@@ -337,7 +337,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// `sodabox create` — materialize the user-owned guest input (ADR-0012), the
+/// `soda create` — materialize the user-owned guest input (ADR-0012), the
 /// per-VM data dir + metadata, and the disks its persistence mode keeps (sparse
 /// raw): data + home disk for `full`, the home disk for `home`, nothing
 /// for `none` (ADR-0014; scratch disks are made at start).
@@ -385,7 +385,7 @@ fn create(
     } else {
         if policy_path.is_file() {
             anyhow::bail!(
-                "VM '{name}' already has a policy; apply profiles to it with `sodabox profile add {} --vm {name}`",
+                "VM '{name}' already has a policy; apply profiles to it with `soda profile add {} --vm {name}`",
                 profiles.join(",")
             );
         }
@@ -558,7 +558,7 @@ fn create(
     Ok(())
 }
 
-/// `sodabox start` — build the guest via mkGuest (ADR-0012) and boot it with
+/// `soda start` — build the guest via mkGuest (ADR-0012) and boot it with
 /// cloud-hypervisor. This first cut runs in the foreground with no
 /// networking; the netns owner + passt and backgrounding come
 /// next.
@@ -586,7 +586,7 @@ fn start(name: &str, foreground: bool, net: bool) -> anyhow::Result<()> {
 
     let meta = VmMeta::load(name).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => {
-            anyhow::anyhow!("no such VM '{name}' — run `sodabox create {name}` first")
+            anyhow::anyhow!("no such VM '{name}' — run `soda create {name}` first")
         }
         _ => anyhow::anyhow!("reading meta.toml for '{name}': {e}"),
     })?;
@@ -601,7 +601,7 @@ fn start(name: &str, foreground: bool, net: bool) -> anyhow::Result<()> {
     let result = start_foreground_locked(name, &meta, &guest_dir, mem_mib);
     // A `home`/`none` VM's scratch disk goes with the VM (ADR-0014), lock held.
     if let Err(e) = meta.discard_scratch() {
-        eprintln!("sodabox: could not delete the scratch disk of '{name}': {e}");
+        eprintln!("soda: could not delete the scratch disk of '{name}': {e}");
     }
     result
 }
@@ -689,7 +689,7 @@ fn start_background(name: &str) -> anyhow::Result<()> {
 
     // Fail fast, on the terminal, if it's already up — before we fork/daemonize.
     if rt()?.block_on(is_running(name)) {
-        anyhow::bail!("VM '{name}' is already running (stop it with `sodabox stop {name}`)");
+        anyhow::bail!("VM '{name}' is already running (stop it with `soda stop {name}`)");
     }
 
     // The supervisor logs here; create the dir now so the daemonizer can validate
@@ -706,7 +706,7 @@ fn start_background(name: &str) -> anyhow::Result<()> {
             let code = match sodabox_supervisor::supervise::run_with_log(name, Some(log)) {
                 Ok(()) => 0,
                 Err(e) => {
-                    eprintln!("sodabox supervisor: {e}");
+                    eprintln!("soda supervisor: {e}");
                     1
                 }
             };
@@ -740,8 +740,8 @@ fn wait_for_ready(
                 "VM '{name}' is up (supervisor pid {child}, {}s).",
                 start.elapsed().as_secs()
             );
-            println!("  ssh:  sodabox ssh {name}");
-            println!("  stop: sodabox stop {name}");
+            println!("  ssh:  soda ssh {name}");
+            println!("  stop: soda stop {name}");
             println!("  log:  {}", log.display());
             return Ok(());
         }
@@ -791,7 +791,7 @@ fn resolve_vm(vm: Option<String>) -> anyhow::Result<String> {
     let vms = VmMeta::list()?;
     match vms.as_slice() {
         [only] => Ok(only.name.clone()),
-        [] => anyhow::bail!("no VMs exist — create one with `sodabox create <name>`"),
+        [] => anyhow::bail!("no VMs exist — create one with `soda create <name>`"),
         _ => {
             let names: Vec<_> = vms.iter().map(|m| m.name.as_str()).collect();
             anyhow::bail!("multiple VMs ({}) — specify --vm <name>", names.join(", "))
@@ -819,7 +819,7 @@ fn apply_edit(
 
     // A VM must exist to have a policy (catches typos before we write a file).
     if !sodabox_common::vm::VmMeta::path(vm).is_file() {
-        anyhow::bail!("no such VM '{vm}' — run `sodabox create {vm}` first");
+        anyhow::bail!("no such VM '{vm}' — run `soda create {vm}` first");
     }
 
     let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
@@ -875,7 +875,7 @@ fn push_live(vm: &str, policy: &sodabox_common::policy::VmPolicy) -> anyhow::Res
     })
 }
 
-/// `sodabox allow ip|domain …` — add a rule (persist + push live).
+/// `soda allow ip|domain …` — add a rule (persist + push live).
 fn allow(what: AllowWhat) -> anyhow::Result<()> {
     use sodabox_common::policy::DomainScope;
     match what {
@@ -918,7 +918,7 @@ fn allow(what: AllowWhat) -> anyhow::Result<()> {
     }
 }
 
-/// `sodabox deny <rule>` — remove matching rule(s) (persist + push live).
+/// `soda deny <rule>` — remove matching rule(s) (persist + push live).
 fn deny(rule: &str, vm: Option<String>) -> anyhow::Result<()> {
     let vm = resolve_vm(vm)?;
     apply_edit(&vm, |p| {
@@ -930,7 +930,7 @@ fn deny(rule: &str, vm: Option<String>) -> anyhow::Result<()> {
     })
 }
 
-/// `sodabox profile add <names> [--vm]` — merge profiles into an existing VM's
+/// `soda profile add <names> [--vm]` — merge profiles into an existing VM's
 /// policy (persist + push live), like appending each profile's rules to
 /// `policy.toml` with a provenance comment per rule (ADR-0015).
 fn profile_add(names: &[String], vm: Option<String>) -> anyhow::Result<()> {
@@ -948,7 +948,7 @@ fn profile_add(names: &[String], vm: Option<String>) -> anyhow::Result<()> {
     })
 }
 
-/// `sodabox policy show|edit`.
+/// `soda policy show|edit`.
 fn policy(action: PolicyAction) -> anyhow::Result<()> {
     match action {
         PolicyAction::Show(t) => policy_show(resolve_vm(t.vm)?),
@@ -994,7 +994,7 @@ fn policy_edit(vm: String) -> anyhow::Result<()> {
     use sodabox_common::policy::PolicyFile;
 
     if !sodabox_common::vm::VmMeta::path(&vm).is_file() {
-        anyhow::bail!("no such VM '{vm}' — run `sodabox create {vm}` first");
+        anyhow::bail!("no such VM '{vm}' — run `soda create {vm}` first");
     }
     // Ensure the file exists so the editor opens something meaningful, and record
     // the version *before* the edit (tool-managed; the user's typed version is
@@ -1052,7 +1052,7 @@ async fn is_running(name: &str) -> bool {
         .is_ok()
 }
 
-/// `sodabox stop` — ask the VM's supervisor to tear down via its control socket.
+/// `soda stop` — ask the VM's supervisor to tear down via its control socket.
 fn stop(name: &str) -> anyhow::Result<()> {
     use sodabox_common::protocol::{Request, Response};
     use sodabox_supervisor::control::ControlClient;
@@ -1074,14 +1074,14 @@ fn stop(name: &str) -> anyhow::Result<()> {
     })
 }
 
-/// `sodabox ls` — enumerate VMs from the data root and probe each control socket
+/// `soda ls` — enumerate VMs from the data root and probe each control socket
 /// for liveness (ADR-0007/0009).
 fn ls() -> anyhow::Result<()> {
     use sodabox_common::vm::VmMeta;
 
     let vms = VmMeta::list()?;
     if vms.is_empty() {
-        println!("no VMs — create one with `sodabox create <name>`");
+        println!("no VMs — create one with `soda create <name>`");
         return Ok(());
     }
 
@@ -1104,7 +1104,7 @@ fn ls() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `sodabox rm` — remove a stopped VM. Deletes the whole data dir, or with
+/// `soda rm` — remove a stopped VM. Deletes the whole data dir, or with
 /// `--keep-disk` keeps the disks holding the VM's kept state: `data.img` and
 /// `home.img` for `persist = "full"`, `home.img` for `home`, nothing for `none`
 /// (ADR-0014). Also deletes the VM's config dir. Asks for confirmation unless
@@ -1119,7 +1119,7 @@ fn rm(name: &str, keep_disk: bool, yes: bool) -> anyhow::Result<()> {
     // assume the stateful default so --keep-disk errs on the side of keeping.
     let persist = VmMeta::load(name).map(|m| m.persist).unwrap_or_default();
     if rt()?.block_on(is_running(name)) {
-        anyhow::bail!("VM '{name}' is running — stop it first (`sodabox stop {name}`)");
+        anyhow::bail!("VM '{name}' is running — stop it first (`soda stop {name}`)");
     }
 
     let data = paths::data_dir(name);

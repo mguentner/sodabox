@@ -1,4 +1,4 @@
-//! `sodabox ssh <vm> [command…]` (ADR-0011).
+//! `soda ssh <vm> [command…]` (ADR-0011).
 //!
 //! Shells out to the system `ssh` with the single hardened, pinned-identity
 //! option set ([`sodabox_common::ssh::hardened_ssh_opts`], shared verbatim with
@@ -34,14 +34,14 @@ pub(crate) fn require_tool_key(name: &str) -> anyhow::Result<()> {
     let key = tool_key_path();
     if !key.exists() {
         anyhow::bail!(
-            "tool SSH key {} is missing — start the VM once so it is generated (`sodabox start {name} --net --foreground`)",
+            "tool SSH key {} is missing — start the VM once so it is generated (`soda start {name} --net --foreground`)",
             key.display()
         );
     }
     Ok(())
 }
 
-/// `sodabox ssh`: connect to `name` as `user` (default root) and either open an
+/// `soda ssh`: connect to `name` as `user` (default root) and either open an
 /// interactive shell or run `command`. Replaces this process with `ssh`.
 pub fn run(name: &str, user: &str, command: &[String]) -> anyhow::Result<()> {
     require_tool_key(name)?;
