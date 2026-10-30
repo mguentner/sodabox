@@ -66,7 +66,10 @@
 
             cargoLock.lockFile = ./Cargo.lock;
 
-            nativeBuildInputs = [ pkgs.makeWrapper ];
+            nativeBuildInputs = [
+              pkgs.makeWrapper
+              pkgs.installShellFiles
+            ];
 
             # Pin every host tool sodabox drives at runtime (ADR-0010): each call
             # site reads a SODABOX_* override (bare-name default), so --set-default
@@ -80,7 +83,13 @@
             # host's own Nix, which --prefix PATH leaves reachable.
             postInstall =
               let
-                inherit (pkgs.lib) getExe getExe' makeBinPath;
+                inherit (pkgs.lib)
+                  getExe
+                  getExe'
+                  makeBinPath
+                  optionalString
+                  ;
+                inherit (pkgs.stdenv) buildPlatform hostPlatform;
               in
               ''
                 # Ship the guest build tooling (mkGuest.nix + base.nix +
@@ -107,6 +116,17 @@
                       pkgs.rsync
                     ]
                   }
+              ''
+              # Dynamic completion stubs (ADR-0009): each one calls back into the
+              # wrapped binary on Tab, so VM, profile and dotfile names are live.
+              # Generating them runs the binary, hence the cross-compile guard.
+              # Autoloaded from site-functions, the zsh stub only registers its
+              # completer, so call it once to complete the very first Tab too.
+              + optionalString (buildPlatform.canExecute hostPlatform) ''
+                installShellCompletion --cmd soda \
+                  --bash <(COMPLETE=bash $out/bin/soda) \
+                  --fish <(COMPLETE=fish $out/bin/soda) \
+                  --zsh <(COMPLETE=zsh $out/bin/soda; echo '_clap_dynamic_completer_soda "$@"')
               '';
 
             meta = with pkgs.lib; {

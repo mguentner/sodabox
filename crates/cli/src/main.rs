@@ -1,6 +1,9 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::engine::ArgValueCandidates;
+use clap_complete::CompleteEnv;
 use sodabox_common::vm::Persist;
 
+mod complete;
 mod cp;
 mod daemonize;
 mod git;
@@ -47,15 +50,16 @@ enum Cmd {
         #[arg(long, value_enum, default_value = "name")]
         hostname: guest::HostnameMode,
         /// policy profiles to merge into the new VM's policy, e.g. claudecode,mistral
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, value_delimiter = ',', add = ArgValueCandidates::new(complete::profiles))]
         profiles: Vec<String>,
         /// dotfile collections to copy into the new VM's /root, e.g. claudecode,pi
         /// (later ones win on conflicts)
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, value_delimiter = ',', add = ArgValueCandidates::new(complete::dotfiles))]
         dotfiles: Vec<String>,
     },
     /// start a VM
     Start {
+        #[arg(add = ArgValueCandidates::new(complete::vms))]
         name: String,
         // stay attached
         #[arg(long)]
@@ -66,6 +70,7 @@ enum Cmd {
     },
     /// ssh into a running VM
     Ssh {
+        #[arg(add = ArgValueCandidates::new(complete::vms))]
         name: String,
         /// login user in the guest (default: root)
         #[arg(long, short = 'l', default_value = "root")]
@@ -93,6 +98,7 @@ enum Cmd {
     },
     /// push the host cwd into a running VM's work dir
     SyncVm {
+        #[arg(add = ArgValueCandidates::new(complete::vms))]
         name: String,
         #[arg(long, short = 'l', default_value = "root")]
         user: String,
@@ -102,6 +108,7 @@ enum Cmd {
     },
     /// pull a running VM's work dir into the host cwd
     SyncHost {
+        #[arg(add = ArgValueCandidates::new(complete::vms))]
         name: String,
         #[arg(long, short = 'l', default_value = "root")]
         user: String,
@@ -114,6 +121,7 @@ enum Cmd {
     },
     /// configure the VM `name` as a git remote in the cwd's repo
     GitRemote {
+        #[arg(add = ArgValueCandidates::new(complete::vms))]
         name: String,
         #[arg(long, short = 'l', default_value = "root")]
         user: String,
@@ -134,7 +142,10 @@ enum Cmd {
         service: String,
     },
     /// stop a running VM
-    Stop { name: String },
+    Stop {
+        #[arg(add = ArgValueCandidates::new(complete::vms))]
+        name: String,
+    },
     /// list VMs
     Ls,
     /// add an allow rule to a VM's egress policy
@@ -145,7 +156,7 @@ enum Cmd {
     /// remove/deny a rule from a VM's egress policy
     Deny {
         rule: String,
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(complete::vms))]
         vm: Option<String>,
     },
     /// show or edit a VM's policy
@@ -159,9 +170,13 @@ enum Cmd {
         action: ProfileAction,
     },
     /// live TUI monitor for a VM
-    Tui { name: String },
+    Tui {
+        #[arg(add = ArgValueCandidates::new(complete::vms))]
+        name: String,
+    },
     /// print a VM's persisted event log (post-hoc audit)
     Logs {
+        #[arg(add = ArgValueCandidates::new(complete::vms))]
         name: String,
         /// show only the last N events
         #[arg(long, short = 'n')]
@@ -172,6 +187,7 @@ enum Cmd {
     },
     /// remove a VM and its config (and its data unless --keep-disk)
     Rm {
+        #[arg(add = ArgValueCandidates::new(complete::vms))]
         name: String,
         #[arg(long)]
         keep_disk: bool,
@@ -190,7 +206,7 @@ enum AllowWhat {
         cidr: String,
         #[arg(long)]
         ports: Option<String>,
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(complete::vms))]
         vm: Option<String>,
     },
     /// allow resolution + egress for a domain
@@ -200,7 +216,7 @@ enum AllowWhat {
         exact: bool,
         #[arg(long, group = "scope")]
         wildcard: bool,
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(complete::vms))]
         vm: Option<String>,
     },
 }
@@ -213,7 +229,7 @@ enum PolicyAction {
 
 #[derive(Args)]
 struct PolicyTarget {
-    #[arg(long)]
+    #[arg(long, add = ArgValueCandidates::new(complete::vms))]
     vm: Option<String>,
 }
 
@@ -222,12 +238,15 @@ enum ProfileAction {
     /// list vendor and user profiles
     Ls,
     /// print a profile
-    Show { name: String },
+    Show {
+        #[arg(add = ArgValueCandidates::new(complete::profiles))]
+        name: String,
+    },
     /// merge profiles into an existing VM's policy, e.g. claudecode,mistral
     Add {
-        #[arg(value_delimiter = ',', required = true)]
+        #[arg(value_delimiter = ',', required = true, add = ArgValueCandidates::new(complete::profiles))]
         names: Vec<String>,
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(complete::vms))]
         vm: Option<String>,
     },
 }
@@ -242,6 +261,9 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some(preflight::PROBE_ARG) {
         std::process::exit(preflight::probe_namespaces());
     }
+    // `COMPLETE=<shell> soda …` is the shell asking for completions (or, with
+    // no further args, for its registration script): answer and exit.
+    CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
     match cli.cmd {

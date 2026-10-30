@@ -54,6 +54,11 @@ pub fn is_vendor(name: &str) -> bool {
     VENDOR.iter().any(|(n, _)| *n == name)
 }
 
+/// Names of the shipped profiles.
+pub fn vendor_names() -> impl Iterator<Item = &'static str> {
+    VENDOR.iter().map(|(n, _)| *n)
+}
+
 /// Write every vendor profile whose file is missing or differs from the shipped
 /// copy, atomically. An overwritten file is reported, since that discards
 /// whatever was changed in it.

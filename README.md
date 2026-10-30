@@ -11,6 +11,18 @@ microVMs for agents, analyses and experiments powered by NixOS
 - emphermal, home-peristed or full-persisted VMs
 - disk, memory and CPU cores are configurable
 
+## Shell completion
+
+The nix package installs completions for bash, zsh and fish. They complete
+VM, profile and dotfile collection names as well as subcommands and flags.
+Without the package, load them from your shell's startup file:
+
+```sh
+source <(COMPLETE=bash soda)   # ~/.bashrc
+source <(COMPLETE=zsh soda)    # ~/.zshrc
+COMPLETE=fish soda | source    # ~/.config/fish/config.fish
+```
+
 ## Architecture
 
 TODO

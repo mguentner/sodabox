@@ -26,6 +26,9 @@ toml = "0.8"
 # Format-preserving edits of policy.toml (comments survive, ADR-0015).
 toml_edit = "0.22"
 clap = { version = "4", features = ["derive"] }
+# Dynamic shell completion (`COMPLETE=<shell> soda`); the API is still behind
+# clap_complete's `unstable-dynamic` feature.
+clap_complete = { version = "4", features = ["unstable-dynamic"] }
 anyhow = "1"
 thiserror = "2"
 # TUI. ratatui re-exports crossterm under `ratatui::crossterm`,

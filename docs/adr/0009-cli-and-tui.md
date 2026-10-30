@@ -43,6 +43,15 @@ soda logs <vm>
 soda rm <vm> [--keep-disk]
 ```
 
+### Shell completion
+
+Completion is dynamic (clap_complete's `CompleteEnv`, behind its
+`unstable-dynamic` feature): the shell runs `COMPLETE=<shell> soda …` on each
+Tab, so VM, profile and dotfile collection names come from the live dirs
+rather than a script generated at build time. The completers only read
+directories and never write (no vendor profile sync). The flake installs the
+bash, zsh and fish stubs; anyone else sources `COMPLETE=<shell> soda`.
+
 ### TUI (ratatui)
 
 - Connects to `$XDG_RUNTIME_DIR/sodabox/<vm>/control.sock`, sends `subscribe`,
