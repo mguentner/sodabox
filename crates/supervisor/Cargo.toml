@@ -9,9 +9,13 @@ license.workspace = true
 sodabox-common.workspace = true
 sodabox-proxy.workspace = true
 sodabox-dns.workspace = true
+sodabox-gateway.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 nix = { version = "0.29", features = ["signal", "sched", "user", "process", "socket", "uio"] }
 socket2 = { version = "0.5", features = ["all"] }
+
+[dev-dependencies]
+toml.workspace = true

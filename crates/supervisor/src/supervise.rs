@@ -51,11 +51,14 @@ use sodabox_common::{paths, storage};
 use sodabox_dns::domain::SharedDomainAllowlist;
 use sodabox_dns::events::DnsEvents;
 use sodabox_dns::frontend::DnsFrontend;
+use sodabox_dns::resolver::LocalNames;
 use sodabox_dns::FilteringResolver;
+
+use sodabox_gateway::{Gateway, GatewayEvents, ProviderFiles};
 
 use sodabox_proxy::events::EgressEvents;
 use sodabox_proxy::policy::{shared, PolicyDialer};
-use sodabox_proxy::tcp::{self, DirectDialer, TransparentProxy};
+use sodabox_proxy::tcp::{self, DirectDialer, LocalService, ServeFuture, TransparentProxy};
 use sodabox_proxy::udp::{self, DirectUdpConnector, TransparentUdpProxy};
 
 use tokio::sync::{broadcast, Notify};
@@ -94,6 +97,20 @@ const OUTBOUND_ADDR: Ipv4Addr = RESOLVER_IP;
 const OUTBOUND_PREFIX: u8 = 24;
 /// Grace before SIGKILL when shutting a child process down.
 const GRACE: Duration = Duration::from_secs(10);
+/// Where the guest reaches the inference gateway (ADR-0020). Never routed
+/// anywhere: the proxy hands connections to this address to the in-process
+/// gateway, or blocks them while the policy grants no access.
+const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 4);
+const GATEWAY_PORT: u16 = 80;
+
+/// The name the guest resolves to [`GATEWAY_IP`] while access is granted.
+fn gateway_name() -> String {
+    format!(
+        "{}.{}",
+        sodabox_gateway::SERVICE,
+        crate::passt::GUEST_SEARCH_DOMAIN
+    )
+}
 
 /// Everything needed to launch and enforce one VM, computed before the fork so
 /// both processes share it (the child inherits it as forked memory).
@@ -561,6 +578,24 @@ async fn serve(
         PolicyDialer::new(allowlist.clone(), Arc::new(DirectDialer), Proto::Tcp)
             .with_events(events.clone()),
     );
+    // Inference gateway (ADR-0020): runs in this process and serves the
+    // connections the proxy hands it for the gateway address. Not critical:
+    // if it can't start (unreadable quota ledger, no TLS roots), the VM runs
+    // without it and the gateway address is blocked like any other.
+    let gateway = match Gateway::new(
+        &plan.name,
+        &plan.policy,
+        sodabox_common::quota::Ledger::for_vm(&plan.name),
+        Arc::new(ProviderFiles),
+        event_sink.clone(),
+    ) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("soda: inference gateway unavailable: {e}");
+            None
+        }
+    };
+
     // The proxy and resolver are the **egress-control plane** — the guest must
     // never run without them (fail-closed). Their JoinHandles are
     // supervised in the select! below: if either `serve()` loop returns or panics,
@@ -568,7 +603,17 @@ async fn serve(
     // filter. (Egress is already denied structurally when the proxy is gone —
     // nothing accepts the TPROXY-diverted connections — but a silent zombie is
     // not an acceptable state; we make the failure deterministic and observable.)
-    let mut proxy_task = tokio::spawn(TransparentProxy::new(tcp_listener, dialer).serve());
+    let mut proxy = TransparentProxy::new(tcp_listener, dialer);
+    if let Some(g) = &gateway {
+        proxy = proxy.with_local(
+            SocketAddr::from((GATEWAY_IP, GATEWAY_PORT)),
+            Arc::new(GatewayService {
+                gateway: g.clone(),
+                events: events.clone(),
+            }),
+        );
+    }
+    let mut proxy_task = tokio::spawn(proxy.serve());
 
     // Filtering DNS resolver on the passed netns UDP listener; emits DNS
     // allowed/refused verdicts onto the same event stream.
@@ -582,6 +627,12 @@ async fn serve(
     // without it, allowing a new domain updates the proxy + UI but the resolver
     // keeps refusing the name, so the proxy never sees an allow.
     let domains = resolver.domains();
+    // The gateway's name resolves only while the policy grants access.
+    let local_names = resolver.local_names();
+    sync_gateway_name(
+        &local_names,
+        gateway.is_some() && sodabox_gateway::is_reachable(&plan.policy),
+    );
     let mut dns_task = tokio::spawn(DnsFrontend::from_std(udp_std)?.serve(resolver));
 
     // Transparent UDP filter proxy: recover each datagram's
@@ -608,12 +659,10 @@ async fn serve(
     // Control + event socket. Unlike the proxy/resolver, this is *not*
     // fail-closed-critical: losing the management socket costs observability and
     // control but cannot open egress, so its exit does not tear the guest down.
-    let state = Arc::new(SupervisorState::new(
-        plan.policy.clone(),
-        allowlist.clone(),
-        domains,
-        events_tx,
-    ));
+    let state = Arc::new(
+        SupervisorState::new(plan.policy.clone(), allowlist.clone(), domains, events_tx)
+            .with_gateway(gateway, local_names),
+    );
     let control = ControlServer::bind(&plan.name, state.clone())?;
     tokio::spawn(control.serve());
 
@@ -771,6 +820,52 @@ impl DnsEvents for BroadcastEvents {
         let _ = self.0.send(event);
     }
 }
+impl GatewayEvents for BroadcastEvents {
+    fn emit(&self, event: Event) {
+        let _ = self.0.send(event);
+    }
+}
+
+/// The gateway as the proxy's local service at [`GATEWAY_IP`]. Access is
+/// checked per connection against the live policy: without it the connection
+/// is closed with the same `blocked` verdict as any destination not on the
+/// allowlist.
+struct GatewayService {
+    gateway: Gateway,
+    events: Arc<dyn EgressEvents>,
+}
+
+impl LocalService for GatewayService {
+    fn serve(&self, client: tokio::net::TcpStream, _peer: SocketAddr) -> ServeFuture {
+        let gateway = self.gateway.clone();
+        let events = self.events.clone();
+        Box::pin(async move {
+            if gateway.reachable() {
+                gateway.serve_conn(client).await;
+            } else {
+                events.emit(Event::Egress {
+                    ts: sodabox_common::event::now_ts(),
+                    verdict: sodabox_common::event::Verdict::Blocked,
+                    proto: "tcp".to_string(),
+                    daddr: GATEWAY_IP.to_string(),
+                    dport: GATEWAY_PORT,
+                    rule: None,
+                });
+            }
+        })
+    }
+}
+
+/// Publish or withdraw the gateway's DNS name.
+fn sync_gateway_name(names: &LocalNames, reachable: bool) {
+    if let Ok(mut names) = names.write() {
+        if reachable {
+            names.insert(gateway_name(), GATEWAY_IP);
+        } else {
+            names.remove(&gateway_name());
+        }
+    }
+}
 
 /// The live VM runtime state the control socket ([`ControlHandler`]) operates on.
 pub struct SupervisorState {
@@ -779,6 +874,10 @@ pub struct SupervisorState {
     domains: SharedDomainAllowlist,
     events: broadcast::Sender<Event>,
     stop: Notify,
+    /// The inference gateway, if it started (ADR-0020).
+    gateway: Option<Gateway>,
+    /// The resolver's local names, where the gateway's name is published.
+    local_names: LocalNames,
 }
 
 impl SupervisorState {
@@ -794,7 +893,23 @@ impl SupervisorState {
             domains,
             events,
             stop: Notify::new(),
+            gateway: None,
+            local_names: LocalNames::default(),
         }
+    }
+
+    /// Attach the inference gateway and the resolver's local names, so policy
+    /// changes reach both.
+    pub fn with_gateway(mut self, gateway: Option<Gateway>, local_names: LocalNames) -> Self {
+        self.gateway = gateway;
+        self.local_names = local_names;
+        self
+    }
+
+    fn gateway(&self) -> Result<&Gateway, String> {
+        self.gateway
+            .as_ref()
+            .ok_or_else(|| "the inference gateway is not running on this VM".to_string())
     }
 
     /// Completes once `stop` has been requested over the control socket.
@@ -816,6 +931,8 @@ impl ControlHandler for SupervisorState {
     }
 
     fn policy_set(&self, policy: VmPolicy) -> Result<(), String> {
+        // Reject bad model aliases before anything changes.
+        policy.validate_models()?;
         // Live swap: atomically replace static rules + version and
         // purge only the ephemerals of removed domains, keeping surviving domains'
         // cached IPs (working flows are not disrupted). `swap_policy` validates the
@@ -840,6 +957,14 @@ impl ControlHandler for SupervisorState {
                 .map_err(|_| "domain allowlist poisoned".to_string())?;
             d.swap_policy(&policy)?;
         }
+        // The gateway's aliases, quota modes and access, and its DNS name.
+        if let Some(g) = &self.gateway {
+            g.update_policy(&policy);
+        }
+        sync_gateway_name(
+            &self.local_names,
+            self.gateway.is_some() && sodabox_gateway::is_reachable(&policy),
+        );
         let mut p = self
             .policy
             .lock()
@@ -868,6 +993,14 @@ impl ControlHandler for SupervisorState {
 
     fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
+    }
+
+    fn quota_get(&self) -> Result<sodabox_common::quota::Balances, String> {
+        self.gateway()?.balances()
+    }
+
+    fn quota_reload(&self) -> Result<(), String> {
+        self.gateway()?.reload_quota()
     }
 }
 
@@ -997,6 +1130,56 @@ mod tests {
         };
         assert!(state.policy_set(bad).is_err());
         assert_eq!(state.policy_get().version, 9);
+    }
+
+    #[test]
+    fn policy_set_publishes_and_withdraws_the_gateway_name() {
+        struct NoEvents;
+        impl GatewayEvents for NoEvents {
+            fn emit(&self, _: Event) {}
+        }
+        let dir = std::env::temp_dir().join(format!("sodabox-sup-gw-{}", std::process::id()));
+        let gateway = Gateway::new(
+            "vm1",
+            &VmPolicy::default(),
+            sodabox_common::quota::Ledger::at(dir.join("quota.jsonl")),
+            Arc::new(ProviderFiles),
+            Arc::new(NoEvents),
+        )
+        .unwrap();
+        let names = LocalNames::default();
+        let (tx, _rx) = broadcast::channel(4);
+        let al = shared(Allowlist::from_policy(&VmPolicy::default()).unwrap());
+        let state = SupervisorState::new(VmPolicy::default(), al, empty_domains(), tx)
+            .with_gateway(Some(gateway.clone()), names.clone());
+
+        let open: VmPolicy = toml::from_str(
+            "version = 2\n[gateway]\nenabled = true\n\
+             [[rules]]\nkind = \"service\"\nname = \"inference\"\n",
+        )
+        .unwrap();
+        state.policy_set(open).unwrap();
+        assert!(gateway.reachable());
+        assert_eq!(
+            names.read().unwrap().get(&gateway_name()),
+            Some(&GATEWAY_IP)
+        );
+
+        // Configured but no access rule: the name goes away.
+        let configured_only: VmPolicy =
+            toml::from_str("version = 3\n[gateway]\nenabled = true\n").unwrap();
+        state.policy_set(configured_only).unwrap();
+        assert!(!gateway.reachable());
+        assert!(names.read().unwrap().is_empty());
+
+        // Duplicate aliases are rejected and change nothing.
+        let dup: VmPolicy = toml::from_str(
+            "version = 4\n[[models]]\nalias = \"a\"\nprovider = \"p\"\nmodel = \"m\"\n\
+             [[models]]\nalias = \"a\"\nprovider = \"p\"\nmodel = \"n\"\n",
+        )
+        .unwrap();
+        assert!(state.policy_set(dup).is_err());
+        assert_eq!(state.status().1, 3);
     }
 
     #[test]

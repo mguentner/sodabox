@@ -14,9 +14,10 @@
 //! The resolved answer is then returned to the guest. Non-A/AAAA queries for an
 //! allowed name are forwarded but admit nothing.
 
+use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use sodabox_common::allowlist::{EphemeralEntry, SharedAllowlist};
@@ -27,13 +28,26 @@ use tokio::net::UdpSocket;
 use crate::domain::{self, DomainAllowlist, DomainRule, SharedDomainAllowlist};
 use crate::events::{null_sink, DnsEvents};
 use crate::frontend::{HandleFuture, QueryHandler, Response};
-use crate::wire::{self, RData, RecordData, RCODE_REFUSED, RCODE_SERVFAIL, TYPE_A, TYPE_AAAA};
+use crate::wire::{
+    self, RData, RecordData, RCODE_NOERROR, RCODE_REFUSED, RCODE_SERVFAIL, TYPE_A, TYPE_AAAA,
+};
 
 /// Grace added to every ephemeral TTL to absorb the race between a DNS answer
 /// and the guest's connection using it.
 const TTL_GRACE: Duration = Duration::from_secs(5);
 /// How long to wait for an upstream reply before trying the next one.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// TTL of answers for [`LocalNames`]: short, so revoking access takes effect
+/// soon in the guest's cache too.
+const LOCAL_TTL: u32 = 30;
+
+/// Names of services sodabox itself offers the guest (ADR-0020), e.g.
+/// `inference.sodabox.internal`, mapped to their reserved addresses. The
+/// resolver answers these itself, and only while they are in the map: the
+/// supervisor adds a name when the policy grants access and removes it when
+/// access is revoked, after which it is refused like any unlisted name.
+pub type LocalNames = Arc<RwLock<HashMap<String, Ipv4Addr>>>;
 
 /// The per-VM filtering resolver.
 pub struct FilteringResolver {
@@ -42,6 +56,7 @@ pub struct FilteringResolver {
     upstreams: Vec<SocketAddr>,
     limits: Limits,
     events: Arc<dyn DnsEvents>,
+    local: LocalNames,
 }
 
 impl FilteringResolver {
@@ -58,7 +73,15 @@ impl FilteringResolver {
             upstreams,
             limits: policy.limits.clone(),
             events: null_sink(),
+            local: LocalNames::default(),
         })
+    }
+
+    /// A clone of the live local-names handle (see [`LocalNames`]). Like
+    /// [`FilteringResolver::domains`], take it before the resolver moves into
+    /// its serve task.
+    pub fn local_names(&self) -> LocalNames {
+        self.local.clone()
     }
 
     /// A clone of the shared domain allowlist handle, so the control plane can
@@ -222,6 +245,35 @@ impl QueryHandler for FilteringResolver {
         let name = query.question.name.to_ascii_lowercase();
         let qtype = query.question.qtype;
 
+        // sodabox's own services: answered here, never forwarded upstream.
+        let local = self
+            .local
+            .read()
+            .ok()
+            .and_then(|l| l.get(name.trim_end_matches('.')).copied());
+        if let Some(ip) = local {
+            // An A record for A queries; NOERROR with no data for the rest
+            // (there is no IPv6 address).
+            let answers = if qtype == TYPE_A {
+                vec![wire::Answer {
+                    name: name.clone(),
+                    ttl: LOCAL_TTL,
+                    data: RecordData::A(ip),
+                }]
+            } else {
+                Vec::new()
+            };
+            self.events.emit(Event::Dns {
+                ts: now_ts(),
+                verdict: DnsVerdict::Allowed,
+                qname: name,
+                answers: answers.iter().filter_map(answer_ip).collect(),
+                ttl: LOCAL_TTL,
+            });
+            let packet = wire::build_response(&query, RCODE_NOERROR, &answers);
+            return Box::pin(async move { Response::Packet(packet) });
+        }
+
         // Filter: match synchronously, before any upstream work. A
         // poisoned lock means a writer panicked mid-swap; fail closed (refuse)
         // rather than trust a possibly-inconsistent set.
@@ -325,6 +377,48 @@ mod tests {
         let al = shared(Allowlist::from_policy(&pol).unwrap());
         let r = FilteringResolver::new(&pol, al.clone(), vec![]).unwrap();
         (r, al)
+    }
+
+    #[tokio::test]
+    async fn local_names_are_answered_only_while_present() {
+        let (r, _al) = resolver_with_domain("allowed.test");
+        let name = "inference.sodabox.internal";
+        let ask =
+            |qtype| wire::parse_query(&wire::build_query(0x22, name, qtype).unwrap()).unwrap();
+        r.local_names()
+            .write()
+            .unwrap()
+            .insert(name.into(), Ipv4Addr::new(10, 0, 2, 4));
+        // No upstreams: the answer must come from the resolver itself.
+        match r.handle(ask(TYPE_A), "127.0.0.1:1".parse().unwrap()).await {
+            Response::Packet(p) => {
+                let parsed = wire::parse_response(&p).unwrap();
+                assert_eq!(parsed.rcode, RCODE_NOERROR);
+                assert!(matches!(
+                    parsed.answers[0].data,
+                    RData::A(ip) if ip == Ipv4Addr::new(10, 0, 2, 4)
+                ));
+            }
+            Response::Drop => panic!("should have replied"),
+        }
+        // AAAA: the name exists but has no IPv6 address.
+        match r
+            .handle(ask(TYPE_AAAA), "127.0.0.1:1".parse().unwrap())
+            .await
+        {
+            Response::Packet(p) => {
+                let parsed = wire::parse_response(&p).unwrap();
+                assert_eq!(parsed.rcode, RCODE_NOERROR);
+                assert!(parsed.answers.is_empty());
+            }
+            Response::Drop => panic!("should have replied"),
+        }
+        // Access revoked: refused like any unlisted name.
+        r.local_names().write().unwrap().clear();
+        match r.handle(ask(TYPE_A), "127.0.0.1:1".parse().unwrap()).await {
+            Response::Packet(p) => assert_eq!(p[3] & 0x0f, RCODE_REFUSED),
+            Response::Drop => panic!("should have replied"),
+        }
     }
 
     #[tokio::test]

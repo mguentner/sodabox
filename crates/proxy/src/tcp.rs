@@ -88,13 +88,34 @@ impl Dialer for DirectDialer {
 pub struct TransparentProxy<D: Dialer> {
     listener: TcpListener,
     dialer: Arc<D>,
+    local: Option<(SocketAddr, Arc<dyn LocalService>)>,
+}
+
+/// Boxed future alias for [`LocalService::serve`].
+pub type ServeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A service sodabox itself offers the guest at a reserved address, e.g. the
+/// inference gateway (ADR-0020). Connections to that address are handed to it
+/// instead of being dialed out; it decides whether the guest may use it.
+pub trait LocalService: Send + Sync + 'static {
+    fn serve(&self, client: TcpStream, peer: SocketAddr) -> ServeFuture;
 }
 
 impl<D: Dialer> TransparentProxy<D> {
     /// Wrap an already-bound listener (use [`bind_transparent`] in production;
     /// tests may pass an ordinary listener).
     pub fn new(listener: TcpListener, dialer: Arc<D>) -> Self {
-        Self { listener, dialer }
+        Self {
+            listener,
+            dialer,
+            local: None,
+        }
+    }
+
+    /// Hand connections whose original destination is `addr` to `service`.
+    pub fn with_local(mut self, addr: SocketAddr, service: Arc<dyn LocalService>) -> Self {
+        self.local = Some((addr, service));
+        self
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -120,6 +141,12 @@ impl<D: Dialer> TransparentProxy<D> {
                     continue;
                 }
             };
+            if let Some((addr, service)) = &self.local {
+                if dst == *addr {
+                    tokio::spawn(service.serve(client, peer));
+                    continue;
+                }
+            }
             let dialer = self.dialer.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle(client, dst, dialer).await {
@@ -216,6 +243,37 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0], paddr);
+    }
+
+    /// A local service that answers every connection with a fixed greeting.
+    struct Greeter;
+    impl LocalService for Greeter {
+        fn serve(&self, mut client: TcpStream, _peer: SocketAddr) -> ServeFuture {
+            Box::pin(async move {
+                let _ = client.write_all(b"local").await;
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn local_service_address_never_reaches_the_dialer() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let dialer = Arc::new(FixedDialer {
+            target: spawn_echo().await,
+            seen: seen.clone(),
+        });
+        // With an ordinary listener the "original dst" is the proxy's own
+        // address, so registering the service there routes every connection.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let paddr = listener.local_addr().unwrap();
+        let proxy = TransparentProxy::new(listener, dialer).with_local(paddr, Arc::new(Greeter));
+        tokio::spawn(proxy.serve());
+
+        let mut c = TcpStream::connect(paddr).await.unwrap();
+        let mut buf = [0u8; 5];
+        c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"local");
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
