@@ -289,7 +289,7 @@ impl Allowlist {
             .iter()
             .filter_map(|r| match r {
                 Rule::Domain { name, .. } => Some(name.as_str()),
-                Rule::Ip { .. } => None,
+                Rule::Ip { .. } | Rule::Service { .. } => None,
             })
             .collect();
         self.static_rules = rebuilt.static_rules;

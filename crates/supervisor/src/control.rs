@@ -31,6 +31,7 @@ use sodabox_common::event::{now_ts, Event};
 use sodabox_common::paths;
 use sodabox_common::policy::VmPolicy;
 use sodabox_common::protocol::{Request, Response};
+use sodabox_common::quota::Balances;
 
 /// The VM-runtime operations the control socket dispatches to. Methods are
 /// synchronous: they only touch in-memory state (behind the supervisor's own
@@ -53,6 +54,14 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn stop(&self);
     /// A fresh subscription to the live event feed for `subscribe`.
     fn subscribe(&self) -> broadcast::Receiver<Event>;
+    /// The inference gateway's live token balances (ADR-0020).
+    fn quota_get(&self) -> Result<Balances, String> {
+        Err("this supervisor has no inference gateway".to_string())
+    }
+    /// Re-read the quota ledger after a grant was appended.
+    fn quota_reload(&self) -> Result<(), String> {
+        Err("this supervisor has no inference gateway".to_string())
+    }
 }
 
 /// The control socket server. Generic over the [`ControlHandler`] so the real
@@ -187,6 +196,16 @@ async fn serve_conn<H: ControlHandler>(stream: UnixStream, handler: Arc<H>) -> i
                 write_line(&mut wr, &Response::Ok).await?;
                 stream_events(&mut wr, handler.subscribe()).await?;
                 return Ok(());
+            }
+            Request::QuotaGet => {
+                let resp = match handler.quota_get() {
+                    Ok(balances) => Response::Quota { balances },
+                    Err(msg) => Response::Error { msg },
+                };
+                write_line(&mut wr, &resp).await?;
+            }
+            Request::QuotaReload => {
+                write_line(&mut wr, &to_response(handler.quota_reload())).await?;
             }
         }
     }

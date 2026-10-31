@@ -15,6 +15,97 @@ pub struct VmPolicy {
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub limits: Limits,
+    /// The inference gateway's settings (ADR-0020). Configuring it does not
+    /// grant access: that takes a `service` rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<GatewayConfig>,
+    /// Model aliases the gateway resolves (ADR-0020). The aliases are also the
+    /// allowlist of models: a name without one is rejected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelAlias>,
+}
+
+/// The services sodabox itself offers the guest (ADR-0020). A `service` rule
+/// may only name one of these.
+pub const SERVICES: &[&str] = &["inference"];
+
+/// `[gateway]` in `policy.toml` (ADR-0020).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `unlimited` turns the quota off for every alias of the VM.
+    #[serde(default, skip_serializing_if = "QuotaMode::is_limited")]
+    pub quota: QuotaMode,
+}
+
+/// Whether token quotas apply (ADR-0020).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuotaMode {
+    #[default]
+    Limited,
+    Unlimited,
+}
+
+impl QuotaMode {
+    pub fn is_limited(&self) -> bool {
+        *self == QuotaMode::Limited
+    }
+}
+
+/// One `[[models]]` table: the name the guest uses for a model, and which
+/// provider and upstream model it stands for on this VM (ADR-0020).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAlias {
+    /// The name the guest sends as `model`.
+    pub alias: String,
+    /// A provider file in `$XDG_CONFIG_HOME/sodabox/providers/`.
+    pub provider: String,
+    /// The model name sent upstream.
+    pub model: String,
+    /// The balance written to the ledger when the alias is first used
+    /// (default 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_quota: Option<u64>,
+    /// `unlimited` turns the quota off for this alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<QuotaMode>,
+}
+
+impl ModelAlias {
+    /// Check the alias the way the gateway will use it.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_alias(&self.alias)?;
+        crate::profile::validate_name(&self.provider)
+            .map_err(|e| format!("model '{}': provider: {e}", self.alias))?;
+        if self.model.is_empty() || self.model.chars().any(char::is_control) {
+            return Err(format!(
+                "model '{}': invalid upstream model name",
+                self.alias
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An alias is what a client puts in `model`, e.g. `foo:13b` or
+/// `mistral/large`. It is matched exactly and shown to the guest, so it must
+/// be printable, have no whitespace, and be at most 128 bytes.
+pub fn validate_alias(alias: &str) -> Result<(), String> {
+    if alias.is_empty() || alias.len() > 128 {
+        return Err(format!(
+            "invalid model alias '{alias}': must be 1–128 bytes"
+        ));
+    }
+    if alias.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "invalid model alias '{alias}': no whitespace or control characters"
+        ));
+    }
+    Ok(())
 }
 
 /// A single allowlist rule. `ip` is a static permit; `domain` also permits DNS
@@ -39,6 +130,9 @@ pub enum Rule {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proto: Option<String>,
     },
+    /// Access to a service sodabox itself offers the guest, e.g. the
+    /// inference gateway (ADR-0020). Not an egress permit.
+    Service { name: String },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,15 +249,75 @@ impl VmPolicy {
     /// (the `deny` verb). Returns how many rules were removed.
     pub fn remove_matching(&mut self, spec: &str) -> usize {
         let before = self.rules.len();
-        self.rules.retain(|r| match r {
-            Rule::Ip { cidr, .. } => cidr != spec,
-            Rule::Domain { name, .. } => name != spec,
-        });
+        self.rules.retain(|r| r.target() != spec);
         before - self.rules.len()
+    }
+
+    /// Add a `service` rule granting the guest access to one of [`SERVICES`].
+    /// Returns `Ok(false)` if the VM already has it.
+    pub fn add_service(&mut self, name: &str) -> Result<bool, String> {
+        let rule = Rule::Service {
+            name: name.to_string(),
+        };
+        rule.validate()?;
+        if self.rules.contains(&rule) {
+            return Ok(false);
+        }
+        self.rules.push(rule);
+        Ok(true)
+    }
+
+    /// Whether a `service` rule grants access to `name`.
+    pub fn allows_service(&self, name: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|r| matches!(r, Rule::Service { name: n } if n == name))
+    }
+
+    /// The alias table for `alias`, if any.
+    pub fn model(&self, alias: &str) -> Option<&ModelAlias> {
+        self.models.iter().find(|m| m.alias == alias)
+    }
+
+    /// Whether `alias` is metered: false if the gateway or the alias is set to
+    /// `unlimited`. The VM-wide setting wins.
+    pub fn is_metered(&self, alias: &str) -> bool {
+        let vm = self.gateway.as_ref().map(|g| g.quota).unwrap_or_default();
+        let own = self.model(alias).and_then(|m| m.quota).unwrap_or_default();
+        vm.is_limited() && own.is_limited()
+    }
+
+    /// Check every model alias, and that no alias appears twice.
+    pub fn validate_models(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for m in &self.models {
+            m.validate()?;
+            if !seen.insert(m.alias.as_str()) {
+                return Err(format!("model alias '{}' is defined twice", m.alias));
+            }
+        }
+        Ok(())
     }
 }
 
+/// What [`PolicyFile::set_model`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelChange {
+    Added,
+    /// The alias existed and now points elsewhere; its balance is kept.
+    Repointed,
+    Unchanged,
+}
+
 impl Rule {
+    /// What `soda deny <spec>` matches: the CIDR, domain or service name.
+    pub fn target(&self) -> &str {
+        match self {
+            Rule::Ip { cidr, .. } => cidr,
+            Rule::Domain { name, .. } | Rule::Service { name } => name,
+        }
+    }
+
     /// Check the rule with the same parsers the allowlist compiles it with,
     /// plus hostname validation for domain rules, so a rule read from a file
     /// (a profile) is rejected up front rather than at policy load.
@@ -179,6 +333,15 @@ impl Rule {
             } => {
                 validate_domain(name)?;
                 (ports, proto)
+            }
+            Rule::Service { name } => {
+                if !SERVICES.contains(&name.as_str()) {
+                    return Err(format!(
+                        "unknown service '{name}' (known: {})",
+                        SERVICES.join(", ")
+                    ));
+                }
+                return Ok(());
             }
         };
         PortSpec::parse(ports.as_deref())?;
@@ -211,7 +374,7 @@ impl PolicyFile {
     pub fn parse(text: &str) -> Result<PolicyFile, String> {
         let doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
         let file = PolicyFile { doc };
-        file.policy()?;
+        file.policy()?.validate_models()?;
         Ok(file)
     }
 
@@ -301,11 +464,7 @@ impl PolicyFile {
         let mut err = None;
         rules.retain(|t| match table_rule(t) {
             Ok(rule) => {
-                let target = match &rule {
-                    Rule::Ip { cidr, .. } => cidr,
-                    Rule::Domain { name, .. } => name,
-                };
-                let keep = target != spec;
+                let keep = rule.target() != spec;
                 removed += usize::from(!keep);
                 keep
             }
@@ -347,6 +506,104 @@ impl PolicyFile {
         Ok(added)
     }
 
+    /// [`VmPolicy::add_service`], applied to the document.
+    pub fn add_service(&mut self, name: &str) -> Result<bool, String> {
+        let mut p = self.policy()?;
+        if !p.add_service(name)? {
+            return Ok(false);
+        }
+        self.push_rule(p.rules.last().expect("just pushed"))?;
+        Ok(true)
+    }
+
+    /// Switch the gateway on or off in `[gateway]`, creating the table if
+    /// needed. Returns `false` if it was already in that state.
+    pub fn set_gateway_enabled(&mut self, enabled: bool) -> Result<bool, String> {
+        let was = self.policy()?.gateway.is_some_and(|g| g.enabled);
+        if was == enabled {
+            return Ok(false);
+        }
+        self.gateway_table()?["enabled"] = toml_edit::value(enabled);
+        Ok(true)
+    }
+
+    /// Set the quota mode of one alias, or of the whole VM (`alias = None`,
+    /// in `[gateway]`). `limited` is the default, so it removes the key.
+    /// Returns `false` if nothing changed.
+    pub fn set_quota_mode(&mut self, alias: Option<&str>, mode: QuotaMode) -> Result<bool, String> {
+        let p = self.policy()?;
+        let current = match alias {
+            None => p.gateway.as_ref().map(|g| g.quota).unwrap_or_default(),
+            Some(a) => p
+                .model(a)
+                .ok_or_else(|| format!("no model alias '{a}'"))?
+                .quota
+                .unwrap_or_default(),
+        };
+        if current == mode {
+            return Ok(false);
+        }
+        let table = match alias {
+            None => self.gateway_table()?,
+            Some(a) => self.model_table_mut(a)?,
+        };
+        match mode {
+            QuotaMode::Unlimited => table["quota"] = toml_edit::value("unlimited"),
+            QuotaMode::Limited => {
+                table.remove("quota");
+            }
+        }
+        Ok(true)
+    }
+
+    /// Add a model alias, or re-point an existing one to `provider`/`model`.
+    /// Re-pointing keeps the alias's other settings, and its balance lives on
+    /// in the ledger (ADR-0020). `initial_quota` applies only when adding.
+    pub fn set_model(
+        &mut self,
+        alias: &str,
+        provider: &str,
+        model: &str,
+        initial_quota: Option<u64>,
+    ) -> Result<ModelChange, String> {
+        let new = ModelAlias {
+            alias: alias.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            initial_quota,
+            quota: None,
+        };
+        new.validate()?;
+        let p = self.policy()?;
+        if let Some(old) = p.model(alias) {
+            if old.provider == provider && old.model == model {
+                return Ok(ModelChange::Unchanged);
+            }
+            let table = self.model_table_mut(alias)?;
+            table["provider"] = toml_edit::value(provider);
+            table["model"] = toml_edit::value(model);
+            return Ok(ModelChange::Repointed);
+        }
+        let text = toml::to_string(&new).map_err(|e| format!("{e}"))?;
+        let doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+        let mut table = fresh_table(doc.as_table());
+        table.decor_mut().set_prefix("\n");
+        self.aot_or_insert("models")?.push(table);
+        Ok(ModelChange::Added)
+    }
+
+    /// Remove a model alias together with its comments. Its ledger history is
+    /// kept, so adding the alias back continues from the old balance.
+    /// Returns `false` if there was no such alias.
+    pub fn remove_model(&mut self, alias: &str) -> Result<bool, String> {
+        let Some(models) = self.aot_mut("models") else {
+            return Ok(false);
+        };
+        let before = models.len();
+        models.retain(|t| t.get("alias").and_then(|v| v.as_str()) != Some(alias));
+        Ok(models.len() != before)
+    }
+
     /// Append `rule` as a new `[[rules]]` table.
     fn push_rule(&mut self, rule: &Rule) -> Result<(), String> {
         let text = toml::to_string(rule).map_err(|e| format!("{e}"))?;
@@ -357,10 +614,39 @@ impl PolicyFile {
         Ok(())
     }
 
-    /// The `rules` array of tables, if present. An inline `rules = [{…}]` is
-    /// converted to `[[rules]]` tables first.
+    /// The `[gateway]` table, created if missing.
+    fn gateway_table(&mut self) -> Result<&mut toml_edit::Table, String> {
+        let item = self
+            .doc
+            .entry("gateway")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        item.as_table_mut()
+            .ok_or_else(|| "policy.toml: `gateway` is not a table".to_string())
+    }
+
+    /// The `[[models]]` table for `alias`.
+    fn model_table_mut(&mut self, alias: &str) -> Result<&mut toml_edit::Table, String> {
+        self.aot_mut("models")
+            .and_then(|m| {
+                m.iter_mut()
+                    .find(|t| t.get("alias").and_then(|v| v.as_str()) == Some(alias))
+            })
+            .ok_or_else(|| format!("no model alias '{alias}'"))
+    }
+
+    /// The `rules` array of tables, if present.
     fn rules_mut(&mut self) -> Option<&mut toml_edit::ArrayOfTables> {
-        let item = self.doc.get_mut("rules")?;
+        self.aot_mut("rules")
+    }
+
+    fn rules_or_insert(&mut self) -> Result<&mut toml_edit::ArrayOfTables, String> {
+        self.aot_or_insert("rules")
+    }
+
+    /// The array of tables at `key`, if present. An inline `key = [{…}]` is
+    /// converted to `[[key]]` tables first.
+    fn aot_mut(&mut self, key: &str) -> Option<&mut toml_edit::ArrayOfTables> {
+        let item = self.doc.get_mut(key)?;
         if !item.is_array_of_tables() {
             if let Ok(aot) = std::mem::take(item).into_array_of_tables() {
                 *item = toml_edit::Item::ArrayOfTables(aot);
@@ -369,16 +655,16 @@ impl PolicyFile {
         item.as_array_of_tables_mut()
     }
 
-    fn rules_or_insert(&mut self) -> Result<&mut toml_edit::ArrayOfTables, String> {
-        let empty = match self.doc.get("rules") {
+    fn aot_or_insert(&mut self, key: &str) -> Result<&mut toml_edit::ArrayOfTables, String> {
+        let empty = match self.doc.get(key) {
             None => true,
             Some(item) => item.as_array().is_some_and(|a| a.is_empty()),
         };
         if empty {
-            self.doc["rules"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+            self.doc[key] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
         }
-        self.rules_mut()
-            .ok_or_else(|| "policy.toml: `rules` is not an array of tables".to_string())
+        self.aot_mut(key)
+            .ok_or_else(|| format!("policy.toml: `{key}` is not an array of tables"))
     }
 }
 
@@ -527,5 +813,128 @@ mod tests {
             }
             other => panic!("expected domain rule, got {other:?}"),
         }
+    }
+
+    const GATEWAY_POLICY: &str = r#"version = 3
+
+# my notes on the gateway
+[gateway]
+enabled = true
+
+[[rules]]
+kind = "service"
+name = "inference"
+
+# a cheap local model
+[[models]]
+alias = "foo:13b"
+provider = "local"
+model = "the_actual_foo:13b"
+initial_quota = 1000
+"#;
+
+    #[test]
+    fn gateway_and_models_load_and_old_files_still_parse() {
+        let p: VmPolicy = toml::from_str(GATEWAY_POLICY).unwrap();
+        assert!(p.gateway.as_ref().unwrap().enabled);
+        assert!(p.allows_service("inference"));
+        assert_eq!(p.model("foo:13b").unwrap().initial_quota, Some(1000));
+        assert!(p.is_metered("foo:13b"));
+        // A pre-gateway policy has neither.
+        let old: VmPolicy = toml::from_str("version = 1\n").unwrap();
+        assert!(old.gateway.is_none() && old.models.is_empty());
+        assert!(!old.allows_service("inference"));
+    }
+
+    #[test]
+    fn only_known_services_and_valid_aliases_are_accepted() {
+        let mut p = VmPolicy::default();
+        assert_eq!(p.add_service("inference"), Ok(true));
+        assert_eq!(p.add_service("inference"), Ok(false));
+        assert!(p.add_service("ssh").is_err());
+        assert!(validate_alias("foo:13b").is_ok());
+        assert!(validate_alias("mistral/large-latest").is_ok());
+        assert!(validate_alias("").is_err());
+        assert!(validate_alias("a b").is_err());
+        let dup = format!(
+            "{GATEWAY_POLICY}\n[[models]]\nalias = \"foo:13b\"\nprovider = \"x\"\nmodel = \"y\"\n"
+        );
+        assert!(PolicyFile::parse(&dup).is_err());
+        let bad_provider =
+            "version = 1\n[[models]]\nalias = \"a\"\nprovider = \"../x\"\nmodel = \"y\"\n";
+        assert!(PolicyFile::parse(bad_provider).is_err());
+    }
+
+    #[test]
+    fn unlimited_vm_wins_over_the_alias() {
+        let mut p: VmPolicy = toml::from_str(GATEWAY_POLICY).unwrap();
+        p.models[0].quota = Some(QuotaMode::Unlimited);
+        assert!(!p.is_metered("foo:13b"));
+        p.models[0].quota = None;
+        p.gateway.as_mut().unwrap().quota = QuotaMode::Unlimited;
+        assert!(!p.is_metered("foo:13b"));
+    }
+
+    #[test]
+    fn model_edits_keep_comments_and_repoint_in_place() {
+        let mut f = PolicyFile::parse(GATEWAY_POLICY).unwrap();
+        assert_eq!(
+            f.set_model("foo:13b", "local", "the_actual_foo:13b", None),
+            Ok(ModelChange::Unchanged)
+        );
+        assert_eq!(
+            f.set_model("foo:13b", "openrouter", "foo-13b", None),
+            Ok(ModelChange::Repointed)
+        );
+        assert_eq!(
+            f.set_model("big", "mistral", "mistral-large-latest", Some(5)),
+            Ok(ModelChange::Added)
+        );
+        let text = f.to_string();
+        assert!(text.contains("# my notes on the gateway"));
+        assert!(text.contains("# a cheap local model"));
+        let p = f.policy().unwrap();
+        let foo = p.model("foo:13b").unwrap();
+        assert_eq!(
+            (foo.provider.as_str(), foo.model.as_str()),
+            ("openrouter", "foo-13b")
+        );
+        // Re-pointing keeps the alias's other settings.
+        assert_eq!(foo.initial_quota, Some(1000));
+        assert_eq!(p.model("big").unwrap().initial_quota, Some(5));
+
+        assert_eq!(f.remove_model("foo:13b"), Ok(true));
+        assert_eq!(f.remove_model("foo:13b"), Ok(false));
+        assert!(!f.to_string().contains("# a cheap local model"));
+    }
+
+    #[test]
+    fn quota_mode_and_enable_edits() {
+        let mut f = PolicyFile::new();
+        assert_eq!(f.set_gateway_enabled(true), Ok(true));
+        assert_eq!(f.set_gateway_enabled(true), Ok(false));
+        assert!(f
+            .set_quota_mode(Some("nope"), QuotaMode::Unlimited)
+            .is_err());
+        f.set_model("foo", "local", "foo", None).unwrap();
+        assert_eq!(
+            f.set_quota_mode(Some("foo"), QuotaMode::Unlimited),
+            Ok(true)
+        );
+        assert!(!f.policy().unwrap().is_metered("foo"));
+        assert_eq!(f.set_quota_mode(Some("foo"), QuotaMode::Limited), Ok(true));
+        assert!(!f.to_string().contains("quota"));
+        assert_eq!(f.set_quota_mode(None, QuotaMode::Unlimited), Ok(true));
+        assert!(!f.policy().unwrap().is_metered("foo"));
+        assert_eq!(f.add_service("inference"), Ok(true));
+        // The edited document still parses as a policy.
+        PolicyFile::parse(&f.to_string()).unwrap();
+    }
+
+    #[test]
+    fn deny_removes_a_service_rule() {
+        let mut f = PolicyFile::parse(GATEWAY_POLICY).unwrap();
+        assert_eq!(f.remove_matching("inference"), Ok(1));
+        assert!(!f.policy().unwrap().allows_service("inference"));
     }
 }

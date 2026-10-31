@@ -170,6 +170,9 @@ fn distinct_key(ev: &Event) -> Option<String> {
             ..
         } => Some(format!("{proto} {daddr}:{dport}")),
         Event::Dns { qname, .. } => Some(strip_trailing_dot(qname).to_ascii_lowercase()),
+        Event::Inference { alias, .. } | Event::QuotaExhausted { alias, .. } => {
+            Some(format!("inference {alias}"))
+        }
         _ => None,
     }
 }
@@ -364,7 +367,9 @@ impl App {
     /// keeping the derived version/state/drop tallies current.
     fn ingest(&mut self, ev: Event) {
         match ev {
-            Event::Egress { .. } => {
+            // Gateway requests are flows too; they share the egress panel until
+            // the gateway gets its own (ADR-0020).
+            Event::Egress { .. } | Event::Inference { .. } | Event::QuotaExhausted { .. } => {
                 if self.egress.push(ev, self.unique) {
                     self.dropped = self.dropped.saturating_add(1);
                 }
@@ -508,7 +513,7 @@ impl App {
         match self.selected_rule() {
             None => Err("select a rule first (↑/↓)"),
             Some(Rule::Ip { cidr, .. }) => Ok(cidr.clone()),
-            Some(Rule::Domain { name, .. }) => Ok(name.clone()),
+            Some(Rule::Domain { name, .. }) | Some(Rule::Service { name }) => Ok(name.clone()),
         }
     }
 
@@ -1218,6 +1223,22 @@ fn event_line(ev: &Event) -> Line<'static> {
             };
             Line::from(vec![ts_span(*ts), tag_span(tag, color), Span::raw(detail)])
         }
+        Event::Inference { ts, verdict, .. } => {
+            let color = match verdict {
+                Verdict::Allowed => Color::Green,
+                Verdict::Blocked => Color::Red,
+            };
+            Line::from(vec![
+                ts_span(*ts),
+                tag_span("INFER", color),
+                Span::raw(crate::logs::inference_detail(ev).unwrap_or_default()),
+            ])
+        }
+        Event::QuotaExhausted { ts, alias } => Line::from(vec![
+            ts_span(*ts),
+            tag_span("QUOTA", Color::Red),
+            Span::raw(format!("{alias}: token quota used up")),
+        ]),
         // Not routed to a flow panel, but render defensively.
         Event::Policy { ts, version } => Line::from(vec![
             ts_span(*ts),
@@ -1265,6 +1286,7 @@ fn fmt_rule(r: &Rule) -> String {
             }
             s
         }
+        Rule::Service { name } => format!("service {name}"),
     }
 }
 

@@ -130,7 +130,7 @@ pub fn config_dir() -> PathBuf {
 
 /// Names a VM may not take: the config dir holds one `<vm>/` dir per VM next
 /// to these shared dirs, so a VM with one of these names would collide.
-pub const RESERVED_VM_NAMES: &[&str] = &["dotfiles", "guest", "profiles"];
+pub const RESERVED_VM_NAMES: &[&str] = &["dotfiles", "guest", "profiles", "providers"];
 
 /// `$XDG_CONFIG_HOME/sodabox/profiles/` — vendor and user policy profiles
 /// (ADR-0015), one `<name>.toml` each.
@@ -142,6 +142,24 @@ pub fn profiles_dir() -> PathBuf {
 /// passed [`crate::profile::validate_name`].
 pub fn profile_path(name: &str) -> PathBuf {
     profiles_dir().join(format!("{name}.toml"))
+}
+
+/// `$XDG_CONFIG_HOME/sodabox/providers/` — inference providers (ADR-0020), one
+/// `<name>.toml` each. Host-wide; never copied into a VM.
+pub fn providers_dir() -> PathBuf {
+    config_dir().join("providers")
+}
+
+/// `$XDG_CONFIG_HOME/sodabox/providers/<name>.toml`. `name` must already have
+/// passed [`crate::provider::validate_name`].
+pub fn provider_path(name: &str) -> PathBuf {
+    providers_dir().join(format!("{name}.toml"))
+}
+
+/// `$XDG_DATA_HOME/sodabox/<vm>/quota.jsonl` — the VM's token quota ledger
+/// (ADR-0020). In the data dir, out of the guest's reach.
+pub fn quota_ledger_path(vm: &str) -> PathBuf {
+    data_dir(vm).join("quota.jsonl")
 }
 
 /// `$XDG_CONFIG_HOME/sodabox/dotfiles/` — dotfile collections (ADR-0019), one

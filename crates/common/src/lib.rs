@@ -14,6 +14,8 @@ pub mod paths;
 pub mod policy;
 pub mod profile;
 pub mod protocol;
+pub mod provider;
+pub mod quota;
 pub mod ssh;
 pub mod storage;
 pub mod vm;

@@ -27,6 +27,29 @@ pub enum Event {
         answers: Vec<String>,
         ttl: u32,
     },
+    /// One request through the inference gateway (ADR-0020). Metadata only:
+    /// prompts and completions are never part of an event.
+    Inference {
+        ts: u64,
+        verdict: Verdict,
+        /// The route's API format: `openai` or `ollama`.
+        api: String,
+        alias: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// HTTP status returned to the guest.
+        status: u16,
+        #[serde(default)]
+        tokens: Tokens,
+        /// False if the response ended early (client gone, upstream cut off),
+        /// so the usage may be partial.
+        complete: bool,
+        latency_ms: u64,
+    },
+    /// A request was refused because the alias's token quota is used up.
+    QuotaExhausted { ts: u64, alias: String },
     /// A live policy change.
     Policy { ts: u64, version: u32 },
     /// VM lifecycle transition.
@@ -46,6 +69,31 @@ pub fn now_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Token usage of one inference request, as the provider reported it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tokens {
+    /// Prompt tokens, including `cache_read`.
+    pub input: u64,
+    /// Completion tokens, including `reasoning`.
+    pub output: u64,
+    #[serde(default)]
+    pub reasoning: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+}
+
+impl Tokens {
+    /// What a request costs against a quota: input and output, but not cache
+    /// reads (ADR-0020).
+    pub fn metered(&self) -> u64 {
+        self.input.saturating_sub(self.cache_read) + self.output
+    }
+
+    pub fn total(&self) -> u64 {
+        self.input + self.output
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

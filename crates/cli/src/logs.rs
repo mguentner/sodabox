@@ -62,6 +62,40 @@ fn render(raw: &str) -> String {
     }
 }
 
+/// The detail of an inference event, shared with the TUI:
+/// `alias -> provider/model  200  in 1200 out 300  850ms`.
+pub(crate) fn inference_detail(ev: &Event) -> Option<String> {
+    let Event::Inference {
+        alias,
+        provider,
+        model,
+        status,
+        tokens,
+        complete,
+        latency_ms,
+        ..
+    } = ev
+    else {
+        return None;
+    };
+    let mut d = alias.clone();
+    if let (Some(p), Some(m)) = (provider, model) {
+        d.push_str(&format!(" -> {p}/{m}"));
+    }
+    d.push_str(&format!(
+        "  {status}  in {} out {}",
+        tokens.input, tokens.output
+    ));
+    if tokens.cache_read > 0 {
+        d.push_str(&format!(" (cached {})", tokens.cache_read));
+    }
+    d.push_str(&format!("  {latency_ms}ms"));
+    if !complete {
+        d.push_str("  (partial)");
+    }
+    Some(d)
+}
+
 /// `<ts>  <TAG>  <detail>` for one event, mirroring the TUI's tags in plain text.
 fn render_event(ev: &Event) -> String {
     let (ts, tag, detail) = match ev {
@@ -100,6 +134,16 @@ fn render_event(ev: &Event) -> String {
                 format!("{qname} -> {} (ttl {ttl})", answers.join(","))
             };
             (*ts, tag, d)
+        }
+        Event::Inference { ts, verdict, .. } => {
+            let tag = match verdict {
+                Verdict::Allowed => "INFER",
+                Verdict::Blocked => "INFER-NO",
+            };
+            (*ts, tag, inference_detail(ev).unwrap_or_default())
+        }
+        Event::QuotaExhausted { ts, alias } => {
+            (*ts, "QUOTA", format!("{alias}: token quota used up"))
         }
         Event::Policy { ts, version } => (*ts, "POLICY", format!("v{version}")),
         Event::Lifecycle { ts, state } => (*ts, "LIFECYCLE", state.clone()),

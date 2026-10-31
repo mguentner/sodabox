@@ -3,6 +3,7 @@
 //! server side lives in the supervisor's control module.
 
 use crate::policy::VmPolicy;
+use crate::quota::Balances;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,10 @@ pub enum Request {
     Stop,
     /// Begin streaming the live event feed (ADR-0009).
     Subscribe,
+    /// The live token balances (ADR-0020).
+    QuotaGet,
+    /// Re-read the quota ledger after the CLI appended a grant.
+    QuotaReload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,5 +35,6 @@ pub enum Response {
     Ok,
     Status { state: String, policy_version: u32 },
     Policy { policy: VmPolicy },
+    Quota { balances: Balances },
     Error { msg: String },
 }
