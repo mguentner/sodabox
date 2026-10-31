@@ -8,6 +8,7 @@ members = [
     "crates/common",
     "crates/proxy",
     "crates/dns",
+    "crates/gateway",
     "crates/supervisor",
     "crates/cli",
 ]
@@ -35,8 +36,16 @@ thiserror = "2"
 # so a single dep covers rendering, raw mode and input — no separate crossterm
 # entry to keep version-aligned.
 ratatui = "0.29"
+# Inference gateway (ADR-0020): an HTTP/1.1 server on connections the proxy
+# hands over, and an HTTPS client to providers. rustls only, no OpenSSL.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"] }
 # internal crates
 sodabox-common = { path = "crates/common" }
 sodabox-proxy = { path = "crates/proxy" }
 sodabox-dns = { path = "crates/dns" }
+sodabox-gateway = { path = "crates/gateway" }
 sodabox-supervisor = { path = "crates/supervisor" }

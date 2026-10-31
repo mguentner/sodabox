@@ -1,0 +1,20 @@
+[package]
+name = "sodabox-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sodabox-common.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+http-body-util = { workspace = true, features = ["channel"] }
+toml.workspace = true

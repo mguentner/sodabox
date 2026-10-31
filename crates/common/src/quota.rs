@@ -61,7 +61,8 @@ pub struct Balance {
 }
 
 impl Balance {
-    fn apply(&mut self, e: &Entry) {
+    /// Fold one ledger entry into the balance.
+    pub fn apply(&mut self, e: &Entry) {
         self.balance = self.balance.saturating_add(e.delta);
         match e.reason {
             Reason::Initial => {
