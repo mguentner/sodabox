@@ -44,6 +44,7 @@ runs arbitrary Linux applications inside microVMs with a whitelist-only network.
 | [0017](0017-optional-virtiofs-share.md) | Optional virtiofs share | Proposed |
 | [0018](0018-caches-on-data-disk.md) | Tool caches on the data disk | Accepted |
 | [0019](0019-dotfile-collections.md) | Dotfile collections | Accepted |
+| [0020](0020-inference-gateway.md) | Inference gateway | Proposed |
 
 ## Conventions
 
