@@ -118,10 +118,36 @@ a VM may use, are part of the VM's policy.
 
 ## Details
 
+### Scope of the first implementation
+
+The first pass (branch `token-gateway`) serves:
+
+- **OpenAI-compatible Chat Completions**, for `openai` providers (OpenAI,
+  OpenRouter, vLLM, Ollama's `/v1`, …) and `mistral` providers.
+- **Ollama's native API**, for `ollama` providers.
+
+The Anthropic Messages API and the OpenAI Responses API come later. So do
+profile merging of `[[models]]`, the TUI gateway panel (inference events show
+in the egress panel until then), and `soda provider test`.
+
+**Routing is by path, without prefixes.** Clients keep their usual base URL,
+and the path says which format they speak:
+
+| Path | Format | Served by providers with `api =` |
+|---|---|---|
+| `POST /v1/chat/completions`, `GET /v1/models` | OpenAI | `openai`, `mistral` |
+| `POST /api/chat`, `POST /api/generate`, `GET /api/tags` | Ollama | `ollama` |
+
+Path prefixes (`/openai/...`) were dropped because Ollama clients take only a
+host (`OLLAMA_HOST`) and call `/api/...` at the root. The model lists return
+the VM's aliases, never upstream model names. When the Anthropic format is
+added, its `/v1/messages` path doesn't collide with these.
+
 ### Reachability
 
 ```
-guest: ANTHROPIC_BASE_URL=http://inference.sodabox.internal/anthropic
+guest: OPENAI_BASE_URL=http://inference.sodabox.internal/v1
+       OLLAMA_HOST=http://inference.sodabox.internal
   │ DNS: inference.sodabox.internal → 10.0.2.4   (only if a rule allows it,
   │                                               else REFUSED like any name)
   ▼
@@ -143,8 +169,10 @@ gateway: parse, resolve alias, check quota, strip client auth,
   default.**
 - The upstream host does **not** need to be in the VM's allowlist. The gateway
   dials it on its own behalf. A VM that only talks to the gateway can have
-  `api.anthropic.com` removed from its policy, which removes a direct path
-  out.
+  `api.mistral.ai` removed from its policy, which removes a direct path out.
+- The gateway reaches providers over rustls with the **host's trust store**,
+  so a self-hosted provider behind a private CA works. It follows no
+  redirects, so the credential can't be carried to another host.
 - In v1 the guest leg is plain HTTP/1.1, which is enough for streaming (SSE)
   over a leg that never leaves the host (guest → passt → netns). If HTTPS is
   needed later, for clients that refuse `http://` base URLs or for
@@ -166,17 +194,31 @@ gateway: parse, resolve alias, check quota, strip client auth,
 (ADR-0015):
 
 ```toml
-description = "Anthropic, team workspace"
-api = "anthropic"                      # anthropic | openai | ollama
-base_url = "https://api.anthropic.com"
+description = "Mistral La Plateforme"
+api = "mistral"                        # openai | mistral | ollama
+base_url = "https://api.mistral.ai/v1" # including the version path
 # The secret is fetched at use and cached in memory only, never written to disk
 # by sodabox. Same idea as git's credential helpers.
-auth = { header = "x-api-key", command = ["pass", "show", "llm/anthropic"] }
+auth = { command = ["pass", "show", "llm/mistral"] }
+```
+
+```toml
+api = "ollama"
+base_url = "http://127.0.0.1:11434"    # the gateway dials from the host netns
+# no auth: a local Ollama needs none
 ```
 
 - `auth.command` (or `auth.env`) keeps the secret in the user's own store.
   sodabox stores no secrets, which matches ADR-0019's "don't build secret
-  features".
+  features". Only the first line of the command's output counts, so `pass`
+  entries work as they are.
+- `auth.header` defaults to `authorization` with the `Bearer` scheme. Another
+  header (e.g. `x-api-key`) gets the bare credential unless `auth.scheme` says
+  otherwise.
+- If a provider answers 401 or 403, the cached credential is dropped, so a
+  rotated key is fetched again on the next request.
+- Provider files are read on every request, so edits apply without restarting
+  the VM.
 - A provider file holds the *how* (endpoint, auth). A VM's policy holds the
   *what* (which models). The ledger holds *how much* (token balances).
 
@@ -191,16 +233,15 @@ enabled = true
 kind = "service"
 name = "inference"
 
-# from profile 'claudecode-gw'
 [[models]]
-alias = "claude-sonnet"              # what the guest sends as "model"
-provider = "anthropic-team"
-model = "claude-sonnet-5-5"          # what goes upstream
+alias = "big"                        # what the guest sends as "model"
+provider = "mistral"
+model = "mistral-large-latest"       # what goes upstream
 initial_quota = 0                    # optional: balance on first use (default 0)
 
 [[models]]
 alias = "foo:13b"
-provider = "openrouter"
+provider = "local"
 model = "the_actual_foo:13b"
 quota = "unlimited"                  # optional: no quota for this alias
 ```
@@ -230,10 +271,10 @@ on a single request, and no money (see *Not in scope: money*).
   can't reach:
 
   ```
-  {"ts":…, "alias":"claude-sonnet", "delta":0,       "reason":"initial"}
-  {"ts":…, "alias":"claude-sonnet", "delta":2000000, "reason":"grant"}
-  {"ts":…, "alias":"claude-sonnet", "delta":-48211,  "reason":"usage"}
-  {"ts":…, "alias":"foo:13b",       "delta":0, "tokens":9120, "reason":"unmetered"}
+  {"ts":…, "alias":"big",     "delta":0,       "reason":"initial"}
+  {"ts":…, "alias":"big",     "delta":2000000, "reason":"grant"}
+  {"ts":…, "alias":"big",     "delta":-48211,  "reason":"usage", "tokens":48211}
+  {"ts":…, "alias":"foo:13b", "delta":0,       "reason":"unmetered", "tokens":9120}
   ```
 
   The balance is the sum of the deltas. The ledger is the audit trail of what
@@ -241,14 +282,18 @@ on a single request, and no money (see *Not in scope: money*).
   refills it.
 - **Initial balance:** the first request for an alias writes an `initial`
   entry with the alias's `initial_quota` (0 if not set).
-- **Top-up:** `soda quota grant <alias> <tokens>`, or a hotkey in the TUI. Both
-  go through the control socket; the supervisor appends the grant and the new
-  balance applies at once. Grants can be made before the VM first uses the
-  alias.
-- **What counts:** input + output tokens (output includes reasoning). Cache
-  reads and cache writes are tracked and shown, but don't use up quota. Agents
-  re-send their cached context every turn, so counting it would make quotas
-  drain at a rate that has little to do with the work done.
+- **Top-up:** `soda quota grant <alias> <tokens>` (later also a hotkey in the
+  TUI). The CLI appends the grant to the ledger and, if the VM is running,
+  asks the supervisor to re-read it (`QuotaReload`), so the new balance applies
+  at once. Each entry is a single append to an `O_APPEND` file, so the CLI and
+  the supervisor never interleave lines. Grants can be made before the VM
+  first uses the alias.
+- **What counts:** input + output tokens (output includes reasoning), minus
+  cache reads. Cache reads are tracked and shown, but don't use up quota.
+  Agents re-send their cached context every turn, so counting it would make
+  quotas drain at a rate that has little to do with the work done. (Cache
+  writes, which only the Anthropic API reports, will be tracked with that
+  format.)
 - **The balance belongs to the alias.** Re-pointing an alias to another
   provider or model keeps its balance. Removing an alias keeps its history in
   the ledger, and adding it back continues from the old balance.
@@ -271,16 +316,16 @@ on a single request, and no money (see *Not in scope: money*).
 - **When the quota is used up**, the gateway returns the error each API's own
   clients treat as "out of credit, don't retry", so the agent shows it
   instead of retrying:
-  - Anthropic: `400`, `type: invalid_request_error` (the shape of Anthropic's
-    own "credit balance too low" error).
-  - OpenAI: `429`, `code: insufficient_quota`. A plain 429 would be retried
-    with backoff; this code is not.
-  - Ollama: a 4xx with a plain `error` string.
+  - OpenAI-compatible: `429`, `code: insufficient_quota`. A plain 429 would
+    be retried with backoff; this code is not.
+  - Ollama: `403` with a plain `error` string. Ollama has no quota error of
+    its own, and a 429 could be retried.
+  - Anthropic (when added): `400`, `type: invalid_request_error` (the shape of
+    Anthropic's own "credit balance too low" error).
 
-  The message says what to do: `sodabox: token quota for 'claude-sonnet' on
-  VM 'vm1' is used up. Grant more on the host: soda quota grant
-  claude-sonnet <n> --vm vm1`. A `QuotaExhausted` event shows it in the TUI
-  too.
+  The message says what to do: `sodabox: token quota for 'big' on VM 'vm1' is
+  used up. Grant more on the host: soda quota grant big <tokens> --vm vm1`. A
+  `QuotaExhausted` event shows it in the TUI too.
 
 ### Not in scope: money
 
@@ -293,33 +338,45 @@ in the event log.
 
 ### Request handling
 
-- Remove every client auth header (`authorization`, `x-api-key`,
-  `api-key`, …) and hop-by-hop headers, then set the provider's header.
+- Upstream headers are built fresh: `content-type`, the client's `accept`, and
+  the provider's auth header. Nothing else from the client is forwarded, so
+  its auth headers (`authorization`, `x-api-key`, …) never reach a provider.
 - Rewrite only `model` in the JSON body (plus the stream-usage option below).
-  Stream the response (SSE) through without buffering.
-- Read token usage from each API's own reporting. Anthropic: input and cache
-  usage in `message_start`, output in `message_delta`. OpenAI Responses:
-  `response.completed`. Ollama: the final chunk. Non-streamed responses:
-  the body. **Chat Completions streams** only report usage when the request
-  sets `stream_options.include_usage`, so the gateway sets it, or streamed
-  requests would go uncounted.
+  Stream the response through without buffering.
+- Read token usage from each API's own reporting:
+  - **Chat Completions:** the `usage` object, on the last chunk of a stream.
+    OpenAI only sends it when the request sets `stream_options.include_usage`,
+    so the gateway sets it for `openai` providers, or streamed requests would
+    go uncounted.
+  - **Mistral:** sends usage on its last chunk without being asked, so its
+    requests are left as they are.
+  - **Ollama:** `prompt_eval_count`/`eval_count` on the `done: true` object.
+  - **Non-streamed responses:** the same fields in the body.
+  - **Later formats:** Anthropic reports input and cache usage in
+    `message_start` and output in `message_delta`; OpenAI Responses in
+    `response.completed`.
 - A client that disconnects mid-stream is still billed by the provider. The
   gateway books the usage seen so far and marks the request incomplete.
-- Cap the request body size, set timeouts, and limit concurrency per VM. This
-  is a new parser exposed to the guest, so it gets the same care as the proxy.
-- Scrub upstream error bodies before returning them (some echo part of the
-  key).
+- This is a new parser exposed to the guest, so it gets the same care as the
+  proxy:
+  - request bodies are capped at 32 MiB;
+  - clients get 30 s to send their headers;
+  - a provider may stay silent for up to 10 minutes mid-response (reasoning
+    models think before the first token);
+  - at most 8 requests per VM are in flight, and more wait.
+- Upstream error bodies are passed on with their status, cut to one line, with
+  the credential redacted (some providers echo part of the key).
 - Events: `Event::Inference { ts, verdict, api, alias, provider, model,
-  status, tokens { input, output, reasoning, cache_read, cache_write },
-  complete, latency_ms }` and `Event::QuotaExhausted { ts, alias }`. Metadata
-  only. Prompts and completions are **never** logged.
+  status, tokens { input, output, reasoning, cache_read }, complete,
+  latency_ms }` and `Event::QuotaExhausted { ts, alias }`. Metadata only.
+  Prompts and completions are **never** logged.
 
 ### CLI / TUI
 
 ```
-soda provider ls | show <name> | test <name>
+soda provider ls | show <name>             # `test <name>` comes later
 soda model ls [--vm <vm>]
-soda model add <alias> <provider>/<model> [--vm <vm>]
+soda model add <alias> <provider>/<model> [--initial-quota N] [--vm <vm>]
 soda model rm <alias> [--vm <vm>]
 soda quota show [--vm <vm>]
 soda quota grant <alias> <tokens> [--vm <vm>]   # e.g. 2M
@@ -327,7 +384,7 @@ soda quota unlimited [<alias>] [--vm <vm>]      # no alias: the whole VM
 soda quota limited [<alias>] [--vm <vm>]
 soda gateway enable|disable [--vm <vm>]   # the [gateway] section
 soda allow service inference [--vm <vm>]  # the access rule
-soda deny service inference [--vm <vm>]
+soda deny inference [--vm <vm>]           # removes the access rule
 ```
 
 - A **Gateway panel** in the existing per-VM `soda tui` (ADR-0009): recent
@@ -398,12 +455,20 @@ counters but no guest-facing surface, which is the part worth sharing.
     the client already talks to the gateway. It does need provider-specific
     auth handling, refresh tokens that rotate safely across VMs, and a check
     of the providers' terms.
-  - Do all target clients accept an `http://` base URL and a path prefix
-    (`/anthropic`)? Not verified yet. If a client rejects the path prefix, use
-    one port per API format instead (10.0.2.4:80 → anthropic, :81 → openai).
-    If it rejects `http://`, use the TLS option above.
+  - **Not yet verified on a live VM:** that passt forwards guest connections
+    to 10.0.2.4, an address inside its own guest subnet, into the netns where
+    TPROXY catches them. If it doesn't, the gateway moves to an address outside
+    10.0.2.0/24; it is a single constant in the supervisor.
+  - Do all target clients accept an `http://` base URL? If one doesn't, use
+    the TLS option above. (Path prefixes are gone, see *Scope of the first
+    implementation*.)
   - The quota-exhausted errors are chosen so that agents show them instead of
-    retrying. Not yet verified per agent (Claude Code, Codex, opencode, …).
+    retrying. Not yet verified per agent (Mistral Vibe, Ollama clients, …).
+  - Mistral is assumed to report usage on its last stream chunk without
+    `stream_options` (as its API reference shows). If it doesn't, streamed
+    Mistral requests are booked with zero tokens; a live request will tell.
+  - Building rustls's `ring` backend needs a C compiler. The dev shell and the
+    Nix build provide one; a bare `cargo build` outside them does not.
   - Non-inference APIs (GitHub, package registries, AWS) are out of scope
     here and need their own ADR.
 
