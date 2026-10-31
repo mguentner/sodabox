@@ -6,6 +6,7 @@ use sodabox_common::vm::Persist;
 mod complete;
 mod cp;
 mod daemonize;
+mod gateway;
 mod git;
 mod guest;
 mod logs;
@@ -169,6 +170,26 @@ enum Cmd {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// switch a VM's inference gateway on or off
+    Gateway {
+        #[command(subcommand)]
+        action: gateway::GatewayAction,
+    },
+    /// list or show inference providers
+    Provider {
+        #[command(subcommand)]
+        action: gateway::ProviderAction,
+    },
+    /// manage a VM's model aliases for the inference gateway
+    Model {
+        #[command(subcommand)]
+        action: gateway::ModelAction,
+    },
+    /// show or change a VM's token quotas
+    Quota {
+        #[command(subcommand)]
+        action: gateway::QuotaAction,
+    },
     /// live TUI monitor for a VM
     Tui {
         #[arg(add = ArgValueCandidates::new(complete::vms))]
@@ -216,6 +237,13 @@ enum AllowWhat {
         exact: bool,
         #[arg(long, group = "scope")]
         wildcard: bool,
+        #[arg(long, add = ArgValueCandidates::new(complete::vms))]
+        vm: Option<String>,
+    },
+    /// allow the guest to use a service sodabox offers (`inference`)
+    Service {
+        #[arg(add = ArgValueCandidates::new(complete::services))]
+        name: String,
         #[arg(long, add = ArgValueCandidates::new(complete::vms))]
         vm: Option<String>,
     },
@@ -349,6 +377,10 @@ fn main() -> anyhow::Result<()> {
             ProfileAction::Show { name } => profile::show(&name),
             ProfileAction::Add { names, vm } => profile_add(&names, vm),
         },
+        Cmd::Gateway { action } => gateway::gateway(action),
+        Cmd::Provider { action } => gateway::provider(action),
+        Cmd::Model { action } => gateway::model(action),
+        Cmd::Quota { action } => gateway::quota(action),
         Cmd::Tui { name } => tui::run(&name),
         Cmd::Logs { name, lines, json } => logs::run(&name, lines, json),
         Cmd::Rm {
@@ -856,6 +888,9 @@ fn apply_edit(
         .map_err(|e| anyhow::anyhow!("invalid policy after edit: {e}"))?;
     Allowlist::from_policy(&policy)
         .map_err(|e| anyhow::anyhow!("invalid policy after edit: {e}"))?;
+    policy
+        .validate_models()
+        .map_err(|e| anyhow::anyhow!("invalid policy after edit: {e}"))?;
     file.set_version(policy.version + 1);
     file.save(vm)
         .map_err(|e| anyhow::anyhow!("writing policy.toml: {e}"))?;
@@ -935,6 +970,23 @@ fn allow(what: AllowWhat) -> anyhow::Result<()> {
                     .add_domain(&name, scope, None)
                     .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(added.then(|| format!("allow domain {name} ({scope:?})")))
+            })
+        }
+        AllowWhat::Service { name, vm } => {
+            let vm = resolve_vm(vm)?;
+            apply_edit(&vm, |p| {
+                let added = p.add_service(&name).map_err(|e| anyhow::anyhow!(e))?;
+                let enabled = p
+                    .policy()
+                    .map_err(|e| anyhow::anyhow!(e))?
+                    .gateway
+                    .is_some_and(|g| g.enabled);
+                if added && !enabled {
+                    println!(
+                        "note: the gateway is switched off; turn it on with `soda gateway enable --vm {vm}`"
+                    );
+                }
+                Ok(added.then(|| format!("allow service {name}")))
             })
         }
     }

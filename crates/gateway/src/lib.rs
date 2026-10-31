@@ -49,7 +49,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type GwBody = UnsyncBoxBody<Bytes, BoxError>;
 
 /// The service name a `service` rule grants access to.
-pub const SERVICE: &str = "inference";
+pub const SERVICE: &str = sodabox_common::policy::INFERENCE_SERVICE;
 
 /// Largest request body accepted. Agents send their whole context with each
 /// request, so this is generous.

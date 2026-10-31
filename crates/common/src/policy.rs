@@ -27,7 +27,10 @@ pub struct VmPolicy {
 
 /// The services sodabox itself offers the guest (ADR-0020). A `service` rule
 /// may only name one of these.
-pub const SERVICES: &[&str] = &["inference"];
+pub const SERVICES: &[&str] = &[INFERENCE_SERVICE];
+
+/// The inference gateway's service name (ADR-0020).
+pub const INFERENCE_SERVICE: &str = "inference";
 
 /// `[gateway]` in `policy.toml` (ADR-0020).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -40,3 +40,34 @@ pub fn dotfiles() -> Vec<CompletionCandidate> {
     names.sort();
     names.into_iter().map(CompletionCandidate::new).collect()
 }
+
+/// Services a `service` rule can grant (ADR-0020).
+pub fn services() -> Vec<CompletionCandidate> {
+    sodabox_common::policy::SERVICES
+        .iter()
+        .map(|s| CompletionCandidate::new(*s))
+        .collect()
+}
+
+/// Inference providers in the providers dir (ADR-0020).
+pub fn providers() -> Vec<CompletionCandidate> {
+    sodabox_common::provider::list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+/// Model aliases of every VM, with the VM as the description. The completer
+/// can't see `--vm`, so it offers all of them.
+pub fn models() -> Vec<CompletionCandidate> {
+    let mut out = Vec::new();
+    for m in VmMeta::list().unwrap_or_default() {
+        if let Ok(p) = sodabox_common::policy::VmPolicy::load(&m.name) {
+            for a in p.models {
+                out.push(CompletionCandidate::new(a.alias).help(Some(m.name.clone().into())));
+            }
+        }
+    }
+    out
+}
