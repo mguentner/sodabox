@@ -455,10 +455,18 @@ counters but no guest-facing surface, which is the part worth sharing.
     the client already talks to the gateway. It does need provider-specific
     auth handling, refresh tokens that rotate safely across VMs, and a check
     of the providers' terms.
-  - **Not yet verified on a live VM:** that passt forwards guest connections
-    to 10.0.2.4, an address inside its own guest subnet, into the netns where
-    TPROXY catches them. If it doesn't, the gateway moves to an address outside
-    10.0.2.0/24; it is a single constant in the supervisor.
+  - *Verified on a live VM (2026-10-31):* passt forwards guest connections to
+    10.0.2.4 into the netns, where TPROXY hands them to the gateway. Also
+    verified live:
+    - `inference.sodabox.internal`, and the short name `inference`, resolve
+      in the guest;
+    - the guest's key is replaced and the model rewritten upstream;
+    - usage is booked, a used-up quota returns 429 `insufficient_quota`, and a
+      grant applies to the running VM;
+    - revoking access makes the name REFUSED and blocks the connection.
+
+    Tested against a fake OpenAI-compatible provider on the host, not yet a
+    real one.
   - Do all target clients accept an `http://` base URL? If one doesn't, use
     the TLS option above. (Path prefixes are gone, see *Scope of the first
     implementation*.)
