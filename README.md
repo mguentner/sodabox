@@ -38,6 +38,12 @@ base_url = "https://api.mistral.ai/v1"
 auth = { command = ["pass", "show", "llm/mistral"] }
 ```
 
+Check it, and see which models it offers (this costs no tokens):
+
+```sh
+soda provider test mistral
+```
+
 Then, for a VM:
 
 ```sh

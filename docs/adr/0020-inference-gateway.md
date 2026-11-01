@@ -126,11 +126,11 @@ The first pass (branch `token-gateway`) serves:
   OpenRouter, vLLM, Ollama's `/v1`, …) and `mistral` providers.
 - **Ollama's native API**, for `ollama` providers.
 
-The Anthropic Messages API and the OpenAI Responses API come later. So do the
-TUI gateway panel (inference events show in the egress panel until then) and
-`soda provider test`. Profiles carrying `[[models]]` came with a second pass.
-Claude Code keeps its subscription login and direct egress for now; the
-gateway can't carry OAuth logins (see *Risks & open questions*).
+The Anthropic Messages API and the OpenAI Responses API come later. A second
+pass added profiles carrying `[[models]]`, the TUI's Inference tab and
+`soda provider test`. Claude Code keeps its subscription login and direct
+egress for now; the gateway can't carry OAuth logins (see *Risks & open
+questions*).
 
 **Routing is by path, without prefixes.** Clients keep their usual base URL,
 and the path says which format they speak:
@@ -399,7 +399,8 @@ in the event log.
 ### CLI / TUI
 
 ```
-soda provider ls | show <name>             # `test <name>` comes later
+soda provider ls | show <name>
+soda provider test <name> [--model <upstream model>]
 soda model ls [--vm <vm>]
 soda model add <alias> <provider>/<model> [--initial-quota N] [--vm <vm>]
 soda model rm <alias> [--vm <vm>]
@@ -423,6 +424,13 @@ soda deny inference [--vm <vm>]           # removes the access rule
     persist-then-push path as allow/deny.
   - Adding, re-pointing and removing aliases stay with `soda model`, since
     they need several fields typed in.
+- `soda provider test` checks a provider before a VM depends on it: it fetches
+  the credential the way the gateway does and asks for the model list with
+  it (`GET {base_url}/models`, or `/api/tags` for Ollama). That costs no
+  tokens, and the list shows the upstream names to use in `soda model add`.
+  `--model` checks that one is offered. It reports where it failed
+  (credential, rejected credential, unreachable, unexpected answer), never
+  the credential, and exits non-zero on failure.
 - The cross-VM overview (`soda tui` with no VM, already planned) fans out over
   control sockets. It shows token usage and balances per VM, with used-up
   quotas highlighted.

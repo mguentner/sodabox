@@ -17,6 +17,7 @@ pub mod api;
 mod body;
 mod book;
 mod creds;
+pub mod probe;
 pub mod usage;
 
 use std::convert::Infallible;
@@ -114,14 +115,7 @@ impl Gateway {
         events: Arc<dyn GatewayEvents>,
     ) -> Result<Gateway, String> {
         let book = QuotaBook::open(ledger).map_err(|e| format!("reading quota ledger: {e}"))?;
-        let client = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .user_agent("sodabox-gateway")
-            // A redirect could carry the credential to another host.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| format!("building HTTP client: {e}"))?;
+        let client = http_client()?;
         Ok(Gateway {
             inner: Arc::new(Inner {
                 vm: vm.to_string(),
@@ -383,23 +377,10 @@ impl Inner {
         if let Some(accept) = accept {
             upstream = upstream.header(ACCEPT, accept);
         }
-        if let (Some(auth), Some(secret)) = (&provider.spec.auth, &secret) {
-            let value = match auth.scheme() {
-                "" => secret.clone(),
-                scheme => format!("{scheme} {secret}"),
-            };
-            let mut value = HeaderValue::from_str(&value).map_err(|_| {
-                Refusal::new(
-                    ErrorKind::Config,
-                    format!(
-                        "sodabox gateway: provider '{}': credential has invalid characters",
-                        provider.name
-                    ),
-                )
-                .alias(&name)
-            })?;
-            value.set_sensitive(true);
-            upstream = upstream.header(auth.header.as_str(), value);
+        if let Some((header, value)) = auth_header(&provider, secret.as_deref()).map_err(|e| {
+            Refusal::new(ErrorKind::Config, format!("sodabox gateway: {e}")).alias(&name)
+        })? {
+            upstream = upstream.header(header, value);
         }
 
         let resp = upstream.send().await.map_err(|e| {
@@ -408,7 +389,7 @@ impl Inner {
                 format!(
                     "provider '{}' unreachable: {}",
                     provider.name,
-                    e.without_url()
+                    error_chain(e)
                 ),
             )
             .alias(&name)
@@ -505,6 +486,58 @@ impl Inner {
         }
         Ok(())
     }
+}
+
+/// The HTTP client the gateway talks to providers with: rustls with the
+/// host's trust store, timeouts, and no redirects.
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .user_agent("sodabox-gateway")
+        // A redirect could carry the credential to another host.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("building HTTP client: {e}"))
+}
+
+/// A reqwest error with its causes, e.g. `error sending request: client
+/// error (Connect): tcp connect error: Connection refused`. The top level
+/// alone ("error sending request") doesn't say what went wrong. The URL is
+/// left out; it is already in the message's context.
+fn error_chain(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        msg.push_str(&format!(": {s}"));
+        source = s.source();
+    }
+    msg
+}
+
+/// The provider's auth header (name, value) for `secret`, or `None` if the
+/// provider needs no credential. The value is marked sensitive so it never
+/// shows up in debug output.
+fn auth_header(
+    provider: &Provider,
+    secret: Option<&str>,
+) -> Result<Option<(String, HeaderValue)>, String> {
+    let (Some(auth), Some(secret)) = (&provider.spec.auth, secret) else {
+        return Ok(None);
+    };
+    let value = match auth.scheme() {
+        "" => secret.to_string(),
+        scheme => format!("{scheme} {secret}"),
+    };
+    let mut value = HeaderValue::from_str(&value).map_err(|_| {
+        format!(
+            "provider '{}': credential has invalid characters",
+            provider.name
+        )
+    })?;
+    value.set_sensitive(true);
+    Ok(Some((auth.header.clone(), value)))
 }
 
 /// Bytes of request per input token, for the estimate. About right for

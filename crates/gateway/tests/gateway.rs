@@ -594,3 +594,78 @@ data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n";
         "{raw}"
     );
 }
+
+// ---- soda provider test --------------------------------------------------
+
+#[tokio::test]
+async fn probe_lists_models_with_the_credential() {
+    let up = Upstream::start(Reply::Body(
+        200,
+        "application/json",
+        "{\"object\":\"list\",\"data\":[{\"id\":\"mistral-large-latest\"},{\"id\":\"mistral-small-latest\"}]}",
+    ))
+    .await;
+    let (_, p) = provider("m", "mistral", &up.url("/v1"), true);
+    let probe = sodabox_gateway::probe::probe(&p).await.unwrap();
+    assert!(probe.credential);
+    assert_eq!(probe.status, 200);
+    assert_eq!(
+        probe.models,
+        vec!["mistral-large-latest", "mistral-small-latest"]
+    );
+    let seen = &up.requests()[0];
+    assert_eq!(seen.path, "/v1/models");
+    assert_eq!(seen.headers["authorization"], "Bearer sk-test");
+}
+
+#[tokio::test]
+async fn probe_reads_ollama_tags_without_auth() {
+    let up = Upstream::start(Reply::Body(
+        200,
+        "application/json",
+        "{\"models\":[{\"name\":\"qwen3:0.6b\"}]}",
+    ))
+    .await;
+    let (_, p) = provider("local", "ollama", &up.url(""), false);
+    let probe = sodabox_gateway::probe::probe(&p).await.unwrap();
+    assert!(!probe.credential);
+    assert_eq!(probe.models, vec!["qwen3:0.6b"]);
+    assert_eq!(up.requests()[0].path, "/api/tags");
+}
+
+#[tokio::test]
+async fn probe_failures_say_where_it_broke() {
+    use sodabox_gateway::probe::{probe, ProbeError};
+
+    // The provider rejects the key; the error body is redacted.
+    let up = Upstream::start(Reply::Body(
+        401,
+        "application/json",
+        "{\"message\":\"bad key sk-test\"}",
+    ))
+    .await;
+    let (_, p) = provider("m", "openai", &up.url("/v1"), true);
+    match probe(&p).await {
+        Err(ProbeError::Rejected(401, detail)) => {
+            assert!(!detail.contains("sk-test"), "{detail}");
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+
+    // Nothing listens there.
+    let (_, p) = provider("m", "openai", "http://127.0.0.1:9/v1", false);
+    assert!(matches!(probe(&p).await, Err(ProbeError::Unreachable(_))));
+
+    // The credential command fails.
+    let p = Provider::parse(
+        "m",
+        "api = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nauth = { command = [\"false\"] }\n",
+    )
+    .unwrap();
+    assert!(matches!(probe(&p).await, Err(ProbeError::Credential(_))));
+
+    // A 200 that isn't a model list.
+    let up = Upstream::start(Reply::Body(200, "text/html", "<html>login</html>")).await;
+    let (_, p) = provider("m", "openai", &up.url("/v1"), false);
+    assert!(matches!(probe(&p).await, Err(ProbeError::BadResponse(_))));
+}

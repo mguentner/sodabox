@@ -41,6 +41,15 @@ pub enum ProviderAction {
         #[arg(add = ArgValueCandidates::new(complete::providers))]
         name: String,
     },
+    /// check the credential and the endpoint, and list the provider's models
+    /// (costs no tokens)
+    Test {
+        #[arg(add = ArgValueCandidates::new(complete::providers))]
+        name: String,
+        /// also check that this upstream model is offered
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -194,7 +203,77 @@ pub fn provider(action: ProviderAction) -> anyhow::Result<()> {
             );
             Ok(())
         }
+        ProviderAction::Test { name, model } => provider_test(&name, model.as_deref()),
     }
+}
+
+/// How many model names `provider test` prints.
+const MODELS_SHOWN: usize = 20;
+
+/// `soda provider test <name> [--model X]`: the credential, the endpoint and
+/// the model list, one line each; fails (non-zero exit) at the first problem.
+fn provider_test(name: &str, model: Option<&str>) -> anyhow::Result<()> {
+    use sodabox_gateway::probe::{self, ProbeError};
+
+    let p = Provider::load(name).map_err(|e| anyhow::anyhow!(e))?;
+    println!(
+        "provider '{name}' ({} API, {})",
+        p.spec.api, p.spec.base_url
+    );
+    let result = rt()?.block_on(probe::probe(&p));
+    let probe = match result {
+        Ok(probe) => probe,
+        Err(e) => {
+            let (step, hint) = match &e {
+                ProbeError::Credential(_) => (
+                    "credential",
+                    "check the provider's auth.command or auth.env",
+                ),
+                ProbeError::Rejected(..) => ("credential", "the provider refused the credential"),
+                ProbeError::Unreachable(_) => ("endpoint", "check base_url and the host's network"),
+                ProbeError::Http(..) | ProbeError::BadResponse(_) => (
+                    "endpoint",
+                    "check base_url (it includes the version path for openai/mistral)",
+                ),
+            };
+            println!("  {step:<11} FAILED: {e}");
+            anyhow::bail!("provider '{name}' failed its test: {hint}");
+        }
+    };
+    let credential = if probe.credential {
+        format!("ok ({})", auth_source(&p))
+    } else {
+        "not needed".to_string()
+    };
+    println!("  {:<11} {credential}", "credential");
+    println!(
+        "  {:<11} ok: {} in {} ms",
+        "endpoint", probe.status, probe.latency_ms
+    );
+    let mut shown: Vec<&str> = probe.models.iter().map(String::as_str).collect();
+    shown.sort_unstable();
+    let more = shown.len().saturating_sub(MODELS_SHOWN);
+    shown.truncate(MODELS_SHOWN);
+    let tail = if more > 0 {
+        format!(", … ({more} more)")
+    } else {
+        String::new()
+    };
+    println!(
+        "  {:<11} {} offered: {}{tail}",
+        "models",
+        probe.models.len(),
+        shown.join(", ")
+    );
+    if let Some(m) = model {
+        if probe.models.iter().any(|x| x == m) {
+            println!("  {:<11} '{m}' is offered", "model");
+        } else {
+            println!("  {:<11} '{m}' is NOT offered", "model");
+            anyhow::bail!("provider '{name}' doesn't offer model '{m}'");
+        }
+    }
+    Ok(())
 }
 
 /// Where a provider's credential comes from, without the credential.

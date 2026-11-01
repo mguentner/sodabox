@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 sodabox-common.workspace = true
 sodabox-supervisor.workspace = true
+sodabox-gateway.workspace = true
 tokio.workspace = true
 clap.workspace = true
 clap_complete.workspace = true

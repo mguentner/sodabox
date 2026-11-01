@@ -1380,6 +1380,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "sodabox-common",
+ "sodabox-gateway",
  "sodabox-supervisor",
  "tokio",
  "toml",
