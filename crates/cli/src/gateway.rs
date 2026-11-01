@@ -397,12 +397,9 @@ fn print_balances(policy: &VmPolicy, balances: &Balances) {
         let model = policy.model(alias);
         let balance = if model.is_some() && !policy.is_metered(alias) {
             "unlimited".to_string()
-        } else if !b.initialized {
-            // The initial balance is written on first use.
-            let initial = model.and_then(|m| m.initial_quota).unwrap_or(0) as i64;
-            (b.balance + initial).to_string()
         } else {
-            b.balance.to_string()
+            let initial = model.and_then(|m| m.initial_quota).unwrap_or(0);
+            quota::shown_balance(&b, initial).to_string()
         };
         let note = if model.is_none() { "  (removed)" } else { "" };
         println!(

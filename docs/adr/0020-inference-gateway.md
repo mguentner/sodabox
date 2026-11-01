@@ -412,12 +412,17 @@ soda allow service inference [--vm <vm>]  # the access rule
 soda deny inference [--vm <vm>]           # removes the access rule
 ```
 
-- A **Gateway panel** in the existing per-VM `soda tui` (ADR-0009): recent
-  requests (alias → provider/model, status, tokens, latency) and the alias
-  table with each alias's balance (`∞` when unlimited). Hotkeys add, re-point
-  or remove an alias, grant tokens, and switch unlimited on or off. Alias
-  edits use the same persist-then-push path as allow/deny; grants go to the
-  ledger.
+- An **Inference tab** in the existing per-VM `soda tui` (ADR-0009), next to
+  the Network tab (Egress, DNS, Policy); `1`/`2` or `←`/`→` switch tabs. It
+  shows recent requests (alias → provider/model, status, tokens, latency) and
+  the alias table with each alias's balance (`∞` when unlimited).
+  - `g` grants tokens to the highlighted alias, through a prompt in the
+    footer. Like `soda quota grant`, it appends to the ledger and has the
+    gateway re-read it.
+  - `m` switches the alias between limited and unlimited, with the same
+    persist-then-push path as allow/deny.
+  - Adding, re-pointing and removing aliases stay with `soda model`, since
+    they need several fields typed in.
 - The cross-VM overview (`soda tui` with no VM, already planned) fans out over
   control sockets. It shows token usage and balances per VM, with used-up
   quotas highlighted.

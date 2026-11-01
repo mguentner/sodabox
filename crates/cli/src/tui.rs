@@ -1,12 +1,21 @@
 //! `soda tui <vm>` — live terminal monitor (ADR-0009).
 //!
 //! Built on a control-socket `subscribe`, a ratatui render loop and bounded
-//! buffers for backpressure, it shows four panels:
+//! buffers for backpressure, it shows two tabs (`1`/`2`, `←`/`→`):
 //!
-//! - **Egress** — flow verdicts (proto, dst:port, matched rule).
-//! - **DNS** — query verdicts (name, resolved IPs, TTL).
-//! - **Policy** — the live policy version and its rules.
-//! - **Status** — VM state, configured CPU/RAM, and uptime.
+//! - **Network**
+//!   - **Egress** — flow verdicts (proto, dst:port, matched rule).
+//!   - **DNS** — query verdicts (name, resolved IPs, TTL).
+//!   - **Policy** — the live policy version and its rules.
+//!   - **Status** — VM state, configured CPU/RAM, and uptime.
+//! - **Inference** (ADR-0020)
+//!   - **Inference** — gateway requests (alias → upstream, status, tokens) and
+//!     used-up quotas.
+//!   - **Gateway** — whether the gateway is on and reachable, and each alias
+//!     with its balance (`∞` while unlimited). `g` grants tokens to the
+//!     highlighted alias (a prompt in the footer), `m` switches it between
+//!     limited and unlimited.
+//!   - **Status**, as on the other tab.
 //!
 //! Quick-actions: the focused flow panel has a selectable cursor
 //! (`Tab` switches panels, `↑`/`↓` move it), and `a`/`Enter` allows the
@@ -46,8 +55,11 @@ use tokio::sync::mpsc;
 
 use sodabox_common::event::{DnsVerdict, Event, Verdict};
 use sodabox_common::paths;
-use sodabox_common::policy::{DomainScope, PolicyFile, Rule, VmPolicy};
+use sodabox_common::policy::{
+    DomainScope, GatewayConfig, ModelAlias, PolicyFile, QuotaMode, Rule, VmPolicy,
+};
 use sodabox_common::protocol::{Request, Response};
+use sodabox_common::quota::{self, Balances, Entry, Ledger, Reason};
 use sodabox_common::vm::VmMeta;
 use sodabox_supervisor::control::{ControlClient, EventStream};
 
@@ -266,20 +278,71 @@ fn scroll_window(scroll: usize, sel: Option<usize>, height: usize, len: usize) -
 }
 
 /// The live policy as the TUI knows it: the version (kept current from the event
-/// feed) and the rules (fetched separately via `policy.get`).
+/// feed), and the rules, model aliases and gateway settings (fetched separately
+/// via `policy.get`).
+#[derive(Default)]
 struct PolicyView {
     version: u32,
     rules: Vec<Rule>,
+    models: Vec<ModelAlias>,
+    gateway: Option<GatewayConfig>,
+}
+
+impl From<VmPolicy> for PolicyView {
+    fn from(p: VmPolicy) -> Self {
+        Self {
+            version: p.version,
+            rules: p.rules,
+            models: p.models,
+            gateway: p.gateway,
+        }
+    }
+}
+
+impl PolicyView {
+    /// Whether this VM uses the inference gateway, so its panels are shown.
+    fn gateway_used(&self) -> bool {
+        self.gateway.as_ref().is_some_and(|g| g.enabled) || !self.models.is_empty()
+    }
+
+    /// Whether `alias` is metered (see [`VmPolicy::is_metered`]).
+    fn is_metered(&self, alias: &str) -> bool {
+        let vm = self.gateway.as_ref().map(|g| g.quota).unwrap_or_default();
+        let own = self
+            .models
+            .iter()
+            .find(|m| m.alias == alias)
+            .and_then(|m| m.quota)
+            .unwrap_or_default();
+        vm.is_limited() && own.is_limited()
+    }
 }
 
 /// Which panel the selection cursor is on. Egress/DNS are the flow panels (allow
 /// a just-blocked destination); Policy is the rule list (deny a selected
-/// rule).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// rule). Inference (gateway requests) and Gateway (the alias table: grant
+/// tokens, switch metering) are on the Inference tab.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Egress,
     Dns,
+    Inference,
     Policy,
+    Gateway,
+}
+
+/// The two tabs: the network (egress, DNS, policy) and the inference gateway
+/// (its requests and the alias table), switched with `1`/`2` or `←`/`→`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tab {
+    Network,
+    Inference,
+}
+
+/// The footer's input line for granting tokens to an alias (`g`).
+struct GrantPrompt {
+    alias: String,
+    input: String,
 }
 
 /// A destination the user chose to allow from a highlighted blocked row.
@@ -307,6 +370,22 @@ pub struct App {
     boot: Option<SystemTime>,
     egress: FlowPanel,
     dns: FlowPanel,
+    /// The tab shown.
+    tab: Tab,
+    /// Inference gateway requests and refusals (ADR-0020).
+    inference: FlowPanel,
+    /// Token balances by alias, from the gateway (`QuotaGet`).
+    quota: Balances,
+    /// Set when an inference event may have changed a balance.
+    quota_dirty: bool,
+    /// Cursor into `policy.models` on the Gateway panel.
+    gateway_sel: Option<usize>,
+    /// An open grant prompt; while it is, keys go to it.
+    prompt: Option<GrantPrompt>,
+    /// A grant (alias, tokens) to apply after the select.
+    pending_grant: Option<(String, u64)>,
+    /// A metering switch (alias, new mode) to apply after the select.
+    pending_metering: Option<(String, QuotaMode)>,
     /// Show one row per destination on the flow panels (`u`) instead of the tail.
     unique: bool,
     policy: PolicyView,
@@ -348,6 +427,14 @@ impl App {
             boot,
             egress: FlowPanel::new(PANEL_CAPACITY),
             dns: FlowPanel::new(PANEL_CAPACITY),
+            tab: Tab::Network,
+            inference: FlowPanel::new(PANEL_CAPACITY),
+            quota: Balances::new(),
+            quota_dirty: true,
+            gateway_sel: None,
+            prompt: None,
+            pending_grant: None,
+            pending_metering: None,
             unique: false,
             policy,
             policy_dirty: false,
@@ -367,10 +454,15 @@ impl App {
     /// keeping the derived version/state/drop tallies current.
     fn ingest(&mut self, ev: Event) {
         match ev {
-            // Gateway requests are flows too; they share the egress panel until
-            // the gateway gets its own (ADR-0020).
-            Event::Egress { .. } | Event::Inference { .. } | Event::QuotaExhausted { .. } => {
+            Event::Egress { .. } => {
                 if self.egress.push(ev, self.unique) {
+                    self.dropped = self.dropped.saturating_add(1);
+                }
+            }
+            // Gateway requests change balances; re-fetch them after this event.
+            Event::Inference { .. } | Event::QuotaExhausted { .. } => {
+                self.quota_dirty = true;
+                if self.inference.push(ev, self.unique) {
                     self.dropped = self.dropped.saturating_add(1);
                 }
             }
@@ -398,13 +490,14 @@ impl App {
             .and_then(|b| SystemTime::now().duration_since(b).ok())
     }
 
-    /// The focused flow panel, or `None` when the Policy panel is focused (it
-    /// holds rules, not events).
+    /// The focused flow panel, or `None` when the Policy or Gateway panel is
+    /// focused (they hold rules and aliases, not events).
     fn focused_flow(&self) -> Option<&FlowPanel> {
         match self.focus {
             Focus::Egress => Some(&self.egress),
             Focus::Dns => Some(&self.dns),
-            Focus::Policy => None,
+            Focus::Inference => Some(&self.inference),
+            Focus::Policy | Focus::Gateway => None,
         }
     }
 
@@ -412,7 +505,8 @@ impl App {
         match self.focus {
             Focus::Egress => Some(&mut self.egress),
             Focus::Dns => Some(&mut self.dns),
-            Focus::Policy => None,
+            Focus::Inference => Some(&mut self.inference),
+            Focus::Policy | Focus::Gateway => None,
         }
     }
 
@@ -421,7 +515,9 @@ impl App {
         match self.focus {
             Focus::Egress => self.egress.sel,
             Focus::Dns => self.dns.sel,
+            Focus::Inference => self.inference.sel,
             Focus::Policy => self.policy_sel,
+            Focus::Gateway => self.gateway_sel,
         }
     }
 
@@ -458,6 +554,7 @@ impl App {
         self.unique = !self.unique;
         self.egress.release();
         self.dns.release();
+        self.inference.release();
     }
 
     /// Move the Policy-panel cursor by `delta` rows, clamped to the rule list;
@@ -485,12 +582,64 @@ impl App {
         };
     }
 
+    /// Move the focus to the next panel of the current tab.
     fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Egress => Focus::Dns,
             Focus::Dns => Focus::Policy,
             Focus::Policy => Focus::Egress,
+            Focus::Inference => Focus::Gateway,
+            Focus::Gateway => Focus::Inference,
         };
+    }
+
+    /// Show `tab`, focusing its first panel.
+    fn show_tab(&mut self, tab: Tab) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.focus = match tab {
+                Tab::Network => Focus::Egress,
+                Tab::Inference => Focus::Inference,
+            };
+        }
+    }
+
+    /// Move the Gateway-panel cursor by `delta` aliases, clamped; the first
+    /// move from no selection lands on the first alias.
+    fn gateway_select(&mut self, delta: i32) {
+        let len = self.policy.models.len();
+        self.gateway_sel = match (len, self.gateway_sel) {
+            (0, _) => None,
+            (_, None) => Some(0),
+            (_, Some(cur)) => Some((cur as i32 + delta).clamp(0, len as i32 - 1) as usize),
+        };
+    }
+
+    /// Keep the Gateway cursor valid after the alias list changes.
+    fn clamp_gateway_sel(&mut self) {
+        let len = self.policy.models.len();
+        self.gateway_sel = match self.gateway_sel {
+            _ if len == 0 => None,
+            Some(i) => Some(i.min(len - 1)),
+            None => None,
+        };
+    }
+
+    /// The alias under the Gateway-panel cursor.
+    fn selected_alias(&self) -> Result<&ModelAlias, &'static str> {
+        self.gateway_sel
+            .and_then(|i| self.policy.models.get(i))
+            .ok_or("select an alias first (↑/↓)")
+    }
+
+    /// A balance as shown: `∞` while unlimited; otherwise the ledger balance,
+    /// plus the alias's initial quota if its first use hasn't written it yet.
+    fn balance_label(&self, alias: &ModelAlias) -> String {
+        if !self.policy.is_metered(&alias.alias) {
+            return "∞".to_string();
+        }
+        let b = self.quota.get(&alias.alias).cloned().unwrap_or_default();
+        quota::shown_balance(&b, alias.initial_quota.unwrap_or(0)).to_string()
     }
 
     /// The event under the cursor in the focused flow panel, if any.
@@ -561,14 +710,8 @@ pub fn run(vm: &str) -> anyhow::Result<()> {
         let (state, _pv) = fetch_status(vm).await.unwrap_or_else(|| ("?".into(), 0));
         let policy = fetch_policy(vm)
             .await
-            .map(|p| PolicyView {
-                version: p.version,
-                rules: p.rules,
-            })
-            .unwrap_or(PolicyView {
-                version: 0,
-                rules: Vec::new(),
-            });
+            .map(PolicyView::from)
+            .unwrap_or_default();
 
         let client = match ControlClient::connect(vm).await {
             Ok(c) => c,
@@ -675,6 +818,9 @@ fn save_bumped(vm: &str, file: &mut PolicyFile) -> anyhow::Result<VmPolicy> {
         .policy()
         .map_err(|e| anyhow::anyhow!("invalid policy: {e}"))?;
     Allowlist::from_policy(&policy).map_err(|e| anyhow::anyhow!("invalid policy: {e}"))?;
+    policy
+        .validate_models()
+        .map_err(|e| anyhow::anyhow!("invalid policy: {e}"))?;
     file.set_version(policy.version + 1);
     file.save(vm)
         .map_err(|e| anyhow::anyhow!("writing policy.toml: {e}"))?;
@@ -723,6 +869,70 @@ async fn apply_deny(vm: &str, spec: &str) -> anyhow::Result<(VmPolicy, String)> 
     }
 }
 
+/// Best-effort `QuotaGet`: the gateway's live balances.
+async fn fetch_quota(vm: &str) -> Option<Balances> {
+    let mut c = ControlClient::connect(vm).await.ok()?;
+    match c.request(&Request::QuotaGet).await.ok()? {
+        Response::Quota { balances } => Some(balances),
+        _ => None,
+    }
+}
+
+/// Grant `tokens` to `alias`: append to the quota ledger and have the running
+/// gateway re-read it, the same as `soda quota grant` (ADR-0020).
+async fn apply_grant(vm: &str, alias: &str, tokens: u64) -> anyhow::Result<String> {
+    let delta = i64::try_from(tokens).map_err(|_| anyhow::anyhow!("token count too large"))?;
+    Ledger::for_vm(vm).append(&Entry {
+        ts: sodabox_common::event::now_ts(),
+        alias: alias.to_string(),
+        delta,
+        reason: Reason::Grant,
+        tokens: None,
+        estimated: false,
+    })?;
+    let mut client = ControlClient::connect(vm)
+        .await
+        .map_err(|e| anyhow::anyhow!("connecting to control socket: {e}"))?;
+    match client.request(&Request::QuotaReload).await? {
+        Response::Ok => Ok(format!("granted {tokens} tokens to '{alias}'")),
+        Response::Error { msg } => anyhow::bail!("granted, but the gateway didn't reload: {msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Switch `alias` to `mode` (limited/unlimited): edit `policy.toml` and push it
+/// live, the same as `soda quota unlimited|limited <alias>`.
+async fn apply_metering(
+    vm: &str,
+    alias: &str,
+    mode: QuotaMode,
+) -> anyhow::Result<(VmPolicy, String)> {
+    let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
+    file.set_quota_mode(Some(alias), mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let policy = save_bumped(vm, &mut file)?;
+    let word = match mode {
+        QuotaMode::Unlimited => "unlimited",
+        QuotaMode::Limited => "limited",
+    };
+    let mut client = ControlClient::connect(vm)
+        .await
+        .map_err(|e| anyhow::anyhow!("connecting to control socket: {e}"))?;
+    match client
+        .request(&Request::PolicySet {
+            policy: policy.clone(),
+        })
+        .await?
+    {
+        Response::Ok => {
+            let summary = format!("'{alias}' is now {word} (v{})", policy.version);
+            Ok((policy, summary))
+        }
+        Response::Error { msg } => anyhow::bail!("supervisor rejected: {msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
 /// The render loop. Ingests events as fast as they arrive, reads keyboard input
 /// off a blocking reader thread, and repaints on a fixed tick so bursts coalesce.
 async fn event_loop(
@@ -758,10 +968,7 @@ async fn event_loop(
         if let Some(target) = app.pending_allow.take() {
             match apply_allow(&app.vm, &target).await {
                 Ok((policy, summary)) => {
-                    app.policy = PolicyView {
-                        version: policy.version,
-                        rules: policy.rules,
-                    };
+                    app.policy = PolicyView::from(policy);
                     app.clamp_policy_sel();
                     app.notice = Some(Notice {
                         text: summary,
@@ -782,10 +989,7 @@ async fn event_loop(
         if let Some(spec) = app.pending_deny.take() {
             match apply_deny(&app.vm, &spec).await {
                 Ok((policy, summary)) => {
-                    app.policy = PolicyView {
-                        version: policy.version,
-                        rules: policy.rules,
-                    };
+                    app.policy = PolicyView::from(policy);
                     app.clamp_policy_sel();
                     app.notice = Some(Notice {
                         text: summary,
@@ -805,13 +1009,46 @@ async fn event_loop(
         // (a quick local IPC round trip) outside the panel render.
         if app.policy_dirty && !app.disconnected {
             if let Some(p) = fetch_policy(&app.vm).await {
-                app.policy = PolicyView {
-                    version: p.version,
-                    rules: p.rules,
-                };
+                app.policy = PolicyView::from(p);
                 app.clamp_policy_sel();
+                app.clamp_gateway_sel();
             }
             app.policy_dirty = false;
+        }
+
+        // Gateway quick-actions (`g` grant, `m` metering on the Gateway panel).
+        if let Some((alias, tokens)) = app.pending_grant.take() {
+            app.notice = Some(match apply_grant(&app.vm, &alias, tokens).await {
+                Ok(text) => Notice { text, error: false },
+                Err(e) => Notice {
+                    text: e.to_string(),
+                    error: true,
+                },
+            });
+            app.quota_dirty = true;
+        }
+        if let Some((alias, mode)) = app.pending_metering.take() {
+            match apply_metering(&app.vm, &alias, mode).await {
+                Ok((policy, text)) => {
+                    app.policy = PolicyView::from(policy);
+                    app.clamp_gateway_sel();
+                    app.notice = Some(Notice { text, error: false });
+                }
+                Err(e) => {
+                    app.notice = Some(Notice {
+                        text: e.to_string(),
+                        error: true,
+                    })
+                }
+            }
+        }
+
+        // Balances changed (a request finished, or a grant): re-fetch them.
+        if app.quota_dirty && !app.disconnected && app.policy.gateway_used() {
+            if let Some(q) = fetch_quota(&app.vm).await {
+                app.quota = q;
+            }
+            app.quota_dirty = false;
         }
 
         if app.should_quit {
@@ -852,34 +1089,120 @@ struct KeyPress {
     mods: KeyModifiers,
 }
 
-/// Key bindings: quit (`q`/`Esc`/`Ctrl-C`), switch panel (`Tab`), move the cursor
-/// (`↑`/`↓`, `k`/`j`), toggle the unique view of the flow panels (`u`). On a flow
-/// panel `a`/Enter allows the highlighted blocked destination; on the Policy
-/// panel `d`/Enter denies the highlighted rule. The action key is
-/// context-sensitive to the focused panel.
+/// Key bindings: quit (`q`/`Esc`/`Ctrl-C`), switch tab (`1`/`2`, `←`/`→`),
+/// switch panel within the tab (`Tab`), move the cursor (`↑`/`↓`, `k`/`j`),
+/// toggle the unique view of the flow panels (`u`). On the Egress/DNS panels
+/// `a`/Enter allows the highlighted blocked destination; on the Policy panel
+/// `d`/Enter denies the highlighted rule; on the Gateway panel `g`/Enter grants
+/// tokens to the highlighted alias and `m` switches it between limited and
+/// unlimited. While the grant prompt is open, keys edit it instead.
 fn handle_key(app: &mut App, k: KeyPress) {
+    if app.prompt.is_some() {
+        prompt_key(app, k);
+        return;
+    }
     match k.code {
         KeyCode::Char('c') if k.mods.contains(KeyModifiers::CONTROL) => app.should_quit = true,
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('1') | KeyCode::Left => app.show_tab(Tab::Network),
+        KeyCode::Char('2') | KeyCode::Right => app.show_tab(Tab::Inference),
         KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
         KeyCode::Char('u') => app.toggle_unique(),
         KeyCode::Up | KeyCode::Char('k') => match app.focus {
             Focus::Policy => app.policy_select(-1),
+            Focus::Gateway => app.gateway_select(-1),
             _ => app.select_older(),
         },
         KeyCode::Down | KeyCode::Char('j') => match app.focus {
             Focus::Policy => app.policy_select(1),
+            Focus::Gateway => app.gateway_select(1),
             _ => app.select_newer(),
         },
-        // `a` allows (flow panels only); `d` denies (Policy panel only). Enter is
-        // "act on the selection" — allow or deny depending on the focused panel.
-        KeyCode::Char('a') if app.focus != Focus::Policy => request_allow(app),
+        // `a` allows (Egress/DNS); `d` denies (Policy); `g` grants and `m`
+        // switches metering (Gateway). Enter is "act on the selection".
+        KeyCode::Char('a') if matches!(app.focus, Focus::Egress | Focus::Dns) => request_allow(app),
         KeyCode::Char('d') if app.focus == Focus::Policy => request_deny(app),
+        KeyCode::Char('g') if app.focus == Focus::Gateway => open_grant_prompt(app),
+        KeyCode::Char('m') if app.focus == Focus::Gateway => request_metering(app),
         KeyCode::Enter => match app.focus {
             Focus::Policy => request_deny(app),
-            _ => request_allow(app),
+            Focus::Gateway => open_grant_prompt(app),
+            Focus::Egress | Focus::Dns => request_allow(app),
+            Focus::Inference => {}
         },
         _ => {}
+    }
+}
+
+/// Keys while the grant prompt is open: a token count like `500k` or `2M`,
+/// Enter to grant, Esc to cancel.
+fn prompt_key(app: &mut App, k: KeyPress) {
+    let Some(prompt) = app.prompt.as_mut() else {
+        return;
+    };
+    match k.code {
+        KeyCode::Esc => app.prompt = None,
+        KeyCode::Char('c') if k.mods.contains(KeyModifiers::CONTROL) => app.prompt = None,
+        KeyCode::Backspace => {
+            prompt.input.pop();
+        }
+        KeyCode::Char(c)
+            if (c.is_ascii_digit() || "kKmM.".contains(c)) && prompt.input.len() < 16 =>
+        {
+            prompt.input.push(c)
+        }
+        KeyCode::Enter => match quota::parse_tokens(&prompt.input) {
+            Ok(0) | Err(_) => {
+                app.notice = Some(Notice {
+                    text: "enter a token count like 1500, 500k or 2M".into(),
+                    error: true,
+                })
+            }
+            Ok(n) => {
+                app.pending_grant = Some((prompt.alias.clone(), n));
+                app.prompt = None;
+            }
+        },
+        _ => {}
+    }
+}
+
+/// Open the grant prompt for the highlighted alias.
+fn open_grant_prompt(app: &mut App) {
+    match app.selected_alias() {
+        Ok(m) => {
+            app.prompt = Some(GrantPrompt {
+                alias: m.alias.clone(),
+                input: String::new(),
+            });
+            app.notice = None;
+        }
+        Err(msg) => {
+            app.notice = Some(Notice {
+                text: msg.to_string(),
+                error: true,
+            })
+        }
+    }
+}
+
+/// Queue switching the highlighted alias between limited and unlimited.
+fn request_metering(app: &mut App) {
+    match app.selected_alias() {
+        Ok(m) => {
+            let mode = if m.quota == Some(QuotaMode::Unlimited) {
+                QuotaMode::Limited
+            } else {
+                QuotaMode::Unlimited
+            };
+            app.pending_metering = Some((m.alias.clone(), mode));
+        }
+        Err(msg) => {
+            app.notice = Some(Notice {
+                text: msg.to_string(),
+                error: true,
+            })
+        }
     }
 }
 
@@ -935,10 +1258,36 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     f.render_widget(header(app), outer[0]);
 
+    // The alias table needs more width than the policy list.
+    let split = match app.tab {
+        Tab::Network => [Constraint::Percentage(60), Constraint::Percentage(40)],
+        Tab::Inference => [Constraint::Percentage(55), Constraint::Percentage(45)],
+    };
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints(split)
         .split(outer[1]);
+
+    if app.tab == Tab::Inference {
+        // Inference tab: the gateway's requests on the left; status and the
+        // alias table on the right.
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(6), Constraint::Min(1)])
+            .split(body[1]);
+        render_flow_panel(
+            f,
+            body[0],
+            "Inference",
+            &mut app.inference,
+            app.focus == Focus::Inference,
+            app.unique,
+        );
+        f.render_widget(status_panel(app), right[0]);
+        render_gateway_panel(f, right[1], app);
+        f.render_widget(footer(app), outer[2]);
+        return;
+    }
 
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -978,17 +1327,30 @@ fn header(app: &App) -> Paragraph<'static> {
         "stopped" => Color::Red,
         _ => Color::Yellow,
     };
+    let tab = |n: &str, name: &str, on: bool| {
+        let style = if on {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Span::styled(format!(" {n} {name} "), style)
+    };
     let mut spans = vec![
         Span::styled(
             format!(" sodabox {} ", app.vm),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw("["),
+        tab("1", "Network", app.tab == Tab::Network),
+        tab("2", "Inference", app.tab == Tab::Inference),
+        Span::raw(" ["),
         Span::styled(app.state.clone(), Style::default().fg(state_color)),
         Span::raw(format!(
-            "  egress {}  dns {}",
+            "  egress {}  dns {}  inference {}",
             app.egress.tail.len(),
-            app.dns.tail.len()
+            app.dns.tail.len(),
+            app.inference.tail.len()
         )),
     ];
     if app.dropped > 0 {
@@ -1154,6 +1516,20 @@ fn render_policy_panel(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn footer(app: &App) -> Paragraph<'static> {
+    // The grant prompt takes over the footer while it's open.
+    if let Some(p) = &app.prompt {
+        return Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" grant tokens to '{}': ", p.alias),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{}▏", p.input), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "  e.g. 500k or 2M · Enter grant · Esc cancel ",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
     let mut spans = Vec::new();
     if let Some(n) = &app.notice {
         let color = if n.error { Color::Red } else { Color::Green };
@@ -1162,19 +1538,109 @@ fn footer(app: &App) -> Paragraph<'static> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
     }
-    // The action key is context-sensitive: `a` allows on the flow panels, `d`
-    // denies on the Policy panel (Enter acts on whichever is focused).
-    let action = if app.focus == Focus::Policy {
-        "d deny"
-    } else {
-        "a allow"
+    // The action keys depend on the focused panel (Enter acts on it).
+    let action = match app.focus {
+        Focus::Egress | Focus::Dns => "a allow  ",
+        Focus::Policy => "d deny  ",
+        Focus::Gateway => "g grant  m unlimited/limited  ",
+        Focus::Inference => "",
     };
     let view = if app.unique { "u all" } else { "u unique" };
     spans.push(Span::styled(
-        format!(" Tab panel  ↑/↓ select  {action}  {view}  q quit "),
+        format!(" 1/2 tab  Tab panel  ↑/↓ select  {action}{view}  q quit "),
         Style::default().fg(Color::DarkGray),
     ));
     Paragraph::new(Line::from(spans))
+}
+
+/// Gateway panel: whether the gateway is on and reachable, then one row per
+/// alias with its upstream and balance (`∞` while unlimited, red once used
+/// up). When focused, the cursor row is highlighted.
+fn render_gateway_panel(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focus == Focus::Gateway;
+    let border = if focused {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let title = if focused {
+        " Gateway ◂ "
+    } else {
+        " Gateway "
+    };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(border))
+        .title(title);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    if !app.policy.gateway_used() {
+        let lines = vec![
+            Line::from(Span::styled("not used by this VM", dim)),
+            Line::from(Span::styled(
+                format!("soda gateway enable --vm {}", app.vm),
+                dim,
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
+    let on = app.policy.gateway.as_ref().is_some_and(|g| g.enabled);
+    let access = app.policy.rules.iter().any(|r| {
+        matches!(r, Rule::Service { name } if name == sodabox_common::policy::INFERENCE_SERVICE)
+    });
+    let flag = |ok: bool, yes: &str, no: &str| {
+        let (text, color) = if ok {
+            (yes, Color::Green)
+        } else {
+            (no, Color::Red)
+        };
+        Span::styled(text.to_string(), Style::default().fg(color))
+    };
+    let mut lines = vec![Line::from(vec![
+        flag(on, "on", "off"),
+        Span::styled(" · access ", dim),
+        flag(access, "granted", "not granted"),
+    ])];
+    // The alias column is as wide as the longest alias, so the upstream
+    // still fits in a narrow panel.
+    let w = app
+        .policy
+        .models
+        .iter()
+        .map(|m| m.alias.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(5, 24);
+    lines.push(Line::from(Span::styled(
+        format!("{:<w$} {:>9} {:>9}  upstream", "alias", "balance", "used"),
+        dim,
+    )));
+    for (idx, m) in app.policy.models.iter().enumerate() {
+        let used = app.quota.get(&m.alias).map_or(0, |b| b.used + b.unmetered);
+        let balance = app.balance_label(m);
+        let empty = app.policy.is_metered(&m.alias) && balance.parse::<i64>().is_ok_and(|b| b <= 0);
+        let mut line = Line::from(vec![
+            Span::raw(format!("{:<w$} ", m.alias)),
+            Span::styled(
+                format!("{balance:>9}"),
+                Style::default().fg(if empty { Color::Red } else { Color::Cyan }),
+            ),
+            Span::raw(format!(" {used:>9}  ")),
+            Span::styled(format!("{}/{}", m.provider, m.model), dim),
+        ]);
+        if focused && app.gateway_sel == Some(idx) {
+            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        lines.push(line);
+    }
+    if app.policy.models.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no aliases: soda model add)",
+            dim,
+        )));
+    }
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Render one flow event as a colored line (egress or DNS).
@@ -1359,7 +1825,7 @@ mod tests {
             None,
             PolicyView {
                 version: 1,
-                rules: vec![],
+                ..PolicyView::default()
             },
             "running".into(),
         )
@@ -1585,7 +2051,11 @@ mod tests {
             "demo",
             None,
             None,
-            PolicyView { version: 1, rules },
+            PolicyView {
+                version: 1,
+                rules,
+                ..PolicyView::default()
+            },
             "running".into(),
         )
     }
@@ -1835,15 +2305,213 @@ mod tests {
         a.policy = PolicyView {
             version: 2,
             rules: vec![ip_rule("10.0.0.0/8")],
+            ..PolicyView::default()
         };
         a.clamp_policy_sel();
         assert_eq!(a.policy_sel, Some(0));
         // Emptying the list releases the selection entirely.
         a.policy = PolicyView {
             version: 3,
-            rules: vec![],
+            ..PolicyView::default()
         };
         a.clamp_policy_sel();
         assert_eq!(a.policy_sel, None);
+    }
+
+    fn press(a: &mut App, code: KeyCode) {
+        handle_key(
+            a,
+            KeyPress {
+                code,
+                mods: KeyModifiers::NONE,
+            },
+        );
+    }
+
+    /// An app whose policy has a gateway with two aliases.
+    fn gateway_app() -> App {
+        let policy: VmPolicy = toml::from_str(
+            "version = 4\n[gateway]\nenabled = true\n\
+             [[rules]]\nkind = \"service\"\nname = \"inference\"\n\
+             [[models]]\nalias = \"big\"\nprovider = \"m\"\nmodel = \"large\"\ninitial_quota = 500\n\
+             [[models]]\nalias = \"free\"\nprovider = \"m\"\nmodel = \"small\"\nquota = \"unlimited\"\n",
+        )
+        .unwrap();
+        App::new(
+            "demo",
+            None,
+            None,
+            PolicyView::from(policy),
+            "running".into(),
+        )
+    }
+
+    fn inference(ts: u64) -> Event {
+        Event::Inference {
+            ts,
+            verdict: Verdict::Allowed,
+            api: "openai".into(),
+            alias: "big".into(),
+            provider: Some("m".into()),
+            model: Some("large".into()),
+            status: 200,
+            tokens: Default::default(),
+            complete: true,
+            latency_ms: 5,
+        }
+    }
+
+    #[test]
+    fn inference_events_go_to_their_own_panel_and_flag_a_balance_refetch() {
+        let mut a = app();
+        a.quota_dirty = false;
+        a.ingest(inference(1));
+        a.ingest(Event::QuotaExhausted {
+            ts: 2,
+            alias: "big".into(),
+        });
+        assert_eq!((a.inference.tail.len(), a.egress.tail.len()), (2, 0));
+        assert!(a.quota_dirty);
+    }
+
+    #[test]
+    fn tabs_switch_and_tab_cycles_within_them() {
+        let mut a = gateway_app();
+        assert_eq!((a.tab, a.focus), (Tab::Network, Focus::Egress));
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.focus, Focus::Policy);
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(
+            a.focus,
+            Focus::Egress,
+            "the network tab cycles its own panels"
+        );
+        press(&mut a, KeyCode::Char('2'));
+        assert_eq!((a.tab, a.focus), (Tab::Inference, Focus::Inference));
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.focus, Focus::Gateway);
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.focus, Focus::Inference);
+        press(&mut a, KeyCode::Left);
+        assert_eq!((a.tab, a.focus), (Tab::Network, Focus::Egress));
+    }
+
+    #[test]
+    fn grant_prompt_takes_keys_until_enter_or_esc() {
+        let mut a = gateway_app();
+        a.show_tab(Tab::Inference);
+        a.focus = Focus::Gateway;
+        press(&mut a, KeyCode::Char('g'));
+        assert!(
+            a.notice.as_ref().is_some_and(|n| n.error),
+            "nothing selected yet"
+        );
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Char('g'));
+        assert_eq!(a.prompt.as_ref().unwrap().alias, "big");
+        // `q` isn't a token character, so it neither quits nor lands in the input.
+        for c in ['2', 'q', 'M'] {
+            press(&mut a, KeyCode::Char(c));
+        }
+        assert!(!a.should_quit);
+        assert_eq!(a.prompt.as_ref().unwrap().input, "2M");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.pending_grant, Some(("big".into(), 2_000_000)));
+        assert!(a.prompt.is_none());
+
+        // Esc cancels the prompt, not the TUI.
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.prompt.is_none() && !a.should_quit);
+    }
+
+    #[test]
+    fn metering_switch_flips_the_selected_alias() {
+        let mut a = gateway_app();
+        a.show_tab(Tab::Inference);
+        a.focus = Focus::Gateway;
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Char('m'));
+        assert_eq!(
+            a.pending_metering,
+            Some(("big".into(), QuotaMode::Unlimited))
+        );
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Char('m'));
+        assert_eq!(
+            a.pending_metering,
+            Some(("free".into(), QuotaMode::Limited))
+        );
+    }
+
+    #[test]
+    fn balances_show_the_initial_quota_until_first_use() {
+        let mut a = gateway_app();
+        let big = a.policy.models[0].clone();
+        let free = a.policy.models[1].clone();
+        assert_eq!(a.balance_label(&big), "500");
+        assert_eq!(a.balance_label(&free), "∞");
+        a.quota.insert(
+            "big".into(),
+            sodabox_common::quota::Balance {
+                balance: -20,
+                initialized: true,
+                granted: 500,
+                used: 520,
+                unmetered: 0,
+            },
+        );
+        assert_eq!(a.balance_label(&big), "-20");
+    }
+
+    /// Draw `a` into an in-memory terminal and return the screen as text.
+    fn screen(a: &mut App) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, a)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn both_tabs_render() {
+        let mut a = gateway_app();
+        let net = screen(&mut a);
+        assert!(
+            net.contains("Egress") && net.contains("DNS") && net.contains("Policy"),
+            "{net}"
+        );
+        assert!(!net.contains("Gateway"), "{net}");
+
+        a.ingest(inference(1));
+        a.show_tab(Tab::Inference);
+        a.focus = Focus::Gateway;
+        a.gateway_select(1);
+        let inf = screen(&mut a);
+        for want in [
+            "Inference",
+            "Gateway",
+            "access granted",
+            "500",
+            "∞",
+            "m/small",
+            "g grant",
+        ] {
+            assert!(inf.contains(want), "missing {want:?} in:\n{inf}");
+        }
+        assert!(!inf.contains("Egress"), "{inf}");
+
+        a.prompt = Some(GrantPrompt {
+            alias: "big".into(),
+            input: "2M".into(),
+        });
+        assert!(screen(&mut a).contains("grant tokens to 'big': 2M"));
     }
 }

@@ -84,6 +84,18 @@ impl Balance {
 /// Balances by alias.
 pub type Balances = BTreeMap<String, Balance>;
 
+/// The balance to show for an alias: its ledger balance, plus its initial
+/// quota if the alias hasn't been used yet (that entry is written on first
+/// use).
+pub fn shown_balance(b: &Balance, initial_quota: u64) -> i64 {
+    if b.initialized {
+        b.balance
+    } else {
+        b.balance
+            .saturating_add(i64::try_from(initial_quota).unwrap_or(i64::MAX))
+    }
+}
+
 /// A VM's ledger file.
 #[derive(Debug, Clone)]
 pub struct Ledger {
