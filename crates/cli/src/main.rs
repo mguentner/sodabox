@@ -1266,8 +1266,17 @@ fn rm(name: &str, keep_disk: bool, yes: bool) -> anyhow::Result<()> {
 }
 
 /// Ask a `[y/N]` question on stdin; anything but y/yes (including EOF) is no.
+/// Without a terminal on stdin it is an error, never a wait (callers offer
+/// `--yes`).
 fn confirm(question: &str) -> std::io::Result<bool> {
-    use std::io::Write;
+    use std::io::{IsTerminal, Write};
+    // Without a terminal nobody can answer: a script or test harness would
+    // wait forever on a stdin that never closes. Fail at once instead.
+    if !std::io::stdin().is_terminal() {
+        return Err(std::io::Error::other(format!(
+            "{question} needs an answer, but stdin is not a terminal; pass --yes to confirm"
+        )));
+    }
     print!("{question} [y/N]: ");
     std::io::stdout().flush()?;
     let mut line = String::new();

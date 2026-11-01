@@ -196,11 +196,11 @@ in
         machine.succeed(f"test ! -e {disk('vm-none', 'data.img')} && test ! -e {disk('vm-none', 'home.img')}")
 
     with subtest("rm --keep-disk keeps exactly the kept disks"):
-        machine.succeed("sb rm vm-full --keep-disk")
+        machine.succeed("sb rm vm-full --keep-disk --yes")
         machine.succeed(f"ls {D}/vm-full | sort | tr '\\n' ' ' | grep -qx 'data.img home.img '")
-        machine.succeed("sb rm vm-home --keep-disk")
+        machine.succeed("sb rm vm-home --keep-disk --yes")
         machine.succeed(f"ls {D}/vm-home | tr '\\n' ' ' | grep -qx 'home.img '")
-        machine.succeed("sb rm vm-none --keep-disk")
+        machine.succeed("sb rm vm-none --keep-disk --yes")
         machine.succeed(f"test ! -e {D}/vm-none")
   '';
 }
