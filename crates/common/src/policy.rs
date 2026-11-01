@@ -303,6 +303,39 @@ impl VmPolicy {
     }
 }
 
+/// What [`PolicyFile::merge_profile`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeReport {
+    /// Rules added.
+    pub rules: usize,
+    /// Model aliases added.
+    pub models: usize,
+    /// Aliases the VM already had with different settings; kept as they were.
+    pub conflicts: Vec<String>,
+    /// Whether the merge switched the gateway on.
+    pub enabled_gateway: bool,
+}
+
+impl MergeReport {
+    /// Whether the merge changed anything.
+    pub fn changed(&self) -> bool {
+        self.rules > 0 || self.models > 0 || self.enabled_gateway
+    }
+}
+
+impl std::fmt::Display for MergeReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "+{} rule(s)", self.rules)?;
+        if self.models > 0 {
+            write!(f, ", +{} model(s)", self.models)?;
+        }
+        if self.enabled_gateway {
+            write!(f, ", gateway enabled")?;
+        }
+        Ok(())
+    }
+}
+
 /// What [`PolicyFile::set_model`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelChange {
@@ -482,31 +515,53 @@ impl PolicyFile {
         }
     }
 
-    /// Merge one profile's rules (ADR-0015). A rule the policy already has is
-    /// skipped; every other one is copied over as the profile file wrote it,
-    /// comments included, with a `# from profile '<name>'` line above it.
-    /// Returns how many rules were added.
-    pub fn merge_profile(&mut self, profile: &crate::profile::Profile) -> Result<usize, String> {
-        let mut existing = self.policy()?.rules;
-        let mut added = 0;
+    /// Merge one profile (ADR-0015, ADR-0020).
+    ///
+    /// - A rule the policy already has is skipped.
+    /// - A model alias the policy already has is never overwritten: an
+    ///   identical one is skipped, a different one is skipped and reported in
+    ///   [`MergeReport::conflicts`], so the VM's own choice wins.
+    /// - `[gateway] enabled = true` switches the gateway on; merging never
+    ///   switches it off.
+    ///
+    /// Everything copied over keeps the comments the profile file wrote, with
+    /// a `# from profile '<name>'` line above it.
+    pub fn merge_profile(
+        &mut self,
+        profile: &crate::profile::Profile,
+    ) -> Result<MergeReport, String> {
+        let policy = self.policy()?;
+        let mut report = MergeReport::default();
+
+        let mut rules = policy.rules;
         for (rule, table) in profile.entries() {
-            if existing.contains(rule) {
+            if rules.contains(rule) {
                 continue;
             }
-            let mut table = fresh_table(table);
-            let comments = table
-                .decor()
-                .prefix()
-                .and_then(|p| p.as_str())
-                .unwrap_or("")
-                .trim_start_matches('\n');
-            let prefix = format!("\n# from profile '{}'\n{comments}", profile.name());
-            table.decor_mut().set_prefix(prefix);
+            let table = with_provenance(table, profile.name());
             self.rules_or_insert()?.push(table);
-            existing.push(rule.clone());
-            added += 1;
+            rules.push(rule.clone());
+            report.rules += 1;
         }
-        Ok(added)
+
+        let mut models = policy.models;
+        for (model, table) in profile.model_entries() {
+            match models.iter().find(|m| m.alias == model.alias) {
+                Some(m) if m == model => {}
+                Some(_) => report.conflicts.push(model.alias.clone()),
+                None => {
+                    let table = with_provenance(table, profile.name());
+                    self.aot_or_insert("models")?.push(table);
+                    models.push(model.clone());
+                    report.models += 1;
+                }
+            }
+        }
+
+        if profile.enables_gateway() && self.set_gateway_enabled(true)? {
+            report.enabled_gateway = true;
+        }
+        Ok(report)
     }
 
     /// [`VmPolicy::add_service`], applied to the document.
@@ -693,6 +748,21 @@ pub(crate) fn table_rule(table: &toml_edit::Table) -> Result<Rule, String> {
 /// comments) with no document position, so toml_edit renders it right after
 /// the tables already in the target document — a parsed table's position is
 /// relative to the document it came from.
+/// A copy of a profile's table, with its comments and a
+/// `# from profile '<name>'` line above them.
+fn with_provenance(src: &toml_edit::Table, profile: &str) -> toml_edit::Table {
+    let mut table = fresh_table(src);
+    let comments = table
+        .decor()
+        .prefix()
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .trim_start_matches('\n');
+    let prefix = format!("\n# from profile '{profile}'\n{comments}");
+    table.decor_mut().set_prefix(prefix);
+    table
+}
+
 fn fresh_table(src: &toml_edit::Table) -> toml_edit::Table {
     let mut t = toml_edit::Table::new();
     for (key, item) in src.iter() {

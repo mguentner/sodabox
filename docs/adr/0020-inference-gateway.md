@@ -126,9 +126,11 @@ The first pass (branch `token-gateway`) serves:
   OpenRouter, vLLM, Ollama's `/v1`, …) and `mistral` providers.
 - **Ollama's native API**, for `ollama` providers.
 
-The Anthropic Messages API and the OpenAI Responses API come later. So do
-profile merging of `[[models]]`, the TUI gateway panel (inference events show
-in the egress panel until then), and `soda provider test`.
+The Anthropic Messages API and the OpenAI Responses API come later. So do the
+TUI gateway panel (inference events show in the egress panel until then) and
+`soda provider test`. Profiles carrying `[[models]]` came with a second pass.
+Claude Code keeps its subscription login and direct egress for now; the
+gateway can't carry OAuth logins (see *Risks & open questions*).
 
 **Routing is by path, without prefixes.** Clients keep their usual base URL,
 and the path says which format they speak:
@@ -256,8 +258,18 @@ quota = "unlimited"                  # optional: no quota for this alias
 - This lives in `policy.toml` for the same reasons as ADR-0015: one auditable
   file per VM, comment-preserving edits, live updates through
   `PolicySet` (the supervisor swaps the alias table the way it swaps the
-  allowlist), and profiles can carry `[[models]]` tables. A `claudecode-gw`
-  profile then replaces the direct-egress `claudecode` profile.
+  allowlist), and profiles can carry `[[models]]` tables (amending ADR-0015).
+  - A profile can bundle a whole gateway setup: the aliases, the
+    `service inference` rule and `[gateway] enabled = true`. A VM then gets
+    it with one `--profiles` flag at `create`, or with `soda profile add`.
+  - Merging adds aliases the VM doesn't have and never overwrites one it has:
+    an identical one is skipped, a different one is kept and reported. That
+    keeps the snapshot semantics of ADR-0015: a later profile change never
+    reaches an existing VM.
+  - Merging never switches the gateway off, and a profile can't set the
+    VM-wide quota mode.
+  - Aliases whose provider file is missing on the host are reported when the
+    profile is applied. They work once the file exists.
 - Exact matching only in v1. Globs (`foo:*`) can come later if needed.
 
 ### Token quotas

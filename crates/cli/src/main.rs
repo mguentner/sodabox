@@ -445,12 +445,17 @@ fn create(
         }
         let mut file = PolicyFile::new();
         for p in profile::load_all(profiles)? {
-            let n = file.merge_profile(&p).map_err(|e| anyhow::anyhow!(e))?;
-            println!("profile '{}': {n} rule(s)", p.name());
+            let report = file.merge_profile(&p).map_err(|e| anyhow::anyhow!(e))?;
+            println!("profile '{}': {report}", p.name());
+            gateway::warn_conflicts(p.name(), &report);
         }
         let policy = file.policy().map_err(|e| anyhow::anyhow!(e))?;
         sodabox_common::allowlist::Allowlist::from_policy(&policy)
             .map_err(|e| anyhow::anyhow!("merged policy is invalid: {e}"))?;
+        policy
+            .validate_models()
+            .map_err(|e| anyhow::anyhow!("merged policy is invalid: {e}"))?;
+        gateway::warn_missing_providers(&policy);
         file.set_version(1);
         Some(file)
     };
@@ -1012,13 +1017,17 @@ fn profile_add(names: &[String], vm: Option<String>) -> anyhow::Result<()> {
     let profiles = profile::load_all(names)?;
     apply_edit(&vm, |file| {
         let mut parts = Vec::new();
-        let mut total = 0;
+        let mut changed = false;
         for p in &profiles {
-            let n = file.merge_profile(p).map_err(|e| anyhow::anyhow!(e))?;
-            parts.push(format!("'{}' +{n}", p.name()));
-            total += n;
+            let report = file.merge_profile(p).map_err(|e| anyhow::anyhow!(e))?;
+            gateway::warn_conflicts(p.name(), &report);
+            parts.push(format!("'{}' {report}", p.name()));
+            changed |= report.changed();
         }
-        Ok((total > 0).then(|| format!("applied profiles {}", parts.join(", "))))
+        if changed {
+            gateway::warn_missing_providers(&file.policy().map_err(|e| anyhow::anyhow!(e))?);
+        }
+        Ok(changed.then(|| format!("applied profiles {}", parts.join("; "))))
     })
 }
 

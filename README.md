@@ -48,6 +48,27 @@ soda quota grant big 2M --vm vm1             # or: soda quota unlimited big
 soda quota show --vm vm1
 ```
 
+To reuse a setup, put it in a profile
+(`$XDG_CONFIG_HOME/sodabox/profiles/mistral-gw.toml`) and apply it with
+`soda create vm2 --profiles mistral-gw` or `soda profile add mistral-gw`:
+
+```toml
+description = "Mistral through the inference gateway"
+
+[gateway]
+enabled = true
+
+[[rules]]
+kind = "service"
+name = "inference"
+
+[[models]]
+alias = "big"
+provider = "mistral"
+model = "mistral-large-latest"
+initial_quota = 1000000
+```
+
 In the guest, point clients at the gateway with any placeholder key:
 
 ```sh

@@ -45,6 +45,11 @@ proto = "tcp"
   are rejected, so a stray `version` or a typo fails instead of being ignored.
 - Every rule is validated with the allowlist's own parsers when the profile
   loads. One bad rule rejects the whole profile.
+- *Amended 2026-10-31 ([ADR-0020](0020-inference-gateway.md)).* A profile may
+  also carry `[[models]]` aliases for the inference gateway and
+  `[gateway] enabled = true`. Merging adds aliases the VM doesn't have, never
+  overwrites one it has (a different one is kept and reported), and never
+  switches the gateway off. The VM-wide quota mode can't come from a profile.
 - Names are `[a-z0-9][a-z0-9_-]*` (≤ 64 chars). A name becomes a file name, so
   this also stops `--profiles ../x` from escaping the profiles dir.
 - No includes, for now.

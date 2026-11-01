@@ -10,7 +10,7 @@ use clap::Subcommand;
 use clap_complete::engine::ArgValueCandidates;
 
 use sodabox_common::event::now_ts;
-use sodabox_common::policy::{ModelChange, QuotaMode, VmPolicy};
+use sodabox_common::policy::{MergeReport, ModelChange, QuotaMode, VmPolicy};
 use sodabox_common::protocol::{Request, Response};
 use sodabox_common::provider::{self, Provider};
 use sodabox_common::quota::{self, Balances, Entry, Ledger, Reason};
@@ -101,6 +101,36 @@ pub enum QuotaAction {
         #[arg(long, add = ArgValueCandidates::new(complete::vms))]
         vm: Option<String>,
     },
+}
+
+/// Tell the user about aliases a profile wanted to add but the VM already had
+/// with other settings (the VM's own stay).
+pub fn warn_conflicts(profile: &str, report: &MergeReport) {
+    for alias in &report.conflicts {
+        println!(
+            "warning: profile '{profile}': kept the VM's own alias '{alias}' \
+             (change it with `soda model add`)"
+        );
+    }
+}
+
+/// Tell the user about aliases whose provider file this host doesn't have
+/// (yet): requests for them fail until it exists.
+pub fn warn_missing_providers(policy: &VmPolicy) {
+    let mut missing: Vec<&str> = policy
+        .models
+        .iter()
+        .map(|m| m.provider.as_str())
+        .filter(|p| Provider::load(p).is_err())
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    for p in missing {
+        println!(
+            "warning: no provider '{p}' on this host yet; add {}",
+            sodabox_common::paths::provider_path(p).display()
+        );
+    }
 }
 
 /// `soda gateway enable|disable`.
