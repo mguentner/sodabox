@@ -465,8 +465,12 @@ counters but no guest-facing surface, which is the part worth sharing.
       grant applies to the running VM;
     - revoking access makes the name REFUSED and blocks the connection.
 
-    Tested against a fake OpenAI-compatible provider on the host, not yet a
-    real one.
+    Tested against a fake OpenAI-compatible provider on the host. The NixOS
+    test `checks.x86_64-linux.inference-gateway` runs the same path against a
+    real Ollama server, with qwen3:0.6b loaded from the Nix store
+    (`nix/tests/ollama-model.nix`). It covers both Ollama's native API and
+    its OpenAI-compatible `/v1`, and confirms that Ollama's `/v1` reports
+    stream usage when the gateway asks for it.
   - Do all target clients accept an `http://` base URL? If one doesn't, use
     the TLS option above. (Path prefixes are gone, see *Scope of the first
     implementation*.)

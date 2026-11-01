@@ -193,6 +193,14 @@
               sodabox = self.packages.x86_64-linux.sodabox;
             }
           );
+          # The inference gateway against a real Ollama server, with the model
+          # fetched once into the store (nix/tests/ollama-model.nix).
+          inference-gateway = pkgs.testers.runNixOSTest (
+            import ./nix/tests/inference-gateway.nix {
+              inherit nixpkgs;
+              sodabox = self.packages.x86_64-linux.sodabox;
+            }
+          );
         }
       );
 
