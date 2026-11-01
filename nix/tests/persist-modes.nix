@@ -46,6 +46,13 @@ in
       "kvm-amd"
       "kvm-intel"
     ];
+    # The test instrumentation pins `clocksource=acpi_pm`, but KVM offers the
+    # guest's ptp_kvm clock only on a TSC-clocked host; without this
+    # `modprobe ptp_kvm` fails with EOPNOTSUPP. The last `clocksource=` wins.
+    boot.kernelParams = lib.mkAfter [
+      "clocksource=tsc"
+      "tsc=reliable"
+    ];
 
     users.users.alice = {
       isNormalUser = true;
@@ -142,6 +149,10 @@ in
                             ("/dev/vdd", "/root"), ("/dev/vdc", "/var/work"),
                             ("/dev/vdc", "/root/.cache"), ("/dev/vdc", "/root/.cargo/registry")]:
             assert f"{dev} {target} ext4" in mounts, f"{dev} on {target} missing:\n{mounts}"
+        # Time comes from the host's PTP clock, not NTP: chrony selects PHC0.
+        machine.wait_until_succeeds("sb ssh vm-home -- 'chronyc -n sources' | grep -q '^#\\* PHC0'",
+                                    timeout=60)
+        guest("vm-home", "! systemctl is-active systemd-timesyncd")
         stop("vm-home")
 
     with subtest("full keeps everything"):

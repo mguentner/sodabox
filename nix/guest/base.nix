@@ -387,6 +387,30 @@
     };
   };
 
+  # Guest time from the host clock over PTP, not NTP. NTP needs egress to a
+  # time server, which the deny-by-default policy doesn't grant, and a guest
+  # that was paused (host suspend, SIGSTOP) comes back minutes or hours behind.
+  # `ptp_kvm` turns the host's clock into a PTP hardware clock for the guest,
+  # read with a KVM hypercall, and chrony disciplines the system clock against
+  # it, with no network involved. The module is loaded in stage-1 so /dev/ptp0
+  # exists before chronyd starts; it is the guest's only PTP device, so the name
+  # is fixed.
+  boot.initrd.kernelModules = [ "ptp_kvm" ];
+  services.timesyncd.enable = false;
+  services.chrony = {
+    enable = true;
+    servers = [ ];
+    # No RTC to trim; the PHC is the only source.
+    enableRTCTrimming = false;
+    # The module's makestep caps the number of steps; after a pause the clock
+    # can be far off at any point, so step whenever the offset exceeds 1 s.
+    makestep.enable = false;
+    extraConfig = ''
+      refclock PHC /dev/ptp0 poll 2 dpoll -2 offset 0 stratum 2
+      makestep 1 -1
+    '';
+  };
+
   # Minimal, headless, autologin on the serial console.
   services.getty.autologinUser = lib.mkDefault "root";
   documentation.enable = lib.mkDefault false;
