@@ -93,6 +93,9 @@ pub(crate) fn inference_detail(ev: &Event) -> Option<String> {
     if !complete {
         d.push_str("  (partial)");
     }
+    if tokens.estimated {
+        d.push_str("  (tokens estimated)");
+    }
     Some(d)
 }
 

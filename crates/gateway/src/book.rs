@@ -42,13 +42,22 @@ impl QuotaBook {
             delta: i64::try_from(initial).unwrap_or(i64::MAX),
             reason: Reason::Initial,
             tokens: None,
+            estimated: false,
         })
     }
 
     /// Book `tokens` used by a request: subtracted if `metered`, otherwise
-    /// recorded as unmetered. The in-memory balance changes even if the
-    /// ledger write fails, so enforcement stays correct while the VM runs.
-    pub fn book(&mut self, alias: &str, tokens: u64, metered: bool) -> std::io::Result<()> {
+    /// recorded as unmetered. `estimated` marks a count the gateway guessed
+    /// because the provider reported none. The in-memory balance changes even
+    /// if the ledger write fails, so enforcement stays correct while the VM
+    /// runs.
+    pub fn book(
+        &mut self,
+        alias: &str,
+        tokens: u64,
+        metered: bool,
+        estimated: bool,
+    ) -> std::io::Result<()> {
         let entry = if metered {
             Entry {
                 ts: now_ts(),
@@ -56,6 +65,7 @@ impl QuotaBook {
                 delta: -i64::try_from(tokens).unwrap_or(i64::MAX),
                 reason: Reason::Usage,
                 tokens: Some(tokens),
+                estimated,
             }
         } else {
             Entry {
@@ -64,6 +74,7 @@ impl QuotaBook {
                 delta: 0,
                 reason: Reason::Unmetered,
                 tokens: Some(tokens),
+                estimated,
             }
         };
         let written = self.ledger.append(&entry);

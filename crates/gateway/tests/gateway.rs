@@ -425,6 +425,7 @@ async fn used_up_quota_is_refused_and_unlimited_is_unmetered() {
             delta: 50,
             reason: sodabox_common::quota::Reason::Grant,
             tokens: None,
+            estimated: false,
         })
         .unwrap();
     h.gateway.reload_quota().unwrap();
@@ -537,4 +538,59 @@ async fn client_disconnect_mid_stream_still_books_usage_seen() {
 
 async fn json_of(req: reqwest::RequestBuilder) -> Value {
     serde_json::from_str(&req.send().await.unwrap().text().await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn a_stream_cut_off_before_its_usage_is_booked_at_an_estimate() {
+    // Three content chunks, then the stream stalls: the usage chunk that
+    // would come at the end never arrives, and the client gives up.
+    let first = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n";
+    let up = Upstream::start(Reply::Stall(first)).await;
+    let h = harness(
+        "estimate",
+        &policy(
+            "[[models]]\nalias = \"foo\"\nprovider = \"up\"\nmodel = \"x\"\ninitial_quota = 1000\n",
+        ),
+        vec![provider("up", "openai", &up.url("/v1"), true)],
+    )
+    .await;
+    let request = json!({"model": "foo", "stream": true, "messages": [{"role": "user", "content": "write until the end of times"}]});
+    let mut resp = client()
+        .post(format!("{}/v1/chat/completions", h.base))
+        .body(request.to_string())
+        .send()
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while got.len() < first.len() {
+        got.extend_from_slice(&resp.chunk().await.unwrap().unwrap());
+    }
+    drop(resp);
+
+    let ev = h
+        .events
+        .wait_for(|e| matches!(e, Event::Inference { status: 200, .. }))
+        .await;
+    let Event::Inference {
+        tokens, complete, ..
+    } = ev
+    else {
+        unreachable!()
+    };
+    assert!(!complete && tokens.estimated, "{tokens:?}");
+    assert_eq!(tokens.output, 3, "one token per content chunk");
+    // The upstream got the request with `model` rewritten and stream_options
+    // added; the estimate is taken from the guest's request as received.
+    let request_bytes = request.to_string().len() as u64;
+    assert_eq!(tokens.input, request_bytes.div_ceil(4));
+
+    let entry = h.ledger.load().unwrap();
+    assert_eq!(entry["foo"].balance, 1000 - (tokens.input + 3) as i64);
+    let raw = std::fs::read_to_string(h.ledger.path()).unwrap();
+    assert!(
+        raw.lines().last().unwrap().contains("\"estimated\":true"),
+        "{raw}"
+    );
 }

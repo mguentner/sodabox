@@ -436,13 +436,16 @@ impl Inner {
         let me = self.clone();
         let provider_name = provider.name.clone();
         let upstream_model = alias.model.clone();
-        let on_finish: body::OnFinish = Box::new(move |tokens, complete| {
+        let request_bytes = bytes.len();
+        let on_finish: body::OnFinish = Box::new(move |reported, chunks, complete| {
             drop(permit);
-            if let Some(t) = tokens {
-                if let Ok(mut book) = me.book.lock() {
-                    if let Err(e) = book.book(&name, t.metered(), metered) {
-                        eprintln!("gateway({}): writing quota ledger: {e}", me.vm);
-                    }
+            // Usage comes at the very end of a response. Without it (cut off,
+            // or a provider that sends none) the request is still booked, at
+            // an estimate, so cancelling early never makes a request free.
+            let tokens = reported.unwrap_or_else(|| estimate(request_bytes, chunks));
+            if let Ok(mut book) = me.book.lock() {
+                if let Err(e) = book.book(&name, tokens.metered(), metered, tokens.estimated) {
+                    eprintln!("gateway({}): writing quota ledger: {e}", me.vm);
                 }
             }
             me.events.emit(Event::Inference {
@@ -453,7 +456,7 @@ impl Inner {
                 provider: Some(provider_name),
                 model: Some(upstream_model),
                 status: status.as_u16(),
-                tokens: tokens.unwrap_or_default(),
+                tokens,
                 complete,
                 latency_ms: started.elapsed().as_millis() as u64,
             });
@@ -501,6 +504,22 @@ impl Inner {
             .alias(alias));
         }
         Ok(())
+    }
+}
+
+/// Bytes of request per input token, for the estimate. About right for
+/// English text and JSON; the real ratio varies by tokenizer and language.
+const BYTES_PER_TOKEN: u64 = 4;
+
+/// The gateway's estimate of a request's usage when the provider reported
+/// none: the input from the request's size, the output from the content
+/// chunks streamed (streaming APIs send about one token per chunk).
+fn estimate(request_bytes: usize, chunks: u64) -> Tokens {
+    Tokens {
+        input: (request_bytes as u64).div_ceil(BYTES_PER_TOKEN),
+        output: chunks,
+        estimated: true,
+        ..Tokens::default()
     }
 }
 

@@ -71,7 +71,8 @@ pub fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-/// Token usage of one inference request, as the provider reported it.
+/// Token usage of one inference request: as the provider reported it, or
+/// the gateway's estimate when the response ended without a report.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tokens {
     /// Prompt tokens, including `cache_read`.
@@ -82,6 +83,11 @@ pub struct Tokens {
     pub reasoning: u64,
     #[serde(default)]
     pub cache_read: u64,
+    /// The provider reported no usage (e.g. the stream was cut off before its
+    /// end): `input` is estimated from the request size, `output` from the
+    /// content chunks streamed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
 }
 
 impl Tokens {

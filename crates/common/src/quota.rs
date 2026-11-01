@@ -43,6 +43,9 @@ pub struct Entry {
     /// Tokens a usage entry stands for (for `unmetered`, where delta is 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u64>,
+    /// The provider reported no usage; `tokens` is the gateway's estimate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
 }
 
 /// One alias's state, summed from the ledger.
@@ -177,6 +180,7 @@ mod tests {
             delta,
             reason,
             tokens,
+            estimated: false,
         }
     }
 

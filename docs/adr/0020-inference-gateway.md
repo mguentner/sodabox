@@ -367,8 +367,21 @@ in the event log.
   - **Later formats:** Anthropic reports input and cache usage in
     `message_start` and output in `message_delta`; OpenAI Responses in
     `response.completed`.
-- A client that disconnects mid-stream is still billed by the provider. The
-  gateway books the usage seen so far and marks the request incomplete.
+- **Responses that end without usage are booked at an estimate.** Every API
+  in scope reports usage only at the very end of a response. A stream cut off
+  before that (the client went away, or a provider that sends no usage) would
+  otherwise be free, and a guest could read almost all of a long answer and
+  disconnect just before the last chunk, again and again. Instead the
+  gateway books:
+  - **output:** the content chunks streamed (about one token each);
+  - **input:** the request's size / 4 bytes.
+
+  The request is marked incomplete, and the ledger entry and the event are
+  marked `estimated`. Reading the rest of the provider's response after the
+  client left was rejected: it would keep a cancelled generation running, and
+  so cost the money or GPU time the user meant to save by cancelling. The
+  error is bounded by the cut-off request's input, which the estimate only
+  approximates.
 - This is a new parser exposed to the guest, so it gets the same care as the
   proxy:
   - request bodies are capped at 32 MiB;
@@ -490,7 +503,8 @@ counters but no guest-facing surface, which is the part worth sharing.
     retrying. Not yet verified per agent (Mistral Vibe, Ollama clients, …).
   - Mistral is assumed to report usage on its last stream chunk without
     `stream_options` (as its API reference shows). If it doesn't, streamed
-    Mistral requests are booked with zero tokens; a live request will tell.
+    Mistral requests are booked at the estimate instead of the real count;
+    a live request will tell.
   - Building rustls's `ring` backend needs a C compiler. The dev shell and the
     Nix build provide one; a bare `cargo build` outside them does not.
   - Non-inference APIs (GitHub, package registries, AWS) are out of scope

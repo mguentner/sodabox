@@ -12,8 +12,9 @@ use hyper::body::{Body, Frame, SizeHint};
 use crate::usage::UsageScanner;
 use crate::BoxError;
 
-/// Called once with the usage seen and whether the body ended normally.
-pub type OnFinish = Box<dyn FnOnce(Option<sodabox_common::event::Tokens>, bool) + Send>;
+/// Called once with the usage the provider reported (if any), the content
+/// chunks streamed, and whether the body ended normally.
+pub type OnFinish = Box<dyn FnOnce(Option<sodabox_common::event::Tokens>, u64, bool) + Send>;
 
 pub struct MeteredBody {
     inner: Pin<Box<dyn Body<Data = Bytes, Error = BoxError> + Send>>,
@@ -37,7 +38,8 @@ impl MeteredBody {
 
     fn finish(&mut self, complete: bool) {
         if let Some(f) = self.on_finish.take() {
-            f(self.scanner.finish(), complete);
+            let reported = self.scanner.finish();
+            f(reported, self.scanner.chunks(), complete);
         }
     }
 }

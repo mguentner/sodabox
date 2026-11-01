@@ -330,6 +330,7 @@ fn grant(vm: &str, alias: &str, tokens: &str) -> anyhow::Result<()> {
         delta,
         reason: Reason::Grant,
         tokens: None,
+        estimated: false,
     })?;
     let balance = ledger.load()?.get(alias).map_or(0, |b| b.balance);
     println!("granted {n} tokens to '{alias}' on '{vm}' (balance {balance})");

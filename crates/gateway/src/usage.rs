@@ -10,6 +10,12 @@
 //!   and `eval_count`.
 //! - Non-streamed responses: the whole body is one JSON object with the same
 //!   fields.
+//!
+//! All of these come at the very end, so a stream cut off early (the client
+//! went away, or the provider sends no usage) has none. For that case the
+//! scanner also counts the content chunks it saw: streaming APIs send about
+//! one token per chunk, so the count is the gateway's estimate of the output
+//! (ADR-0020).
 
 use serde_json::Value;
 use sodabox_common::event::Tokens;
@@ -41,6 +47,8 @@ pub struct UsageScanner {
     /// The current line grew past [`MAX_LINE`]; skip until its end.
     skipping: bool,
     tokens: Option<Tokens>,
+    /// Content chunks seen (streams only): the output estimate.
+    chunks: u64,
 }
 
 impl UsageScanner {
@@ -50,6 +58,7 @@ impl UsageScanner {
             buf: Vec::new(),
             skipping: false,
             tokens: None,
+            chunks: 0,
         }
     }
 
@@ -64,7 +73,10 @@ impl UsageScanner {
             return;
         }
         while let Some(nl) = data.iter().position(|&b| b == b'\n') {
-            if !self.skipping {
+            if self.skipping {
+                // Too long to parse: content, so it counts as a chunk.
+                self.chunks += 1;
+            } else {
                 self.buf.extend_from_slice(&data[..nl]);
                 let line = std::mem::take(&mut self.buf);
                 self.line(&line);
@@ -106,6 +118,12 @@ impl UsageScanner {
         self.tokens
     }
 
+    /// Content chunks seen so far: about one token each. Used as the output
+    /// estimate when the response carried no usage.
+    pub fn chunks(&self) -> u64 {
+        self.chunks
+    }
+
     fn line(&mut self, line: &[u8]) {
         let line = trim(line);
         match self.framing {
@@ -118,6 +136,14 @@ impl UsageScanner {
                     return;
                 }
                 if let Ok(v) = serde_json::from_slice::<Value>(payload) {
+                    // A chunk with choices carries content (or a tool call);
+                    // the usage-only chunk has none.
+                    if v.get("choices")
+                        .and_then(Value::as_array)
+                        .is_some_and(|c| !c.is_empty())
+                    {
+                        self.chunks += 1;
+                    }
                     if let Some(t) = openai_usage(&v) {
                         self.tokens = Some(t);
                     }
@@ -125,6 +151,9 @@ impl UsageScanner {
             }
             Framing::OllamaNdjson => {
                 if let Ok(v) = serde_json::from_slice::<Value>(line) {
+                    if v.get("done").and_then(Value::as_bool) == Some(false) {
+                        self.chunks += 1;
+                    }
                     if let Some(t) = ollama_usage(&v) {
                         self.tokens = Some(t);
                     }
@@ -168,6 +197,7 @@ pub fn openai_usage(v: &Value) -> Option<Tokens> {
         output: count(u, &["completion_tokens"]),
         reasoning: count(u, &["completion_tokens_details", "reasoning_tokens"]),
         cache_read: count(u, &["prompt_tokens_details", "cached_tokens"]),
+        estimated: false,
     })
 }
 
@@ -257,10 +287,26 @@ data: [DONE]\n\n";
             scan(Framing::OpenaiSse, "data: {\"choices\":[]}\n\n", 4),
             None
         );
-        // Cut off before the usage chunk: nothing to book.
+        // Cut off before the usage chunk: no usage, so the gateway falls back
+        // to the chunk count.
         let cut = &OPENAI_SSE[..OPENAI_SSE.find("data: {\"choices\":[],").unwrap()];
         assert_eq!(scan(Framing::OpenaiSse, cut, 16), None);
         assert_eq!(scan(Framing::OpenaiJson, "{not json", 4), None);
+    }
+
+    #[test]
+    fn content_chunks_are_counted_but_not_the_usage_chunk() {
+        let mut s = UsageScanner::new(Framing::OpenaiSse);
+        s.feed(OPENAI_SSE.as_bytes());
+        s.finish();
+        // One content chunk; the usage-only chunk and [DONE] don't count.
+        assert_eq!(s.chunks(), 1);
+
+        let mut s = UsageScanner::new(Framing::OllamaNdjson);
+        for _ in 0..5 {
+            s.feed(b"{\"message\":{\"content\":\"x\"},\"done\":false}\n");
+        }
+        assert_eq!((s.finish(), s.chunks()), (None, 5));
     }
 
     #[test]
