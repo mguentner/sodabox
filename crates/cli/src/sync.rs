@@ -10,13 +10,14 @@
 //!   can commit/branch.
 //! - `sync-host` **pulls** the guest work dir → the host cwd — the only direction
 //!   that overwrites host files — behind a dry-run summary and a confirm prompt
-//!   (all / interactive per-entry / no). `.git` is **not** pulled unless
+//!   (all / interactive per-entry / no), or `--mode` to choose up front (for
+//!   scripts: without a terminal, sync-host fails instead of asking). `.git` is **not** pulled unless
 //!   `--sync-git`, so a guest repo can't clobber host history.
 //!
 //! Neither direction uses `--delete`: sync is additive/overwrite only.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 use sodabox_common::ssh::{rsync_bin, ssh_rsh_command, tool_key_path, SshEndpoint};
@@ -34,6 +35,8 @@ pub struct SyncArgs {
     pub excludes: Vec<String>,
     /// Pull `.git` too (default: push-only).
     pub sync_git: bool,
+    /// `sync-host` only: what to pull, instead of asking.
+    pub mode: Option<Mode>,
 }
 
 /// The remote rsync location `user@host:/dir/`, plus the ssh port for `-e`.
@@ -119,7 +122,17 @@ pub fn sync_host(args: &SyncArgs) -> anyhow::Result<()> {
         println!("    {c}");
     }
 
-    match prompt_mode()? {
+    let mode = match args.mode {
+        Some(m) => m,
+        None => prompt_mode()?,
+    };
+    if mode == Mode::Interactive && !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "interactive mode asks about each path, but stdin is not a terminal; \
+             use --mode all or --mode no"
+        );
+    }
+    match mode {
         Mode::No => {
             println!("aborted; no files changed.");
             Ok(())
@@ -180,10 +193,14 @@ fn parse_changes(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// User's choice at the pull confirmation prompt.
-enum Mode {
+/// What `sync-host` pulls: chosen at the prompt, or up front with `--mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Mode {
+    /// pull every changed path
     All,
+    /// ask for each changed path (needs a terminal)
     Interactive,
+    /// pull nothing, only show what would change
     No,
 }
 
@@ -223,8 +240,16 @@ fn plan_pull(paths: &[String], ask: &mut impl FnMut(&str) -> Answer) -> Option<V
     Some(excludes)
 }
 
-/// Prompt for the pull mode on stdin.
+/// Prompt for the pull mode on stdin. Without a terminal nobody can answer
+/// (a stdin that never closes would wait forever), so that is an error
+/// pointing at `--mode`.
 fn prompt_mode() -> io::Result<Mode> {
+    if !io::stdin().is_terminal() {
+        return Err(io::Error::other(
+            "sync-host asks what to pull, but stdin is not a terminal; \
+             pass --mode all, --mode no, or run it in a terminal",
+        ));
+    }
     loop {
         print!("Pull? [a]ll / [i]nteractive / [N]o: ");
         io::stdout().flush()?;

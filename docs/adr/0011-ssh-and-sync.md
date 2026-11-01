@@ -148,6 +148,10 @@ a locked-down VM is still reachable/operable.
     dry-run summary (rsync `--out-format=%n`), then offer sync-all / interactive
     (per-entry y/N/q, a declined dir suppressing its children) / no. This is the
     only direction that overwrites host files.
+    *Amended 2026-11-01:* `--mode all|interactive|no` makes the choice up
+    front, for scripts. Without a terminal on stdin, `sync-host` fails instead
+    of asking (a stdin that never closes would otherwise wait forever), and
+    `--mode interactive` needs a terminal too.
 - **Never deletes** (`--delete` is not used): additive/overwrite only, so the
   destination never loses a file the other side lacks.
 - **`.git` is asymmetric:** pushed by default (so an in-guest agent can diff,

@@ -119,6 +119,9 @@ enum Cmd {
         /// Also pull `.git` (default: push-only, so a guest can't clobber history).
         #[arg(long)]
         sync_git: bool,
+        /// What to pull, instead of asking after the dry-run summary.
+        #[arg(long, value_enum)]
+        mode: Option<sync::Mode>,
     },
     /// configure the VM `name` as a git remote in the cwd's repo
     GitRemote {
@@ -344,17 +347,20 @@ fn main() -> anyhow::Result<()> {
             user,
             excludes,
             sync_git: false,
+            mode: None,
         }),
         Cmd::SyncHost {
             name,
             user,
             excludes,
             sync_git,
+            mode,
         } => sync::sync_host(&sync::SyncArgs {
             vm: name,
             user,
             excludes,
             sync_git,
+            mode,
         }),
         Cmd::GitRemote {
             name,
