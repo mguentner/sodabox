@@ -411,6 +411,15 @@
     '';
   };
 
+  # `nix-command` and `flakes` on by default, so `nix build`, `nix develop`,
+  # `builtins.getFlake` and friends work out of the box instead of failing with
+  # "experimental Nix feature 'nix-command' is disabled". mkDefault, so a VM
+  # layer can tighten it if it wants a flakes-free guest.
+  nix.settings.experimental-features = lib.mkDefault [
+    "nix-command"
+    "flakes"
+  ];
+
   # Minimal, headless, autologin on the serial console.
   services.getty.autologinUser = lib.mkDefault "root";
   documentation.enable = lib.mkDefault false;
