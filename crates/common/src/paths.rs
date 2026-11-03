@@ -128,9 +128,13 @@ pub fn config_dir() -> PathBuf {
     base.join("sodabox")
 }
 
-/// Names a VM may not take: the config dir holds one `<vm>/` dir per VM next
-/// to these shared dirs, so a VM with one of these names would collide.
-pub const RESERVED_VM_NAMES: &[&str] = &["dotfiles", "guest", "profiles", "providers"];
+/// `$XDG_CONFIG_HOME/sodabox/guests/` — one `<vm>/` dir per VM. Guests live
+/// in their own subtree, so every other top-level config dir (`shared/`,
+/// `profiles/`, `providers/`, `dotfiles/`) is just a neighbor of `guests/`, not
+/// a peer of any VM — no VM name can collide with one.
+pub fn guests_root() -> PathBuf {
+    config_dir().join("guests")
+}
 
 /// `$XDG_CONFIG_HOME/sodabox/profiles/` — vendor and user policy profiles
 /// (ADR-0015), one `<name>.toml` each.
@@ -176,24 +180,19 @@ pub fn vm_dotfiles_dir(vm: &str) -> PathBuf {
 
 /// The shared, editable guest input (ADR-0012): `configuration.nix` + `npins/`.
 pub fn shared_guest_dir() -> PathBuf {
-    config_dir().join("guest")
+    config_dir().join("shared")
 }
 
-/// `$XDG_CONFIG_HOME/sodabox/<vm>/` — the VM's user-owned config (e.g. its
-/// guest override).
+/// `$XDG_CONFIG_HOME/sodabox/guests/<vm>/` — the VM's user-owned config: its
+/// guest input, which shadows the shared default.
 pub fn vm_config_dir(vm: &str) -> PathBuf {
-    config_dir().join(vm)
+    guests_root().join(vm)
 }
 
-/// Optional per-VM guest input that shadows the shared default.
-pub fn vm_guest_override_dir(vm: &str) -> PathBuf {
-    vm_config_dir(vm).join("guest")
-}
-
-/// The guest input dir sodabox builds for `vm`: the per-VM override if it has a
+/// The guest input dir sodabox builds for `vm`: the VM's own if it has a
 /// `configuration.nix`, else the shared default (ADR-0012).
 pub fn resolve_guest_dir(vm: &str) -> PathBuf {
-    let over = vm_guest_override_dir(vm);
+    let over = vm_config_dir(vm);
     if over.join("configuration.nix").is_file() {
         over
     } else {

@@ -418,12 +418,6 @@ fn create(
     use sodabox_common::vm::VmMeta;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    if paths::RESERVED_VM_NAMES.contains(&name) {
-        anyhow::bail!(
-            "'{name}' is reserved (it names a shared dir in the config dir); pick another VM name"
-        );
-    }
-
     let cpus = cpus.unwrap_or(2);
     let mem = mem.unwrap_or("2048M");
     let disk = disk.unwrap_or("8G");

@@ -1,9 +1,9 @@
 # This VM's guest configuration — this file is YOURS (ADR-0012).
 #
-# `soda create` writes it once per VM, to <config-dir>/<vm>/guest/, and never
+# `soda create` writes it once per VM, to <config-dir>/guests/<vm>/, and never
 # rewrites it. It layers on top of the shared guest configuration, so:
 #
-#   - "all VMs" settings go in the shared <config-dir>/guest/configuration.nix
+#   - "all VMs" settings go in the shared <config-dir>/shared/configuration.nix
 #     (imported below);
 #   - "this VM" settings go here.
 #
@@ -11,7 +11,7 @@
 # Replace the symlink with a real npins dir to pin this VM separately.
 { ... }:
 {
-  imports = [ ../../guest/configuration.nix ];
+  imports = [ ../../shared/configuration.nix ];
 
   # Chosen by `soda create --hostname name|static|random`; edit freely.
   networking.hostName = "@HOSTNAME@";

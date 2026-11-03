@@ -104,10 +104,12 @@ changes:
 `policy show` prints the file as written. The enforced `VmPolicy` is always
 parsed from the document, so there is no second representation to drift.
 
-### Reserved VM names
+### VM names
 
-The config dir holds one `<vm>/` per VM next to the shared `guest/` and
-`profiles/` dirs, so `create` refuses the VM names `guest` and `profiles`.
+*Amended 2026-10-16.* Per-VM config dirs live under `guests/<vm>/`, not
+directly in the config dir, so a VM name can no longer collide with a shared
+dir (`shared/`, `profiles/`, `providers/`, `dotfiles/`); the previously
+reserved names (`guest`, `profiles`, `providers`, `dotfiles`) are free to use.
 
 ### CLI
 

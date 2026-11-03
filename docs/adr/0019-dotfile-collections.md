@@ -75,8 +75,9 @@ $XDG_CONFIG_HOME/sodabox/dotfiles/
   collection is an error.
 - Names follow the profile rule (ADR-0015): `[a-z0-9][a-z0-9_-]*`, ≤ 64 chars.
   Paths must be relative, without `..`.
-- `dotfiles` joins `guest` and `profiles` as a reserved VM name, since the
-  config dir holds one `<vm>/` folder per VM next to these shared ones.
+- Per-VM config lives under `guests/<vm>/` (ADR-0012, as amended 2026-10-16),
+  so no collection-dir name (`dotfiles` included) collides with a VM and no
+  VM name is reserved on its account.
 
 ### Merging and snapshot
 

@@ -46,7 +46,7 @@ experimental features, and no requirement that the user has sodabox's flake).
 ### Layout — user inputs only (materialized into the config dir)
 
 ```
-$XDG_CONFIG_HOME/sodabox/guest/          # editable default; per-VM override may shadow it
+$XDG_CONFIG_HOME/sodabox/shared/         # editable default; per-VM override may shadow it
   npins/
     sources.json     # pinned nixpkgs (+ optional overlays / other sources)
     default.nix      # `import ./npins` -> { nixpkgs = <path>; ... } (npins-generated)
@@ -57,9 +57,16 @@ $XDG_CONFIG_HOME/sodabox/guest/          # editable default; per-VM override may
 - A per-VM override may shadow the shared default (mirroring the
   `authorized_keys`/`policy.toml` per-instance pattern), so most users share one
   editable guest input while a VM can diverge.
+- *Amended 2026-10-16.* Per-VM config dirs live under
+  `$XDG_CONFIG_HOME/sodabox/guests/<vm>/` rather than directly in the config
+  dir, so no VM name can collide with a shared dir (`shared/`, `profiles/`,
+  `providers/`, `dotfiles/`) — none of those names is reserved any more. The
+  shared input is `shared/` rather than `guest/`, which was too easily confused
+  with `guests/`, and a VM's input sits directly in its dir with no `guest/`
+  subdir, since nothing else lives there.
 - *Amended 2026-10-16.* `create` materializes that override for every new VM as
   a thin layer instead of leaving it opt-in. Its `configuration.nix` imports the
-  shared one (`imports = [ ../../guest/configuration.nix ]`) and sets
+  shared one (`imports = [ ../../shared/configuration.nix ]`) and sets
   `networking.hostName`. Its `npins` is a symlink to the shared pins. That gives
   two editable layers for free, "all VMs" (shared) and "this VM" (per-VM), and
   `npins update` in the shared dir still moves every VM. The hostname comes from
@@ -70,9 +77,9 @@ $XDG_CONFIG_HOME/sodabox/guest/          # editable default; per-VM override may
   using the shared input and `sodabox-guest`.
 
 ```
-$XDG_CONFIG_HOME/sodabox/<vm>/guest/      # written by create, never rewritten
-  npins -> ../../guest/npins              # replace with a real dir to pin this VM alone
-  configuration.nix                        # imports ../../guest/configuration.nix; sets networking.hostName
+$XDG_CONFIG_HOME/sodabox/guests/<vm>/    # written by create, never rewritten
+  npins -> ../../shared/npins            # replace with a real dir to pin this VM alone
+  configuration.nix                      # imports ../../shared/configuration.nix; sets networking.hostName
 ```
 - **Why npins:** flake-free (no experimental features, no dependency on sodabox's
   flake) and user-updatable — `npins update` / `npins add github NixOS nixpkgs
@@ -132,8 +139,8 @@ the launch live in sodabox's flake + Rust.*
 - **Builder:** **bespoke `eval-config`** with sodabox's own base module (not
   `microvm.nix`), matching the validated minimal direct-kernel path (spike 0001)
   and the minimal-closure goal (ADR-0008). Revisit `microvm.nix` later if wanted.
-- **Location:** a **shared editable default** at `…/sodabox/guest/`, with an
-  optional **per-VM override** at `…/sodabox/<vm>/guest/`.
+- **Location:** a **shared editable default** at `…/sodabox/shared/`, with an
+  optional **per-VM override** at `…/sodabox/guests/<vm>/`.
 
 **Still open:**
 - Exact **argument interface** of `mkGuest` and the **base-module option surface**

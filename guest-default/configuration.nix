@@ -5,7 +5,7 @@
 # built and booted (kernel, store image, launch) — see ADR-0012. Update the
 # pinned nixpkgs with `npins update` in this directory.
 #
-# This is the "all VMs" layer: each VM's own <config-dir>/<vm>/guest/
+# This is the "all VMs" layer: each VM's own <config-dir>/guests/<vm>/
 # configuration.nix imports it and adds that VM's settings (e.g. its hostname).
 # Use lib.mkDefault here for anything a VM layer should be able to override.
 { pkgs, ... }:

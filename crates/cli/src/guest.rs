@@ -121,7 +121,7 @@ fn render_vm_configuration(hostname: &str) -> String {
     VM_CONFIGURATION.replace("@HOSTNAME@", hostname)
 }
 
-/// Write VM `vm`'s own guest layer (`<config-dir>/<vm>/guest/`) if absent: a
+/// Write VM `vm`'s own guest layer (`<config-dir>/guests/<vm>/`) if absent: a
 /// `configuration.nix` that imports the shared one and sets the hostname, plus
 /// an `npins` symlink to the shared pins so `npins update` there still moves
 /// every VM. `hostname` is resolved only when the file is actually written,
@@ -131,7 +131,7 @@ pub fn ensure_vm_guest_input(
     vm: &str,
     hostname: impl FnOnce() -> anyhow::Result<String>,
 ) -> anyhow::Result<(bool, PathBuf)> {
-    let dir = paths::vm_guest_override_dir(vm);
+    let dir = paths::vm_config_dir(vm);
     let configuration = dir.join("configuration.nix");
     if configuration.is_file() {
         return Ok((false, dir));
@@ -140,9 +140,9 @@ pub fn ensure_vm_guest_input(
     fs::create_dir_all(&dir)?;
     let npins = dir.join("npins");
     if fs::symlink_metadata(&npins).is_err() {
-        // Relative, matching the template's `../../guest/configuration.nix`, so
+        // Relative, matching the template's `../../shared/configuration.nix`, so
         // moving the whole config dir keeps working.
-        std::os::unix::fs::symlink("../../guest/npins", &npins)?;
+        std::os::unix::fs::symlink("../../shared/npins", &npins)?;
     }
     fs::write(&configuration, render_vm_configuration(&hostname))?;
     Ok((true, dir))
@@ -196,7 +196,7 @@ mod tests {
     fn vm_configuration_imports_shared_and_sets_hostname() {
         let c = render_vm_configuration("thebox");
         assert!(
-            c.contains("imports = [ ../../guest/configuration.nix ];"),
+            c.contains("imports = [ ../../shared/configuration.nix ];"),
             "{c}"
         );
         assert!(c.contains("networking.hostName = \"thebox\";"), "{c}");
