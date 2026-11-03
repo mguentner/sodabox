@@ -24,6 +24,11 @@ use std::time::Duration;
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use tokio::io::Interest;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+
+/// How long to wait before accepting again after a temporary accept error. The
+/// failed connection stays queued, so retrying at once would spin.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 /// How long a dial runs before a client close can cancel it. A client may
 /// half-close right after sending (`printf … | nc -N`) and still want the reply,
@@ -111,6 +116,8 @@ pub struct TransparentProxy<D: Dialer> {
     listener: TcpListener,
     dialer: Arc<D>,
     local: Option<(SocketAddr, Arc<dyn LocalService>)>,
+    /// One permit per open connection; `None` means no cap.
+    permits: Option<Arc<Semaphore>>,
 }
 
 /// Boxed future alias for [`LocalService::serve`].
@@ -131,7 +138,16 @@ impl<D: Dialer> TransparentProxy<D> {
             listener,
             dialer,
             local: None,
+            permits: None,
         }
+    }
+
+    /// Allow at most `max` open connections, closing new ones past that. Each
+    /// holds file descriptors the VM's DNS, UDP and control paths share, so a
+    /// guest opening too many must not starve those.
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.permits = Some(Arc::new(Semaphore::new(max)));
+        self
     }
 
     /// Hand connections whose original destination is `addr` to `service`.
@@ -151,10 +167,47 @@ impl<D: Dialer> TransparentProxy<D> {
     /// supervisor powers the guest off rather than let it run unfiltered. A
     /// per-connection failure never reaches here: an unmatched destination or a
     /// failed upstream dial denies that one connection (see [`crate::policy`]) and
-    /// the loop continues.
+    /// the loop continues. Neither does a temporary accept error such as running
+    /// out of file descriptors: the filter still works, and nothing is dialed
+    /// while it waits (see [`is_transient_accept_error`]).
     pub async fn serve(self) -> io::Result<()> {
+        // Each logs once per episode: a guest can keep these going for a while.
+        let mut accept_failing = false;
+        let mut at_cap = false;
         loop {
-            let (client, peer) = self.listener.accept().await?;
+            let (client, peer) = match self.listener.accept().await {
+                Ok(accepted) => {
+                    accept_failing = false;
+                    accepted
+                }
+                Err(e) if is_transient_accept_error(&e) => {
+                    if !accept_failing {
+                        eprintln!("proxy: can't accept connections for now, retrying: {e}");
+                        accept_failing = true;
+                    }
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let permit = match &self.permits {
+                Some(permits) => match permits.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        at_cap = false;
+                        Some(permit)
+                    }
+                    // Dropping `client` closes it: the guest gets a fast failure
+                    // it can retry, not a hang.
+                    Err(_) => {
+                        if !at_cap {
+                            eprintln!("proxy: connection limit reached, closing new connections");
+                            at_cap = true;
+                        }
+                        continue;
+                    }
+                },
+                None => None,
+            };
             // TPROXY preserves the original destination as the local address.
             let dst = match client.local_addr() {
                 Ok(a) => a,
@@ -165,18 +218,50 @@ impl<D: Dialer> TransparentProxy<D> {
             };
             if let Some((addr, service)) = &self.local {
                 if dst == *addr {
-                    tokio::spawn(service.serve(client, peer));
+                    let serving = service.serve(client, peer);
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        serving.await;
+                    });
                     continue;
                 }
             }
             let dialer = self.dialer.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = handle(client, dst, dialer).await {
                     eprintln!("proxy: {peer} -> {dst} closed: {e}");
                 }
             });
         }
     }
+}
+
+/// Whether a failed `accept` says nothing about the listener itself: the process
+/// or host is out of a resource, or the connection failed before it was accepted
+/// (accept(2) says to treat those network errors like `EAGAIN`). Anything else
+/// means the listener is broken, which stays fatal.
+fn is_transient_accept_error(e: &io::Error) -> bool {
+    use nix::libc;
+    matches!(
+        e.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::EINTR
+                | libc::EPROTO
+                | libc::ENETDOWN
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::ENONET
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+        )
+    )
 }
 
 async fn handle<D: Dialer>(
@@ -288,6 +373,60 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0], paddr);
+    }
+
+    #[test]
+    fn only_a_broken_listener_is_a_fatal_accept_error() {
+        use nix::libc;
+        let transient = |code| is_transient_accept_error(&io::Error::from_raw_os_error(code));
+        assert!(transient(libc::EMFILE));
+        assert!(transient(libc::ENFILE));
+        assert!(transient(libc::ECONNABORTED));
+        assert!(!transient(libc::EBADF));
+        assert!(!transient(libc::EINVAL));
+        assert!(!is_transient_accept_error(&io::Error::other("boom")));
+    }
+
+    #[tokio::test]
+    async fn connections_past_the_cap_are_closed_until_one_ends() {
+        let dialer = Arc::new(FixedDialer {
+            target: spawn_echo().await,
+            seen: Arc::new(Mutex::new(Vec::new())),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = TransparentProxy::new(listener, dialer).with_max_connections(1);
+        let paddr = proxy.local_addr().unwrap();
+        tokio::spawn(proxy.serve());
+        let echoes = |mut c: TcpStream| async move {
+            c.write_all(b"hi").await.unwrap();
+            let mut buf = [0u8; 2];
+            c.read_exact(&mut buf).await.unwrap();
+            c
+        };
+
+        let first = echoes(TcpStream::connect(paddr).await.unwrap()).await;
+
+        // At the cap: closed straight away, while the first keeps working.
+        let mut second = TcpStream::connect(paddr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(2), second.read(&mut buf)).await;
+        assert!(matches!(closed, Ok(Ok(0)) | Ok(Err(_))), "{closed:?}");
+        let first = echoes(first).await;
+
+        // Its permit comes back once it ends.
+        drop(first);
+        for _ in 0..100 {
+            let mut c = TcpStream::connect(paddr).await.unwrap();
+            let served = c.write_all(b"hi").await.is_ok()
+                && tokio::time::timeout(Duration::from_millis(100), c.read_exact(&mut [0u8; 2]))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+            if served {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the cap never freed up");
     }
 
     /// A connected (client, accepted server side) pair.

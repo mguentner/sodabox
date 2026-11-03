@@ -536,6 +536,52 @@ fn parent_main(
     result
 }
 
+/// The file descriptors one supervisor plans around (ADR-0004), raising the soft
+/// limit to this if the hard limit allows, so behavior doesn't depend on how it
+/// was launched. It stays well below what a high hard limit would allow, since a
+/// guest can make the supervisor use all of it.
+const FD_BUDGET: u64 = 16_384;
+/// Held back from TCP connections: the UDP proxy's `MAX_FLOWS` flows, plus DNS
+/// upstream queries, the control socket, the gateway and the log.
+const FD_RESERVE: u64 = 2_048;
+/// The connection cap's floor, should the hard limit leave no room for one.
+const MIN_TCP_CONNECTIONS: usize = 64;
+
+/// What to set the soft limit to, and the budget that gives. A soft limit already
+/// above the budget is left alone; the budget doesn't grow with it.
+fn fd_limits(soft: u64, hard: u64) -> (u64, u64) {
+    let raised = soft.max(hard.min(FD_BUDGET));
+    (raised, raised.min(FD_BUDGET))
+}
+
+/// Raise `RLIMIT_NOFILE` towards [`FD_BUDGET`], returning the budget to plan with.
+fn raise_fd_limit() -> u64 {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok(limits) => limits,
+        Err(e) => {
+            eprintln!("soda: reading the fd limit: {e}");
+            return 0;
+        }
+    };
+    let (raised, budget) = fd_limits(soft, hard);
+    if raised != soft {
+        if let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, raised, hard) {
+            eprintln!("soda: raising the fd limit to {raised}: {e}");
+            return soft.min(FD_BUDGET);
+        }
+    }
+    budget
+}
+
+/// The TCP proxy's connection cap for an fd budget: each connection takes two.
+fn max_tcp_connections(budget: u64) -> usize {
+    let cap = budget.saturating_sub(FD_RESERVE) / 2;
+    usize::try_from(cap)
+        .unwrap_or(usize::MAX)
+        .max(MIN_TCP_CONNECTIONS)
+}
+
 /// The async body running in the host netns: enforcement, DNS, control, guest.
 async fn serve(
     plan: LaunchPlan,
@@ -610,7 +656,8 @@ async fn serve(
     // filter. (Egress is already denied structurally when the proxy is gone —
     // nothing accepts the TPROXY-diverted connections — but a silent zombie is
     // not an acceptable state; we make the failure deterministic and observable.)
-    let mut proxy = TransparentProxy::new(tcp_listener, dialer);
+    let mut proxy = TransparentProxy::new(tcp_listener, dialer)
+        .with_max_connections(max_tcp_connections(raise_fd_limit()));
     if let Some(g) = &gateway {
         proxy = proxy.with_local(
             SocketAddr::from((GATEWAY_IP, GATEWAY_PORT)),
@@ -1225,6 +1272,30 @@ mod tests {
         );
         assert!(bare.request_resolve(1, true).is_err());
         assert!(bare.request_list().is_empty());
+    }
+
+    #[test]
+    fn fd_limit_is_raised_to_the_budget_without_exceeding_or_lowering() {
+        // A typical launch: raised to the budget, not all the way to the hard limit.
+        assert_eq!(fd_limits(1024, 524_288), (FD_BUDGET, FD_BUDGET));
+        assert_eq!(fd_limits(1024, u64::MAX), (FD_BUDGET, FD_BUDGET));
+        // The hard limit is as far as it can go.
+        assert_eq!(fd_limits(1024, 4096), (4096, 4096));
+        assert_eq!(fd_limits(1024, 1024), (1024, 1024));
+        // Already higher: left alone, and the plan doesn't grow with it.
+        assert_eq!(fd_limits(524_288, 524_288), (524_288, FD_BUDGET));
+    }
+
+    #[test]
+    fn connection_cap_leaves_the_reserve_and_has_a_floor() {
+        let cap = max_tcp_connections(FD_BUDGET);
+        assert_eq!(cap, 7168);
+        assert!(cap as u64 * 2 + FD_RESERVE <= FD_BUDGET);
+        // More fds than the UDP flows alone need must stay reserved.
+        assert!(FD_RESERVE > sodabox_proxy::udp::MAX_FLOWS as u64);
+        // A low hard limit: the floor, with the accept loop as the safety net.
+        assert_eq!(max_tcp_connections(1024), MIN_TCP_CONNECTIONS);
+        assert_eq!(max_tcp_connections(0), MIN_TCP_CONNECTIONS);
     }
 
     #[test]

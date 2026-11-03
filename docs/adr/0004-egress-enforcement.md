@@ -98,6 +98,15 @@ netns. That matters for the nftables approach:
   timestamp) on the VM's event stream for the TUI ([ADR-0009](0009-cli-and-tui.md)).
 - **Fail-closed:** if the proxy is down or policy can't be evaluated, egress is
   denied.
+- **Resource limits don't count as the proxy being down.** Running out of file
+  descriptors leaves the filter intact, and the guest can cause it just by
+  opening connections, so it must not power the VM off. The supervisor raises its
+  soft fd limit to 16384 if the hard limit allows, and caps open TCP connections
+  at `(budget - 2048) / 2`, keeping the rest for UDP flows, DNS and the control
+  socket. Connections past the cap are closed at once, a fast failure the guest
+  can retry. Temporary `accept` errors are retried after 100 ms, which covers
+  fds used up some other way; nothing is dialed meanwhile, so this still fails
+  closed. Only an error that means the listener itself is broken ends the proxy.
 
 ## Consequences
 
