@@ -32,6 +32,9 @@ restart required.
   resolution of the name (ADR-0005) and authorizes its resolved IPs while their
   TTL is valid. Proto/port scoping applies to the authorized IPs, so
   `domain github.com tcp:443` allows only TLS to whatever GitHub resolves to.
+- `resolve <name> [subdomains|exact|wildcard]` — permits resolution of the name
+  only; its resolved IPs gain no egress. Approving a DNS request adds one
+  ([ADR-0021](0021-pending-egress-requests.md)).
 
 Both IPv4 and IPv6 are first-class, **including the `:PORT`/proto qualifier on
 both** (unlike cogbox, whose `:PORT` qualifier is IPv4-only in v1).

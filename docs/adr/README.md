@@ -45,6 +45,7 @@ runs arbitrary Linux applications inside microVMs with a whitelist-only network.
 | [0018](0018-caches-on-data-disk.md) | Tool caches on the data disk | Accepted |
 | [0019](0019-dotfile-collections.md) | Dotfile collections | Accepted |
 | [0020](0020-inference-gateway.md) | Inference gateway | Proposed |
+| [0021](0021-pending-egress-requests.md) | Pending egress requests — interactive approval with TTL | Proposed |
 
 ## Conventions
 
