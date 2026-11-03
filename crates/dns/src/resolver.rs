@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use sodabox_common::allowlist::{EphemeralEntry, SharedAllowlist};
 use sodabox_common::event::{now_ts, DnsVerdict, Event};
 use sodabox_common::policy::{Limits, VmPolicy};
+use sodabox_common::request::{PendingRequests, RequestVerdict, REQUEST_TTL};
 use tokio::net::UdpSocket;
 
 use crate::domain::{self, DomainAllowlist, DomainRule, SharedDomainAllowlist};
@@ -57,6 +58,9 @@ pub struct FilteringResolver {
     limits: Limits,
     events: Arc<dyn DnsEvents>,
     local: LocalNames,
+    /// Where an undecided qname is parked for interactive approval
+    /// (ADR-0021); `None` keeps the plain refuse-on-deny behavior (tests).
+    pending: Option<PendingRequests>,
 }
 
 impl FilteringResolver {
@@ -74,7 +78,15 @@ impl FilteringResolver {
             limits: policy.limits.clone(),
             events: null_sink(),
             local: LocalNames::default(),
+            pending: None,
         })
+    }
+
+    /// Park undecided qnames in this table instead of refusing them
+    /// (ADR-0021).
+    pub fn with_pending(mut self, pending: PendingRequests) -> Self {
+        self.pending = Some(pending);
+        self
     }
 
     /// A clone of the live local-names handle (see [`LocalNames`]). Like
@@ -214,17 +226,20 @@ fn admit(
         // Anti-abuse caps: admit only within the per-VM count and total-
         // size limits. Once a cap is hit, stop admitting the rest of the spray —
         // the un-admitted IPs stay deny-by-default and are not returned to the
-        // guest (no point handing it addresses the proxy will refuse).
-        let admitted = al.try_insert_ephemeral(
-            EphemeralEntry {
-                ip,
-                ports: rule.ports.clone(),
-                proto: rule.proto,
-                expiry: now + Duration::from_secs(ttl as u64) + TTL_GRACE,
-                domain: rule.name.clone(),
-            },
-            limits,
-        );
+        // guest (no point handing it addresses the proxy will refuse). A
+        // `resolve` rule admits nothing: the guest gets the address, and the
+        // proxy holds whatever it dials there as its own request (ADR-0021).
+        let admitted = !rule.admits
+            || al.try_insert_ephemeral(
+                EphemeralEntry {
+                    ip,
+                    ports: rule.ports.clone(),
+                    proto: rule.proto,
+                    expiry: now + Duration::from_secs(ttl as u64) + TTL_GRACE,
+                    domain: rule.name.clone(),
+                },
+                limits,
+            );
         if !admitted {
             break;
         }
@@ -283,11 +298,32 @@ impl QueryHandler for FilteringResolver {
             .ok()
             .and_then(|d| d.matches(&name).cloned());
         let allowlist = self.allowlist.clone();
+        let domains = self.domains.clone();
+        let pending = self.pending.clone();
         let upstreams = self.upstreams.clone();
         let limits = self.limits.clone();
         let events = self.events.clone();
 
         Box::pin(async move {
+            // Undecided, not refused (ADR-0021): an unlisted name is parked for
+            // up to REQUEST_TTL and answered only once resolved. The upstream
+            // query stays unsent until approval, so an unapproved name never
+            // leaks to the host resolver (the ADR-0005 anti-exfil property
+            // holds); retransmissions coalesce in the request table.
+            let mut matched = matched;
+            if matched.is_none() {
+                if let Some(pending) = pending {
+                    let (_, rx) = pending.hold("dns", &name, None);
+                    if matches!(
+                        tokio::time::timeout(REQUEST_TTL, rx).await,
+                        Ok(Ok(RequestVerdict::Approved))
+                    ) {
+                        // Approve *is* a persistent rule: re-read the (just
+                        // updated) domain allowlist, exactly like the live swap.
+                        matched = domains.read().ok().and_then(|d| d.matches(&name).cloned());
+                    }
+                }
+            }
             let Some(rule) = matched else {
                 // Not allowlisted -> REFUSED (anti-exfil). Report the blocked
                 // query so the TUI/log can surface exfil attempts.
@@ -379,6 +415,33 @@ mod tests {
         (r, al)
     }
 
+    #[test]
+    fn resolve_rule_answers_without_admitting_egress() {
+        let pol = VmPolicy {
+            rules: vec![Rule::Resolve {
+                name: "allowed.test".into(),
+                scope: DomainScope::Subdomains,
+            }],
+            ..VmPolicy::default()
+        };
+        let al = shared(Allowlist::from_policy(&pol).unwrap());
+        let domains = DomainAllowlist::from_policy(&pol).unwrap();
+        let rule = domains.matches("www.allowed.test").unwrap().clone();
+        let answers = vec![wire::Rr {
+            name: "www.allowed.test".into(),
+            ttl: 60,
+            data: RData::A("203.0.113.10".parse().unwrap()),
+        }];
+
+        assert_eq!(admit(&al, &rule, &answers, &Limits::default()).len(), 1);
+        let decision = al.read().unwrap().evaluate(
+            "203.0.113.10:443".parse().unwrap(),
+            Proto::Tcp,
+            Instant::now(),
+        );
+        assert_eq!(decision, sodabox_common::allowlist::Decision::Deny);
+    }
+
     #[tokio::test]
     async fn local_names_are_answered_only_while_present() {
         let (r, _al) = resolver_with_domain("allowed.test");
@@ -428,6 +491,80 @@ mod tests {
         let q = wire::parse_query(&wire::build_query(0x11, "evil.test", TYPE_A).unwrap()).unwrap();
         match r.handle(q, "127.0.0.1:1".parse().unwrap()).await {
             Response::Packet(p) => assert_eq!(p[3] & 0x0f, RCODE_REFUSED),
+            Response::Drop => panic!("should have replied"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unlisted_name_is_held_then_refused_on_deny() {
+        // ADR-0021: an unlisted name parks in the request table; a deny refuses
+        // it exactly as if it had been refused immediately.
+        let (r, _al) = resolver_with_domain("allowed.test");
+        let pending = sodabox_common::request::shared();
+        let r = r.with_pending(pending.clone());
+        // The hold happens inside the query's future (ADR-0021), so the query
+        // must run concurrently with the wait below.
+        let task = {
+            let q =
+                wire::parse_query(&wire::build_query(0x21, "maybe.test", TYPE_A).unwrap()).unwrap();
+            let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            tokio::spawn(async move { r.handle(q, peer).await })
+        };
+
+        // The query is parked, not answered.
+        let id = loop {
+            if let Some(req) = pending.list().first() {
+                break req.id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(pending.list()[0].destination, "maybe.test");
+        assert!(pending.resolve(id, false));
+
+        match task.await.unwrap() {
+            Response::Packet(p) => assert_eq!(p[3] & 0x0f, RCODE_REFUSED),
+            Response::Drop => panic!("should have replied"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unlisted_name_proceeds_past_the_filter_on_approval() {
+        // Approve *is* a persistent rule: the domain lands in the (live) domain
+        // allowlist and the held query then proceeds. No upstreams are
+        // configured here, so the proof it got past the filter is SERVFAIL
+        // (an upstream failure), not REFUSED (a filter verdict).
+        let (r, _al) = resolver_with_domain("allowed.test");
+        let domains = r.domains();
+        let pending = sodabox_common::request::shared();
+        let r = r.with_pending(pending.clone());
+        let task = {
+            let q = wire::parse_query(&wire::build_query(0x22, "granted.test", TYPE_A).unwrap())
+                .unwrap();
+            let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            tokio::spawn(async move { r.handle(q, peer).await })
+        };
+
+        let id = loop {
+            if let Some(req) = pending.list().first() {
+                break req.id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        // The TUI's approve path: rule first, then the resolve.
+        let allow = VmPolicy {
+            rules: vec![Rule::Domain {
+                name: "granted.test".into(),
+                scope: DomainScope::Subdomains,
+                ports: None,
+                proto: None,
+            }],
+            ..VmPolicy::default()
+        };
+        domains.write().unwrap().swap_policy(&allow).unwrap();
+        assert!(pending.resolve(id, true));
+
+        match task.await.unwrap() {
+            Response::Packet(p) => assert_eq!(p[3] & 0x0f, RCODE_SERVFAIL),
             Response::Drop => panic!("should have replied"),
         }
     }

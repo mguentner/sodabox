@@ -52,6 +52,24 @@ pub enum Event {
     QuotaExhausted { ts: u64, alias: String },
     /// A live policy change.
     Policy { ts: u64, version: u32 },
+    /// A request was parked for interactive approval (ADR-0021): no rule
+    /// matched, so instead of refusing, the enforcement component holds it for
+    /// `REQUEST_TTL` and waits for a `RequestResolve` over the control socket.
+    RequestPending {
+        ts: u64,
+        id: u64,
+        /// `dns`, `tcp` or `udp`.
+        proto: String,
+        /// The qname (dns) or destination IP (tcp/udp).
+        destination: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// Unix seconds when the request dies if unresolved.
+        expires_ts: u64,
+    },
+    /// A parked request left the table: `approved` / `denied` / `expired` /
+    /// `abandoned`.
+    RequestResolved { ts: u64, id: u64, verdict: String },
     /// VM lifecycle transition.
     Lifecycle { ts: u64, state: String },
     /// A backpressure gap: a subscriber fell behind and the

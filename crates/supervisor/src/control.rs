@@ -62,6 +62,14 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn quota_reload(&self) -> Result<(), String> {
         Err("this supervisor has no inference gateway".to_string())
     }
+    /// Approve/deny a parked egress request (ADR-0021). Default: none.
+    fn request_resolve(&self, _id: u64, _allow: bool) -> Result<(), String> {
+        Err("this supervisor holds no pending requests".to_string())
+    }
+    /// The live parked requests (ADR-0021). Default: none.
+    fn request_list(&self) -> Vec<sodabox_common::request::PendingRequest> {
+        Vec::new()
+    }
 }
 
 /// The control socket server. Generic over the [`ControlHandler`] so the real
@@ -206,6 +214,18 @@ async fn serve_conn<H: ControlHandler>(stream: UnixStream, handler: Arc<H>) -> i
             }
             Request::QuotaReload => {
                 write_line(&mut wr, &to_response(handler.quota_reload())).await?;
+            }
+            Request::RequestResolve { id, allow } => {
+                write_line(&mut wr, &to_response(handler.request_resolve(id, allow))).await?;
+            }
+            Request::RequestList => {
+                write_line(
+                    &mut wr,
+                    &Response::Requests {
+                        requests: handler.request_list(),
+                    },
+                )
+                .await?;
             }
         }
     }

@@ -4,6 +4,7 @@
 
 use crate::policy::VmPolicy;
 use crate::quota::Balances;
+use crate::request::PendingRequest;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,14 +28,35 @@ pub enum Request {
     QuotaGet,
     /// Re-read the quota ledger after the CLI appended a grant.
     QuotaReload,
+    /// Approve or deny a parked egress request (ADR-0021). Idempotent: an
+    /// unknown or expired id is `Ok` (the request died in between).
+    RequestResolve {
+        id: u64,
+        allow: bool,
+    },
+    /// The live parked-egress-request table (ADR-0021), for a starting TUI.
+    RequestList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "resp", rename_all = "snake_case")]
 pub enum Response {
     Ok,
-    Status { state: String, policy_version: u32 },
-    Policy { policy: VmPolicy },
-    Quota { balances: Balances },
-    Error { msg: String },
+    Status {
+        state: String,
+        policy_version: u32,
+    },
+    Policy {
+        policy: VmPolicy,
+    },
+    Quota {
+        balances: Balances,
+    },
+    /// The live parked requests ([`Request::RequestList`]).
+    Requests {
+        requests: Vec<PendingRequest>,
+    },
+    Error {
+        msg: String,
+    },
 }

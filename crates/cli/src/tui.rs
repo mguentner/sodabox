@@ -4,6 +4,12 @@
 //! buffers for backpressure, it shows two tabs (`1`/`2`, `←`/`→`):
 //!
 //! - **Network**
+//!   - **Egress Requests** (ADR-0021) — destinations no rule matched, held
+//!     up to 30 s for interactive approval: `a`/Enter approves (which adds the
+//!     persistent rule), `d` denies; the countdown fades white → yellow →
+//!     orange → red → dark red → purple. A new request raises an OSC 9
+//!     notification and/or the terminal bell, cycled with `n`
+//!     (`off|notification|bell|all`, persisted in `tui.toml`).
 //!   - **Egress** — flow verdicts (proto, dst:port, matched rule).
 //!   - **DNS** — query verdicts (name, resolved IPs, TTL).
 //!   - **Policy** — the live policy version and its rules.
@@ -20,9 +26,9 @@
 //! Quick-actions: the focused flow panel has a selectable cursor
 //! (`Tab` switches panels, `↑`/`↓` move it), and `a`/`Enter` allows the
 //! highlighted **blocked** destination on the spot — an egress `BLOCK` becomes
-//! an `ip` allow of its dst, a DNS `REFUSED` becomes a `domain` allow of its
-//! name. Like `soda allow`, that edits `policy.toml` and pushes the whole new
-//! policy via `PolicySet` (the supervisor rejects raw single-rule edits so the
+//! an `ip` allow of its proto and dst:port, a DNS `REFUSED` becomes a `resolve`
+//! allow of its name. Like `soda allow`, that edits `policy.toml` and pushes
+//! the whole new policy via `PolicySet` (the supervisor rejects raw single-rule edits so the
 //! CLI stays the sole writer of `policy.toml`); the result shows in the footer.
 //! While a row is held the panel is frozen on it: new events land below the
 //! window instead of sliding the content under the cursor.
@@ -43,6 +49,8 @@
 //! into one visible "dropped" tally so a gap is never silent.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::Write as IoWrite;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
@@ -60,6 +68,7 @@ use sodabox_common::policy::{
 };
 use sodabox_common::protocol::{Request, Response};
 use sodabox_common::quota::{self, Balances, Entry, Ledger, Reason};
+use sodabox_common::request::PendingRequest;
 use sodabox_common::vm::VmMeta;
 use sodabox_supervisor::control::{ControlClient, EventStream};
 
@@ -324,6 +333,7 @@ impl PolicyView {
 /// tokens, switch metering) are on the Inference tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
+    Requests,
     Egress,
     Dns,
     Inference,
@@ -348,16 +358,127 @@ struct GrantPrompt {
 /// A destination the user chose to allow from a highlighted blocked row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AllowTarget {
-    /// Egress `BLOCK` → allow the dst IP (a bare host, added as a /32).
-    Ip(String),
-    /// DNS `REFUSED` → allow the queried name (subdomains scope).
-    Domain(String),
+    /// DNS `REFUSED` or a held dns request → let the name resolve (subdomains
+    /// scope), no egress.
+    Resolve(String),
+    /// Egress `BLOCK` or a held tcp/udp request → allow exactly what its row
+    /// shows.
+    Flow {
+        ip: String,
+        port: u16,
+        proto: String,
+    },
+}
+
+/// The rule approving `req` adds (ADR-0021): resolving the name for a dns
+/// request (the only kind without a port), else the row's proto and ip:port.
+fn request_allow_target(req: &PendingRequest) -> AllowTarget {
+    match req.port {
+        Some(port) => AllowTarget::Flow {
+            ip: req.destination.clone(),
+            port,
+            proto: req.proto.clone(),
+        },
+        None => AllowTarget::Resolve(req.destination.clone()),
+    }
 }
 
 /// A transient footer message (the outcome of the last quick-action).
 struct Notice {
     text: String,
     error: bool,
+}
+
+/// What the TUI emits on a new [`Event::RequestPending`] (ADR-0021): the OSC 9
+/// "growl" notification, the terminal bell, both, or neither. Cycled with
+/// `n`, persisted in `tui.toml` so it survives restarts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NotifyMode {
+    Off,
+    Notification,
+    Bell,
+    All,
+}
+
+impl NotifyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            NotifyMode::Off => "off",
+            NotifyMode::Notification => "notification",
+            NotifyMode::Bell => "bell",
+            NotifyMode::All => "all",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(NotifyMode::Off),
+            "notification" => Some(NotifyMode::Notification),
+            "bell" => Some(NotifyMode::Bell),
+            "all" => Some(NotifyMode::All),
+            _ => None,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            NotifyMode::Off => NotifyMode::Notification,
+            NotifyMode::Notification => NotifyMode::Bell,
+            NotifyMode::Bell => NotifyMode::All,
+            NotifyMode::All => NotifyMode::Off,
+        }
+    }
+
+    fn notification(self) -> bool {
+        matches!(self, NotifyMode::Notification | NotifyMode::All)
+    }
+
+    fn bell(self) -> bool {
+        matches!(self, NotifyMode::Bell | NotifyMode::All)
+    }
+}
+
+/// Where the notify mode persists: `$XDG_CONFIG_HOME/sodabox/tui.toml`.
+fn notify_path() -> PathBuf {
+    paths::config_dir().join("tui.toml")
+}
+
+fn load_notify_from(path: &std::path::Path) -> NotifyMode {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return NotifyMode::All;
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("notify") {
+            let rest = rest.trim().trim_start_matches('=').trim().trim_matches('"');
+            if let Some(mode) = NotifyMode::parse(rest) {
+                return mode;
+            }
+        }
+    }
+    NotifyMode::All
+}
+
+/// Best-effort: an unwritable config dir just means the mode resets next run.
+fn save_notify_to(path: &std::path::Path, mode: NotifyMode) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("notify = \"{}\"\n", mode.as_str()));
+}
+
+/// Raise the user's attention for a new pending request (ADR-0021): the
+/// OSC 9 "growl" notification and/or the terminal bell, per `mode`. Written
+/// straight to stdout between frames — the TUI owns the terminal.
+fn notify_terminal(mode: NotifyMode, msg: &str) {
+    let mut out = std::io::stdout();
+    if mode.notification() {
+        // OSC 9: ESC ] 9 ; <message> BEL
+        let _ = write!(out, "\x1b]9;{msg}\x07");
+    }
+    if mode.bell() {
+        let _ = write!(out, "\x07");
+    }
+    let _ = out.flush();
 }
 
 /// The monitor's UI state.
@@ -370,6 +491,21 @@ pub struct App {
     boot: Option<SystemTime>,
     egress: FlowPanel,
     dns: FlowPanel,
+    /// Parked egress requests (ADR-0021), id-ordered, with their expiry.
+    requests: Vec<PendingRequest>,
+    /// The highlighted request's id (`None` = no selection). An id, not an
+    /// index: rows expire on their own, and approving adds a persistent rule.
+    request_sel: Option<u64>,
+    /// What a new pending request emits (OSC 9 / bell), cycled with `n`.
+    notify: NotifyMode,
+    /// Where `notify` persists.
+    notify_path: PathBuf,
+    /// A queued request verdict to apply after the select.
+    pending_resolve: Option<(PendingRequest, bool)>,
+    /// Set when `requests` may have missed events; re-fetched after the select.
+    requests_dirty: bool,
+    /// A notification to emit after the select (set by `ingest`).
+    notify_msg: Option<String>,
     /// The tab shown.
     tab: Tab,
     /// Inference gateway requests and refusals (ADR-0020).
@@ -419,6 +555,7 @@ impl App {
         boot: Option<SystemTime>,
         policy: PolicyView,
         state: String,
+        notify_path: PathBuf,
     ) -> Self {
         Self {
             vm: vm.to_string(),
@@ -427,6 +564,13 @@ impl App {
             boot,
             egress: FlowPanel::new(PANEL_CAPACITY),
             dns: FlowPanel::new(PANEL_CAPACITY),
+            requests: Vec::new(),
+            request_sel: None,
+            notify: load_notify_from(&notify_path),
+            notify_path,
+            pending_resolve: None,
+            requests_dirty: false,
+            notify_msg: None,
             tab: Tab::Network,
             inference: FlowPanel::new(PANEL_CAPACITY),
             quota: Balances::new(),
@@ -471,6 +615,32 @@ impl App {
                     self.dropped = self.dropped.saturating_add(1);
                 }
             }
+            // A parked request joined or left the table (ADR-0021). The pending
+            // side also queues the terminal notification (OSC 9/bell).
+            Event::RequestPending {
+                id,
+                proto,
+                destination,
+                port,
+                expires_ts,
+                ..
+            } => {
+                if self.requests.iter().any(|r| r.id == id) {
+                    return;
+                }
+                self.requests.push(PendingRequest {
+                    id,
+                    proto,
+                    destination,
+                    port,
+                    expires_ts,
+                });
+                self.queue_request_notification();
+            }
+            Event::RequestResolved { id, .. } => {
+                self.requests.retain(|r| r.id != id);
+                self.drop_stale_request_sel();
+            }
             Event::Policy { version, .. } => {
                 // Show the new version immediately; flag a rules re-fetch.
                 if version != self.policy.version {
@@ -481,6 +651,8 @@ impl App {
             Event::Lifecycle { state, .. } => self.state = state,
             Event::Dropped { count, .. } => {
                 self.dropped = self.dropped.saturating_add(count);
+                // The gap may have swallowed request events.
+                self.requests_dirty = true;
             }
         }
     }
@@ -497,7 +669,7 @@ impl App {
             Focus::Egress => Some(&self.egress),
             Focus::Dns => Some(&self.dns),
             Focus::Inference => Some(&self.inference),
-            Focus::Policy | Focus::Gateway => None,
+            Focus::Policy | Focus::Gateway | Focus::Requests => None,
         }
     }
 
@@ -506,7 +678,7 @@ impl App {
             Focus::Egress => Some(&mut self.egress),
             Focus::Dns => Some(&mut self.dns),
             Focus::Inference => Some(&mut self.inference),
-            Focus::Policy | Focus::Gateway => None,
+            Focus::Policy | Focus::Gateway | Focus::Requests => None,
         }
     }
 
@@ -516,6 +688,7 @@ impl App {
             Focus::Egress => self.egress.sel,
             Focus::Dns => self.dns.sel,
             Focus::Inference => self.inference.sel,
+            Focus::Requests => self.request_sel_index(),
             Focus::Policy => self.policy_sel,
             Focus::Gateway => self.gateway_sel,
         }
@@ -585,12 +758,74 @@ impl App {
     /// Move the focus to the next panel of the current tab.
     fn toggle_focus(&mut self) {
         self.focus = match self.focus {
+            Focus::Requests => Focus::Egress,
             Focus::Egress => Focus::Dns,
             Focus::Dns => Focus::Policy,
-            Focus::Policy => Focus::Egress,
+            Focus::Policy => Focus::Requests,
             Focus::Inference => Focus::Gateway,
             Focus::Gateway => Focus::Inference,
         };
+    }
+
+    /// Move the Requests-panel cursor by `delta` rows, clamped to the request
+    /// list; the first move from no-selection lands on the newest request
+    /// (last row — the panel shows oldest at the top).
+    fn request_select(&mut self, delta: i32) {
+        let len = self.requests.len();
+        if len == 0 {
+            self.request_sel = None;
+            return;
+        }
+        let next = match self.request_sel_index() {
+            None => len - 1,
+            Some(cur) => (cur as i32 + delta).clamp(0, len as i32 - 1) as usize,
+        };
+        self.request_sel = Some(self.requests[next].id);
+    }
+
+    /// Queue the terminal notification for a new request. Static text: the
+    /// destination is guest-controlled, and this reaches the terminal as a raw
+    /// escape sequence.
+    fn queue_request_notification(&mut self) {
+        self.notify_msg = Some(format!("{} has new egress requests", self.vm));
+    }
+
+    /// Clear the cursor if its request is gone. Never slide onto a neighbor: the
+    /// next approve must act on a row the user picked.
+    fn drop_stale_request_sel(&mut self) {
+        if self.request_sel_index().is_none() {
+            self.request_sel = None;
+        }
+    }
+
+    /// Replace the rows with the supervisor's live list, after events were lost.
+    fn sync_requests(&mut self, live: Vec<PendingRequest>) {
+        if live
+            .iter()
+            .any(|r| !self.requests.iter().any(|known| known.id == r.id))
+        {
+            self.queue_request_notification();
+        }
+        self.requests = live;
+        self.drop_stale_request_sel();
+    }
+
+    /// Remove rows past their expiry, whose `RequestResolved` must have been lost
+    /// (the supervisor's sweep is what normally removes them).
+    fn prune_expired_requests(&mut self, now: u64) {
+        self.requests.retain(|r| r.expires_ts >= now);
+        self.drop_stale_request_sel();
+    }
+
+    /// The highlighted request's row in `requests`.
+    fn request_sel_index(&self) -> Option<usize> {
+        let id = self.request_sel?;
+        self.requests.iter().position(|r| r.id == id)
+    }
+
+    /// The highlighted pending request, or `None` when none is selected.
+    fn selected_request(&self) -> Option<PendingRequest> {
+        self.request_sel_index().map(|i| self.requests[i].clone())
     }
 
     /// Show `tab`, focusing its first panel.
@@ -662,7 +897,9 @@ impl App {
         match self.selected_rule() {
             None => Err("select a rule first (↑/↓)"),
             Some(Rule::Ip { cidr, .. }) => Ok(cidr.clone()),
-            Some(Rule::Domain { name, .. }) | Some(Rule::Service { name }) => Ok(name.clone()),
+            Some(Rule::Domain { name, .. })
+            | Some(Rule::Resolve { name, .. })
+            | Some(Rule::Service { name }) => Ok(name.clone()),
         }
     }
 
@@ -674,15 +911,21 @@ impl App {
             None => Err("select a row first (↑/↓)"),
             Some(Event::Egress {
                 verdict: Verdict::Blocked,
+                proto,
                 daddr,
+                dport,
                 ..
-            }) => Ok(AllowTarget::Ip(daddr.clone())),
+            }) => Ok(AllowTarget::Flow {
+                ip: daddr.clone(),
+                port: *dport,
+                proto: proto.clone(),
+            }),
             Some(Event::Egress { .. }) => Err("that flow is already allowed"),
             Some(Event::Dns {
                 verdict: DnsVerdict::Refused,
                 qname,
                 ..
-            }) => Ok(AllowTarget::Domain(strip_trailing_dot(qname))),
+            }) => Ok(AllowTarget::Resolve(strip_trailing_dot(qname))),
             Some(Event::Dns { .. }) => Err("that query is already allowed"),
             Some(_) => Err("nothing to allow on that row"),
         }
@@ -726,7 +969,10 @@ pub fn run(vm: &str) -> anyhow::Result<()> {
             other => anyhow::bail!("unexpected subscribe ack from '{vm}': {other:?}"),
         }
 
-        let mut app = App::new(vm, meta, boot, policy, state);
+        let mut app = App::new(vm, meta, boot, policy, state, notify_path());
+        // Seed the Egress Requests panel with whatever is already parked
+        // (ADR-0021); live events keep it current from here on.
+        app.requests = fetch_requests(vm).await.unwrap_or_default();
         let mut terminal = ratatui::init();
         let res = event_loop(&mut terminal, &mut app, stream).await;
         ratatui::restore();
@@ -774,14 +1020,15 @@ async fn fetch_policy(vm: &str) -> Option<VmPolicy> {
 async fn apply_allow(vm: &str, target: &AllowTarget) -> anyhow::Result<(VmPolicy, String)> {
     let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
     let (added, summary) = match target {
-        AllowTarget::Ip(cidr) => (
-            file.add_ip(cidr, None).map_err(|e| anyhow::anyhow!(e))?,
-            format!("allowed ip {cidr}"),
-        ),
-        AllowTarget::Domain(name) => (
-            file.add_domain(name, DomainScope::Subdomains, None)
+        AllowTarget::Resolve(name) => (
+            file.add_resolve(name, DomainScope::Subdomains)
                 .map_err(|e| anyhow::anyhow!(e))?,
-            format!("allowed domain {name}"),
+            format!("allowed resolving {name}"),
+        ),
+        AllowTarget::Flow { ip, port, proto } => (
+            file.add_ip_for_proto(ip, Some(&port.to_string()), Some(proto))
+                .map_err(|e| anyhow::anyhow!(e))?,
+            format!("allowed {proto} {ip}:{port}"),
         ),
     };
     if !added {
@@ -878,6 +1125,61 @@ async fn fetch_quota(vm: &str) -> Option<Balances> {
     }
 }
 
+/// Best-effort `RequestList` (ADR-0021): the parked requests a freshly
+/// started TUI should show without waiting for new ones.
+async fn fetch_requests(vm: &str) -> Option<Vec<PendingRequest>> {
+    let mut c = ControlClient::connect(vm).await.ok()?;
+    match c.request(&Request::RequestList).await.ok()? {
+        Response::Requests { requests } => Some(requests),
+        _ => None,
+    }
+}
+
+/// Apply a request verdict (ADR-0021): an **approve** first adds the persistent
+/// allowlist rule (the same quick-allow path as `soda allow` — approve *is* a
+/// rule, so the held flow proceeds through the normal allow path), then
+/// resolves the parked request over the control socket. A **deny** only
+/// resolves. Resolving an id that expired in between is `Ok` (idempotent), so an
+/// approve first checks the request is still pending: a stale row must not add a
+/// persistent rule or report an approval that admitted nothing.
+/// Returns the new policy on approve (so the panel refreshes) and a summary.
+async fn apply_resolve(
+    vm: &str,
+    req: &PendingRequest,
+    allow: bool,
+) -> anyhow::Result<(Option<VmPolicy>, String)> {
+    let mut policy = None;
+    if allow {
+        let live = fetch_requests(vm)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("couldn't list pending requests"))?;
+        if !live.iter().any(|r| r.id == req.id) {
+            anyhow::bail!("request #{} is no longer pending", req.id);
+        }
+        let (p, _) = apply_allow(vm, &request_allow_target(req)).await?;
+        policy = Some(p);
+    }
+
+    let mut client = ControlClient::connect(vm)
+        .await
+        .map_err(|e| anyhow::anyhow!("connecting to control socket: {e}"))?;
+    match client
+        .request(&Request::RequestResolve { id: req.id, allow })
+        .await?
+    {
+        Response::Ok => {
+            let where_to = match req.port {
+                Some(p) => format!("{}:{p}", req.destination),
+                None => req.destination.clone(),
+            };
+            let what = if allow { "approved" } else { "denied" };
+            Ok((policy, format!("{what} {where_to} (request #{})", req.id)))
+        }
+        Response::Error { msg } => anyhow::bail!("supervisor rejected: {msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
 /// Grant `tokens` to `alias`: append to the quota ledger and have the running
 /// gateway re-read it, the same as `soda quota grant` (ADR-0020).
 async fn apply_grant(vm: &str, alias: &str, tokens: u64) -> anyhow::Result<String> {
@@ -958,6 +1260,7 @@ async fn event_loop(
                 None => app.should_quit = true, // input thread gone
             },
             _ = redraw.tick() => {
+                app.prune_expired_requests(sodabox_common::event::now_ts());
                 terminal.draw(|f| draw(f, app))?;
             }
         }
@@ -1003,6 +1306,48 @@ async fn event_loop(
                     })
                 }
             }
+        }
+
+        // A request verdict (ADR-0021: `a`/Enter approves, `d` denies on the
+        // Egress Requests panel): approve adds the rule then resolves the held
+        // request over the control socket; deny just resolves.
+        if let Some((req, allow)) = app.pending_resolve.take() {
+            match apply_resolve(&app.vm, &req, allow).await {
+                Ok((policy, summary)) => {
+                    if let Some(p) = policy {
+                        app.policy = PolicyView::from(p);
+                        app.clamp_policy_sel();
+                    }
+                    app.notice = Some(Notice {
+                        text: summary,
+                        error: false,
+                    });
+                }
+                Err(e) => {
+                    app.notice = Some(Notice {
+                        text: e.to_string(),
+                        error: true,
+                    });
+                    // The row may be stale (see `apply_resolve`).
+                    app.requests_dirty = true;
+                }
+            }
+        }
+
+        // Events were lost, or an approve hit a stale row: take the supervisor's
+        // list. Before the notification below, which this may queue.
+        if app.requests_dirty && !app.disconnected {
+            if let Some(live) = fetch_requests(&app.vm).await {
+                app.sync_requests(live);
+            }
+            app.requests_dirty = false;
+        }
+
+        // A new parked request queued a notification (ADR-0021): OSC 9 and/or
+        // the bell, per the `n`-cycled mode. Off the sync ingest so the raw
+        // escape sequences land between frames.
+        if let Some(msg) = app.notify_msg.take() {
+            notify_terminal(app.notify, &msg);
         }
 
         // A policy version bump means the rules may have changed; re-fetch them
@@ -1111,23 +1456,38 @@ fn handle_key(app: &mut App, k: KeyPress) {
         KeyCode::Up | KeyCode::Char('k') => match app.focus {
             Focus::Policy => app.policy_select(-1),
             Focus::Gateway => app.gateway_select(-1),
+            Focus::Requests => app.request_select(-1),
             _ => app.select_older(),
         },
         KeyCode::Down | KeyCode::Char('j') => match app.focus {
             Focus::Policy => app.policy_select(1),
             Focus::Gateway => app.gateway_select(1),
+            Focus::Requests => app.request_select(1),
             _ => app.select_newer(),
         },
-        // `a` allows (Egress/DNS); `d` denies (Policy); `g` grants and `m`
-        // switches metering (Gateway). Enter is "act on the selection".
+        // `a` allows (Egress/DNS/Requests); `d` denies (Policy/Requests);
+        // `g` grants and `m` switches metering (Gateway); `n` cycles the
+        // pending-request notification mode (off|notification|bell|all).
+        // Enter is "act on the selection".
+        KeyCode::Char('n') => {
+            app.notify = app.notify.next();
+            save_notify_to(&app.notify_path, app.notify);
+            app.notice = Some(Notice {
+                text: format!("notifications: {}", app.notify.as_str()),
+                error: false,
+            });
+        }
         KeyCode::Char('a') if matches!(app.focus, Focus::Egress | Focus::Dns) => request_allow(app),
+        KeyCode::Char('a') if app.focus == Focus::Requests => request_resolve(app, true),
         KeyCode::Char('d') if app.focus == Focus::Policy => request_deny(app),
+        KeyCode::Char('d') if app.focus == Focus::Requests => request_resolve(app, false),
         KeyCode::Char('g') if app.focus == Focus::Gateway => open_grant_prompt(app),
         KeyCode::Char('m') if app.focus == Focus::Gateway => request_metering(app),
         KeyCode::Enter => match app.focus {
             Focus::Policy => request_deny(app),
             Focus::Gateway => open_grant_prompt(app),
             Focus::Egress | Focus::Dns => request_allow(app),
+            Focus::Requests => request_resolve(app, true),
             Focus::Inference => {}
         },
         _ => {}
@@ -1233,6 +1593,22 @@ fn request_deny(app: &mut App) {
     }
 }
 
+/// Queue an approve (`allow == true`) or deny of the highlighted pending
+/// egress request (ADR-0021). Applied in the async loop: an approve first adds
+/// the persistent rule (the quick-allow path), then resolves the request over
+/// the control socket.
+fn request_resolve(app: &mut App, allow: bool) {
+    match app.selected_request() {
+        Some(req) => app.pending_resolve = Some((req, allow)),
+        None => {
+            app.notice = Some(Notice {
+                text: "no pending request selected".into(),
+                error: true,
+            })
+        }
+    }
+}
+
 /// Paint one frame: header, four panels, footer.
 ///
 /// ```text
@@ -1291,7 +1667,13 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        // The Egress Requests panel (ADR-2021) sits above Egress; a fixed small
+        // height keeps the flow panels legible when no request is pending.
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(3),
+            Constraint::Min(3),
+        ])
         .split(body[0]);
 
     let right = Layout::default()
@@ -1299,9 +1681,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(6), Constraint::Min(1)])
         .split(body[1]);
 
+    render_requests_panel(f, left[0], app);
     render_flow_panel(
         f,
-        left[0],
+        left[1],
         "Egress",
         &mut app.egress,
         app.focus == Focus::Egress,
@@ -1309,7 +1692,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
     render_flow_panel(
         f,
-        left[1],
+        left[2],
         "DNS",
         &mut app.dns,
         app.focus == Focus::Dns,
@@ -1352,6 +1735,8 @@ fn header(app: &App) -> Paragraph<'static> {
             app.dns.tail.len(),
             app.inference.tail.len()
         )),
+        Span::raw(format!("  requests {}", app.requests.len())),
+        Span::raw(format!("  notify {}", app.notify.as_str())),
     ];
     if app.dropped > 0 {
         spans.push(Span::styled(
@@ -1361,6 +1746,101 @@ fn header(app: &App) -> Paragraph<'static> {
     }
     spans.push(Span::raw("]"));
     Paragraph::new(Line::from(spans))
+}
+
+/// The Egress Requests panel (ADR-0021): one row per parked request with its
+/// destination and a countdown of the remaining TTL, colored white → yellow →
+/// orange → red → dark red → purple as the 30 s run out. `a`/Enter approves
+/// the highlighted request, `d` denies it.
+fn render_requests_panel(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focus == Focus::Requests;
+    let len = app.requests.len();
+    let sel_index = app.request_sel_index();
+    let mut title = " Egress Requests".to_string();
+    if let Some(sel) = sel_index {
+        title.push_str(&format!(" {}/{len}", sel + 1));
+    }
+    title.push_str(if focused { " ◂ " } else { " " });
+    let border = if focused {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(border))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.requests.is_empty() {
+        let line = Line::from(Span::styled(
+            " none held",
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(Paragraph::new(line), inner);
+        return;
+    }
+
+    let now = sodabox_common::event::now_ts();
+    let height = inner.height as usize;
+    // Show the window's end (newest last); with more requests than rows, the
+    // cursor stays visible by scrolling from the selection.
+    let start = match sel_index {
+        Some(sel) if len > height => sel
+            .saturating_sub(height.saturating_sub(1))
+            .min(len - height),
+        _ => len.saturating_sub(height),
+    };
+    let lines: Vec<Line> = app
+        .requests
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(height)
+        .map(|(i, req)| {
+            let remaining = req.expires_ts.saturating_sub(now);
+            let where_to = match req.port {
+                Some(p) => format!("{}:{p}", req.destination),
+                None => req.destination.clone(),
+            };
+            let countdown = Span::styled(
+                format!("{remaining:>2}s"),
+                Style::default().fg(ttl_color(remaining)),
+            );
+            let mut spans = vec![
+                Span::raw(format!(" {:<3} ", req.proto)),
+                Span::raw(where_to),
+                Span::raw("  "),
+            ];
+            spans.push(countdown);
+            let line = Line::from(spans);
+            if Some(i) == sel_index {
+                Line::styled(
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>(),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                )
+            } else {
+                line
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The countdown's color ramp (ADR-0021): white → yellow → orange → red →
+/// dark red → purple as the 30 s TTL runs down (purple = about to be deleted).
+fn ttl_color(remaining: u64) -> Color {
+    match remaining {
+        20.. => Color::White,
+        15..=19 => Color::Yellow,
+        10..=14 => Color::Rgb(255, 140, 0),
+        6..=9 => Color::Red,
+        3..=5 => Color::Rgb(139, 0, 0),
+        _ => Color::Magenta,
+    }
 }
 
 /// Egress/DNS panel: a bordered box showing the window of the current view
@@ -1541,6 +2021,7 @@ fn footer(app: &App) -> Paragraph<'static> {
     // The action keys depend on the focused panel (Enter acts on it).
     let action = match app.focus {
         Focus::Egress | Focus::Dns => "a allow  ",
+        Focus::Requests => "a approve  d deny  ",
         Focus::Policy => "d deny  ",
         Focus::Gateway => "g grant  m unlimited/limited  ",
         Focus::Inference => "",
@@ -1711,6 +2192,31 @@ fn event_line(ev: &Event) -> Line<'static> {
             tag_span("POLICY", Color::Cyan),
             Span::raw(format!("v{version}")),
         ]),
+        // Not routed to a flow panel (the Egress Requests panel owns them,
+        // ADR-0021), but render defensively.
+        Event::RequestPending {
+            ts,
+            proto,
+            destination,
+            port,
+            expires_ts,
+            ..
+        } => {
+            let where_to = match port {
+                Some(p) => format!("{destination}:{p}"),
+                None => destination.clone(),
+            };
+            Line::from(vec![
+                ts_span(*ts),
+                tag_span("REQ", Color::Yellow),
+                Span::raw(format!("hold {proto} {where_to} (expires {expires_ts})")),
+            ])
+        }
+        Event::RequestResolved { ts, id, verdict } => Line::from(vec![
+            ts_span(*ts),
+            tag_span("REQ-DONE", Color::Yellow),
+            Span::raw(format!("request #{id} {verdict}")),
+        ]),
         Event::Lifecycle { ts, state } => Line::from(vec![
             ts_span(*ts),
             tag_span("LIFECYCLE", Color::Yellow),
@@ -1752,6 +2258,7 @@ fn fmt_rule(r: &Rule) -> String {
             }
             s
         }
+        Rule::Resolve { name, scope } => format!("resolve {name} ({})", scope_str(*scope)),
         Rule::Service { name } => format!("service {name}"),
     }
 }
@@ -1808,6 +2315,15 @@ mod tests {
         }
     }
 
+    /// What allowing a blocked row for 203.0.113.1:443 adds: that flow only.
+    fn blocked_target() -> AllowTarget {
+        AllowTarget::Flow {
+            ip: "203.0.113.1".into(),
+            port: 443,
+            proto: "tcp".into(),
+        }
+    }
+
     fn dns(ts: u64) -> Event {
         Event::Dns {
             ts,
@@ -1816,6 +2332,235 @@ mod tests {
             answers: vec!["93.184.216.34".into()],
             ttl: 300,
         }
+    }
+
+    fn request_pending(ts: u64, id: u64, proto: &str) -> Event {
+        Event::RequestPending {
+            ts,
+            id,
+            proto: proto.into(),
+            destination: if proto == "dns" {
+                "maybe.test".into()
+            } else {
+                "203.0.113.5".into()
+            },
+            port: if proto == "dns" { None } else { Some(443) },
+            expires_ts: ts + 30,
+        }
+    }
+
+    #[test]
+    fn pending_requests_join_the_panel_and_queue_a_notification() {
+        let mut a = app();
+        a.ingest(request_pending(0, 1, "tcp"));
+        a.ingest(request_pending(0, 2, "dns"));
+        // A duplicate (e.g. a replayed event) must not double the row.
+        a.ingest(request_pending(0, 1, "tcp"));
+        assert_eq!(a.requests.len(), 2);
+        // Static text only: the destination is guest-controlled.
+        assert_eq!(
+            a.notify_msg.as_deref(),
+            Some("demo has new egress requests")
+        );
+
+        // Resolution removes the row and keeps the cursor on its request.
+        a.request_sel = Some(2);
+        a.ingest(Event::RequestResolved {
+            ts: 1,
+            id: 1,
+            verdict: "approved".into(),
+        });
+        assert_eq!(a.requests.len(), 1);
+        assert_eq!(a.request_sel, Some(2));
+        a.ingest(Event::RequestResolved {
+            ts: 2,
+            id: 2,
+            verdict: "expired".into(),
+        });
+        assert!(a.requests.is_empty());
+        assert_eq!(a.request_sel, None);
+    }
+
+    #[test]
+    fn request_approve_and_deny_key_queue_the_action() {
+        let mut a = app();
+        a.ingest(request_pending(0, 1, "tcp"));
+        a.ingest(request_pending(0, 2, "dns"));
+        a.focus = Focus::Requests;
+
+        // No selection yet: the first `j` lands on the newest request.
+        press(&mut a, KeyCode::Char('j'));
+        assert_eq!(a.request_sel, Some(2));
+        press(&mut a, KeyCode::Char('k'));
+        assert_eq!(a.request_sel, Some(1));
+
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(
+            a.pending_resolve.as_ref().map(|(r, allow)| (r.id, *allow)),
+            Some((1, true))
+        );
+        a.pending_resolve = None;
+
+        press(&mut a, KeyCode::Char('j'));
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(
+            a.pending_resolve.as_ref().map(|(r, allow)| (r.id, *allow)),
+            Some((2, false))
+        );
+    }
+
+    #[test]
+    fn approve_only_acts_on_the_highlighted_request() {
+        let mut a = app();
+        for id in 1..=3 {
+            a.ingest(request_pending(0, id, "tcp"));
+        }
+        a.focus = Focus::Requests;
+        a.request_sel = Some(2);
+
+        // An older row expiring shifts the rows, not the selection.
+        a.ingest(Event::RequestResolved {
+            ts: 1,
+            id: 1,
+            verdict: "expired".into(),
+        });
+        press(&mut a, KeyCode::Char('a'));
+        assert_eq!(a.pending_resolve.take().map(|(r, _)| r.id), Some(2));
+
+        // Once the highlighted row is gone (a double Enter, or it expired),
+        // approving does nothing rather than taking the next request.
+        a.ingest(Event::RequestResolved {
+            ts: 2,
+            id: 2,
+            verdict: "approved".into(),
+        });
+        press(&mut a, KeyCode::Enter);
+        assert!(a.pending_resolve.is_none());
+        assert_eq!(a.requests.len(), 1);
+    }
+
+    #[test]
+    fn lost_events_flag_a_resync_that_reconciles_the_rows() {
+        let mut a = app();
+        a.ingest(request_pending(0, 1, "tcp"));
+        a.ingest(request_pending(0, 2, "tcp"));
+        a.request_sel = Some(2);
+        a.notify_msg = None;
+        assert!(!a.requests_dirty);
+
+        a.ingest(Event::Dropped { ts: 1, count: 5 });
+        assert!(a.requests_dirty);
+
+        // Same rows but one: the phantom goes, the cursor stays, nothing notifies.
+        let row = |id| PendingRequest {
+            id,
+            proto: "tcp".into(),
+            destination: "203.0.113.5".into(),
+            port: Some(443),
+            expires_ts: 30,
+        };
+        a.sync_requests(vec![row(2)]);
+        assert_eq!(a.requests.len(), 1);
+        assert_eq!(a.request_sel, Some(2));
+        assert!(a.notify_msg.is_none());
+
+        // A request whose event was lost appears and notifies; the highlighted
+        // one going away clears the cursor.
+        a.sync_requests(vec![row(3)]);
+        assert_eq!(a.requests, vec![row(3)]);
+        assert_eq!(a.request_sel, None);
+        assert_eq!(
+            a.notify_msg.as_deref(),
+            Some("demo has new egress requests")
+        );
+    }
+
+    #[test]
+    fn rows_past_their_expiry_are_removed() {
+        let mut a = app();
+        a.ingest(request_pending(0, 1, "tcp")); // expires at 30
+        a.ingest(request_pending(10, 2, "tcp")); // expires at 40
+        a.request_sel = Some(1);
+
+        // At expiry the row stays: the supervisor's sweep gets to report it.
+        a.prune_expired_requests(30);
+        assert_eq!(a.requests.len(), 2);
+
+        a.prune_expired_requests(31);
+        assert_eq!(a.requests.len(), 1);
+        assert_eq!(a.requests[0].id, 2);
+        assert_eq!(a.request_sel, None);
+    }
+
+    #[test]
+    fn approval_target_matches_the_request_row() {
+        let tcp = PendingRequest {
+            id: 1,
+            proto: "tcp".into(),
+            destination: "203.0.113.5".into(),
+            port: Some(443),
+            expires_ts: 30,
+        };
+        assert_eq!(
+            request_allow_target(&tcp),
+            AllowTarget::Flow {
+                ip: "203.0.113.5".into(),
+                port: 443,
+                proto: "tcp".into(),
+            }
+        );
+        let dns = PendingRequest {
+            id: 2,
+            proto: "dns".into(),
+            destination: "maybe.test".into(),
+            port: None,
+            expires_ts: 30,
+        };
+        assert_eq!(
+            request_allow_target(&dns),
+            AllowTarget::Resolve("maybe.test".into())
+        );
+    }
+
+    #[test]
+    fn n_cycles_and_persists_the_notify_mode() {
+        let dir = std::env::temp_dir().join(format!("sodabox-tui-notify-{}", std::process::id()));
+        let mut a = app();
+        a.notify_path = dir.join("tui.toml");
+        assert_eq!(a.notify, NotifyMode::All);
+        for m in [
+            NotifyMode::Off,
+            NotifyMode::Notification,
+            NotifyMode::Bell,
+            NotifyMode::All,
+        ] {
+            press(&mut a, KeyCode::Char('n'));
+            assert_eq!(a.notify, m, "n must cycle the mode");
+            assert_eq!(load_notify_from(&a.notify_path), m, "n must persist it");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ttl_countdown_follows_the_color_ramp() {
+        assert_eq!(ttl_color(30), Color::White);
+        assert_eq!(ttl_color(20), Color::White);
+        assert_eq!(ttl_color(19), Color::Yellow);
+        assert_eq!(ttl_color(15), Color::Yellow);
+        assert_eq!(ttl_color(14), Color::Rgb(255, 140, 0));
+        assert_eq!(ttl_color(10), Color::Rgb(255, 140, 0));
+        assert_eq!(ttl_color(9), Color::Red);
+        assert_eq!(ttl_color(6), Color::Red);
+        assert_eq!(ttl_color(5), Color::Rgb(139, 0, 0));
+        assert_eq!(ttl_color(3), Color::Rgb(139, 0, 0));
+        assert_eq!(ttl_color(2), Color::Magenta);
+        assert_eq!(ttl_color(0), Color::Magenta);
+    }
+
+    /// A notify file that doesn't exist, so a test `App` starts from the default
+    /// mode and stays away from the real config dir.
+    fn no_notify_file() -> PathBuf {
+        std::env::temp_dir().join("sodabox-tui-test-absent/tui.toml")
     }
 
     fn app() -> App {
@@ -1828,6 +2573,7 @@ mod tests {
                 ..PolicyView::default()
             },
             "running".into(),
+            no_notify_file(),
         )
     }
 
@@ -2007,13 +2753,10 @@ mod tests {
         // Nothing selected yet.
         assert!(a.selected_allow_target().is_err());
 
-        // A blocked egress row -> allow its dst IP.
+        // A blocked egress row -> allow that proto and dst:port.
         a.ingest(egress(0)); // Blocked, daddr 203.0.113.1
         a.select_older();
-        assert_eq!(
-            a.selected_allow_target(),
-            Ok(AllowTarget::Ip("203.0.113.1".into()))
-        );
+        assert_eq!(a.selected_allow_target(), Ok(blocked_target()));
 
         // An already-allowed egress row is declined.
         let mut a = app();
@@ -2028,7 +2771,7 @@ mod tests {
         a.select_older();
         assert_eq!(
             a.selected_allow_target(),
-            Ok(AllowTarget::Domain("evil.test".into()))
+            Ok(AllowTarget::Resolve("evil.test".into()))
         );
 
         // An allowed DNS row is declined.
@@ -2057,6 +2800,7 @@ mod tests {
                 ..PolicyView::default()
             },
             "running".into(),
+            no_notify_file(),
         )
     }
 
@@ -2076,6 +2820,8 @@ mod tests {
         assert!(a.focus == Focus::Dns);
         a.toggle_focus();
         assert!(a.focus == Focus::Policy);
+        a.toggle_focus();
+        assert!(a.focus == Focus::Requests);
         a.toggle_focus();
         assert!(a.focus == Focus::Egress);
     }
@@ -2224,10 +2970,7 @@ mod tests {
         a.select_older(); // 203.0.113.2, latest verdict Allowed
         assert!(a.selected_allow_target().is_err());
         a.select_older(); // 203.0.113.1:443, latest verdict Blocked
-        assert_eq!(
-            a.selected_allow_target(),
-            Ok(AllowTarget::Ip("203.0.113.1".into()))
-        );
+        assert_eq!(a.selected_allow_target(), Ok(blocked_target()));
     }
 
     #[test]
@@ -2259,10 +3002,7 @@ mod tests {
         // A new destination lands below: the cursor follows its row.
         a.ingest(egress_to("203.0.113.3", 443, Verdict::Blocked, 3));
         assert_eq!(a.egress.sel, Some(2));
-        assert_eq!(
-            a.selected_allow_target(),
-            Ok(AllowTarget::Ip("203.0.113.1".into()))
-        );
+        assert_eq!(a.selected_allow_target(), Ok(blocked_target()));
     }
 
     #[test]
@@ -2343,6 +3083,7 @@ mod tests {
             None,
             PolicyView::from(policy),
             "running".into(),
+            no_notify_file(),
         )
     }
 
@@ -2381,6 +3122,8 @@ mod tests {
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
         assert_eq!(a.focus, Focus::Policy);
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.focus, Focus::Requests);
         press(&mut a, KeyCode::Tab);
         assert_eq!(
             a.focus,

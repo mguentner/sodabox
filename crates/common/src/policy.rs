@@ -112,7 +112,8 @@ pub fn validate_alias(alias: &str) -> Result<(), String> {
 }
 
 /// A single allowlist rule. `ip` is a static permit; `domain` also permits DNS
-/// resolution of the name and authorizes its resolved IPs (ADR-0005).
+/// resolution of the name and authorizes its resolved IPs (ADR-0005); `resolve`
+/// permits the resolution alone (ADR-0021).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Rule {
@@ -132,6 +133,13 @@ pub enum Rule {
         ports: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proto: Option<String>,
+    },
+    /// The name may be resolved, but its IPs gain no egress: each IP:Port the
+    /// guest goes on to use is its own request (ADR-0021).
+    Resolve {
+        name: String,
+        #[serde(default)]
+        scope: DomainScope,
     },
     /// Access to a service sodabox itself offers the guest, e.g. the
     /// inference gateway (ADR-0020). Not an egress permit.
@@ -199,22 +207,29 @@ impl VmPolicy {
     /// fail to compile is rejected here rather than at load. Returns `Ok(false)`
     /// if an identical rule already exists (idempotent add).
     pub fn add_ip(&mut self, cidr: &str, ports: Option<&str>) -> Result<bool, String> {
+        self.add_ip_for_proto(cidr, ports, None)
+    }
+
+    /// [`Self::add_ip`], optionally limited to one protocol.
+    pub fn add_ip_for_proto(
+        &mut self,
+        cidr: &str,
+        ports: Option<&str>,
+        proto: Option<&str>,
+    ) -> Result<bool, String> {
         // Validate up front (fail-closed: never persist a rule we can't compile).
         crate::allowlist::IpCidr::parse(cidr)?;
         crate::allowlist::PortSpec::parse(ports)?;
-        let cidr = cidr.to_string();
-        let ports = ports.map(str::to_string);
-        let dup = self.rules.iter().any(|r| {
-            matches!(r, Rule::Ip { cidr: c, ports: p, proto: None } if *c == cidr && *p == ports)
-        });
-        if dup {
+        proto.map(crate::allowlist::Proto::parse).transpose()?;
+        let rule = Rule::Ip {
+            cidr: cidr.to_string(),
+            ports: ports.map(str::to_string),
+            proto: proto.map(str::to_string),
+        };
+        if self.rules.contains(&rule) {
             return Ok(false);
         }
-        self.rules.push(Rule::Ip {
-            cidr,
-            ports,
-            proto: None,
-        });
+        self.rules.push(rule);
         Ok(true)
     }
 
@@ -244,6 +259,20 @@ impl VmPolicy {
             ports,
             proto: None,
         });
+        Ok(true)
+    }
+
+    /// Add a [`Rule::Resolve`]. Returns `Ok(false)` if an identical rule exists.
+    pub fn add_resolve(&mut self, name: &str, scope: DomainScope) -> Result<bool, String> {
+        validate_domain(name)?;
+        let rule = Rule::Resolve {
+            name: name.to_string(),
+            scope,
+        };
+        if self.rules.contains(&rule) {
+            return Ok(false);
+        }
+        self.rules.push(rule);
         Ok(true)
     }
 
@@ -350,7 +379,7 @@ impl Rule {
     pub fn target(&self) -> &str {
         match self {
             Rule::Ip { cidr, .. } => cidr,
-            Rule::Domain { name, .. } | Rule::Service { name } => name,
+            Rule::Domain { name, .. } | Rule::Resolve { name, .. } | Rule::Service { name } => name,
         }
     }
 
@@ -370,6 +399,7 @@ impl Rule {
                 validate_domain(name)?;
                 (ports, proto)
             }
+            Rule::Resolve { name, .. } => return validate_domain(name),
             Rule::Service { name } => {
                 if !SERVICES.contains(&name.as_str()) {
                     return Err(format!(
@@ -467,8 +497,18 @@ impl PolicyFile {
 
     /// [`VmPolicy::add_ip`], applied to the document.
     pub fn add_ip(&mut self, cidr: &str, ports: Option<&str>) -> Result<bool, String> {
+        self.add_ip_for_proto(cidr, ports, None)
+    }
+
+    /// [`VmPolicy::add_ip_for_proto`], applied to the document.
+    pub fn add_ip_for_proto(
+        &mut self,
+        cidr: &str,
+        ports: Option<&str>,
+        proto: Option<&str>,
+    ) -> Result<bool, String> {
         let mut p = self.policy()?;
-        if !p.add_ip(cidr, ports)? {
+        if !p.add_ip_for_proto(cidr, ports, proto)? {
             return Ok(false);
         }
         self.push_rule(p.rules.last().expect("just pushed"))?;
@@ -484,6 +524,16 @@ impl PolicyFile {
     ) -> Result<bool, String> {
         let mut p = self.policy()?;
         if !p.add_domain(name, scope, ports)? {
+            return Ok(false);
+        }
+        self.push_rule(p.rules.last().expect("just pushed"))?;
+        Ok(true)
+    }
+
+    /// [`VmPolicy::add_resolve`], applied to the document.
+    pub fn add_resolve(&mut self, name: &str, scope: DomainScope) -> Result<bool, String> {
+        let mut p = self.policy()?;
+        if !p.add_resolve(name, scope)? {
             return Ok(false);
         }
         self.push_rule(p.rules.last().expect("just pushed"))?;
@@ -815,6 +865,68 @@ mod tests {
         assert!(p.add_ip("not-a-cidr", None).is_err());
         assert!(p.add_ip("10.0.0.0/8", Some("notaport")).is_err());
         assert_eq!(p.rules.len(), 2);
+    }
+
+    #[test]
+    fn add_resolve_round_trips_and_grants_no_egress() {
+        use crate::allowlist::Allowlist;
+
+        let mut file = PolicyFile::new();
+        assert_eq!(
+            file.add_resolve("example.com", DomainScope::Subdomains),
+            Ok(true)
+        );
+        assert_eq!(
+            file.add_resolve("example.com", DomainScope::Subdomains),
+            Ok(false)
+        );
+        assert!(file
+            .add_resolve("https://x.test/", DomainScope::Subdomains)
+            .is_err());
+
+        let reparsed = PolicyFile::parse(&file.to_string())
+            .unwrap()
+            .policy()
+            .unwrap();
+        assert_eq!(
+            reparsed.rules,
+            vec![Rule::Resolve {
+                name: "example.com".into(),
+                scope: DomainScope::Subdomains,
+            }]
+        );
+        assert!(reparsed.rules[0].validate().is_ok());
+        assert!(Allowlist::from_policy(&reparsed).is_ok());
+
+        // `soda deny <name>` removes it like any other rule.
+        assert_eq!(file.remove_matching("example.com"), Ok(1));
+    }
+
+    #[test]
+    fn add_ip_for_proto_allows_only_that_proto_and_port() {
+        use crate::allowlist::{Allowlist, Decision, Proto};
+        use std::time::Instant;
+
+        let mut file = PolicyFile::new();
+        assert_eq!(
+            file.add_ip_for_proto("203.0.113.5", Some("443"), Some("tcp")),
+            Ok(true)
+        );
+        // Identical rule is a no-op; an unknown proto is rejected.
+        assert_eq!(
+            file.add_ip_for_proto("203.0.113.5", Some("443"), Some("tcp")),
+            Ok(false)
+        );
+        assert!(file
+            .add_ip_for_proto("203.0.113.5", Some("443"), Some("icmp"))
+            .is_err());
+
+        // What was written back to the document is what gets enforced.
+        let al = Allowlist::from_policy(&file.policy().unwrap()).unwrap();
+        let check = |dst: &str, proto| al.evaluate(dst.parse().unwrap(), proto, Instant::now());
+        assert_eq!(check("203.0.113.5:443", Proto::Tcp), Decision::AllowStatic);
+        assert_eq!(check("203.0.113.5:80", Proto::Tcp), Decision::Deny);
+        assert_eq!(check("203.0.113.5:443", Proto::Udp), Decision::Deny);
     }
 
     #[test]

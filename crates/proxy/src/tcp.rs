@@ -19,9 +19,31 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+use tokio::io::Interest;
 use tokio::net::{TcpListener, TcpStream};
+
+/// How long a dial runs before a client close can cancel it. A client may
+/// half-close right after sending (`printf … | nc -N`) and still want the reply,
+/// which a socket can't tell apart from leaving, so an ordinary dial must finish
+/// undisturbed. A dial still running after this is almost always a held request
+/// (ADR-0021), where a client that closed has given up.
+const CLIENT_GONE_GRACE: Duration = Duration::from_secs(2);
+/// How often to re-check a client that has sent data (readable from then on, so
+/// waiting for readiness alone would spin).
+const CLIENT_GONE_POLL: Duration = Duration::from_secs(1);
+
+/// Keepalive on the guest side while a dial is outstanding: keeps an idle held
+/// connection alive, and with these timings notices a dead peer (10 + 3 × 5 s)
+/// within [`sodabox_common::request::REQUEST_TTL`].
+fn hold_keepalive() -> TcpKeepalive {
+    TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(5))
+        .with_retries(3)
+}
 
 /// Bind a TCP listener with `IP_TRANSPARENT` so the kernel will deliver
 /// TPROXY-diverted connections to it (requires CAP_NET_ADMIN, held in the owned
@@ -162,10 +184,33 @@ async fn handle<D: Dialer>(
     dst: SocketAddr,
     dialer: Arc<D>,
 ) -> io::Result<()> {
-    let mut upstream = dialer.dial(dst).await?;
+    SockRef::from(&client).set_tcp_keepalive(&hold_keepalive())?;
+    // Dropping a held dial drops its waiter, so a request whose clients have
+    // all gone leaves the table (see `PendingRequests::expire_due`).
+    let mut upstream = tokio::select! {
+        dialed = dialer.dial(dst) => dialed?,
+        () = client_gone(&client, CLIENT_GONE_GRACE) => return Ok(()),
+    };
+    // Only the hold needs it; an established flow is the two peers' business.
+    SockRef::from(&client).set_keepalive(false)?;
     // Bidirectional copy until either side closes.
     tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     Ok(())
+}
+
+/// Resolves once `client` has closed, reset or failed keepalive, checking only
+/// after `grace`. Looks at readiness rather than reading, so data the guest sent
+/// meanwhile is still there for the splice.
+async fn client_gone(client: &TcpStream, grace: Duration) {
+    tokio::time::sleep(grace).await;
+    loop {
+        match client.ready(Interest::READABLE).await {
+            Ok(ready) if !ready.is_read_closed() => {
+                tokio::time::sleep(CLIENT_GONE_POLL).await;
+            }
+            _ => return,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +288,83 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0], paddr);
+    }
+
+    /// A connected (client, accepted server side) pair.
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        (c, l.accept().await.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn hold_keepalive_reports_a_dead_peer_within_the_request_ttl() {
+        let (_c, s) = tcp_pair().await;
+        let sock = SockRef::from(&s);
+        sock.set_tcp_keepalive(&hold_keepalive()).unwrap();
+        assert!(sock.keepalive().unwrap());
+        let time = sock.keepalive_time().unwrap();
+        let interval = sock.keepalive_interval().unwrap();
+        let retries = sock.keepalive_retries().unwrap();
+        assert!(time + interval * retries < sodabox_common::request::REQUEST_TTL);
+    }
+
+    #[tokio::test]
+    async fn client_gone_waits_for_a_close_and_sees_past_unread_data() {
+        let (mut c, s) = tcp_pair().await;
+        let gone = |grace| tokio::time::timeout(Duration::from_millis(200), client_gone(&s, grace));
+
+        // Open and quiet: not gone.
+        assert!(gone(Duration::ZERO).await.is_err());
+        // Open with unread data: still not gone, and the data stays readable.
+        c.write_all(b"early").await.unwrap();
+        assert!(gone(Duration::ZERO).await.is_err());
+
+        // Closed: gone, even with that data still unread.
+        drop(c);
+        tokio::time::timeout(CLIENT_GONE_POLL * 3, client_gone(&s, Duration::ZERO))
+            .await
+            .expect("a closed client must be noticed");
+        let mut buf = [0u8; 5];
+        s.try_read(&mut buf).unwrap();
+        assert_eq!(&buf, b"early");
+    }
+
+    /// Connects to `target` after `delay`, like a dial with a real round trip.
+    struct SlowDialer {
+        target: SocketAddr,
+        delay: Duration,
+    }
+    impl Dialer for SlowDialer {
+        fn dial(&self, _dst: SocketAddr) -> DialFuture {
+            let (target, delay) = (self.target, self.delay);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                TcpStream::connect(target).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn half_close_during_an_ordinary_dial_still_gets_the_reply() {
+        let dialer = Arc::new(SlowDialer {
+            target: spawn_echo().await,
+            delay: Duration::from_millis(200),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = TransparentProxy::new(listener, dialer);
+        let paddr = proxy.local_addr().unwrap();
+        tokio::spawn(proxy.serve());
+
+        let mut c = TcpStream::connect(paddr).await.unwrap();
+        c.write_all(b"query").await.unwrap();
+        c.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), c.read_to_end(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, b"query");
     }
 
     /// A local service that answers every connection with a fixed greeting.

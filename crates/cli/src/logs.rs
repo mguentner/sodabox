@@ -149,6 +149,27 @@ fn render_event(ev: &Event) -> String {
             (*ts, "QUOTA", format!("{alias}: token quota used up"))
         }
         Event::Policy { ts, version } => (*ts, "POLICY", format!("v{version}")),
+        Event::RequestPending {
+            ts,
+            proto,
+            destination,
+            port,
+            expires_ts,
+            ..
+        } => {
+            let where_to = match port {
+                Some(p) => format!("{destination}:{p}"),
+                None => destination.clone(),
+            };
+            (
+                *ts,
+                "REQ",
+                format!("hold {proto} {where_to} (expires {expires_ts})"),
+            )
+        }
+        Event::RequestResolved { ts, id, verdict } => {
+            (*ts, "REQ-DONE", format!("request #{id} {verdict}"))
+        }
         Event::Lifecycle { ts, state } => (*ts, "LIFECYCLE", state.clone()),
         Event::Dropped { ts, count } => (*ts, "DROPPED", format!("{count} events")),
     };

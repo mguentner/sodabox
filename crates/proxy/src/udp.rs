@@ -21,13 +21,15 @@
 //! netns-child injector that owns the transparent send (ADR-0004).
 //!
 //! Flows are evicted after [`FLOW_TTL`] idle or when [`MAX_FLOWS`] is exceeded
-//! (oldest first), bounding fd/memory use against a chatty or hostile guest.
+//! (oldest first), bounding fd/memory use against a chatty or hostile guest. A
+//! flow awaiting a verdict is exempt: its hold task owns the entry until the
+//! verdict lands, and the request table's waiter cap bounds how many there are.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -38,6 +40,7 @@ use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrIn};
 
 use sodabox_common::allowlist::{Decision, Proto, SharedAllowlist};
 use sodabox_common::event::{Event, Verdict};
+use sodabox_common::request::{PendingRequests, RequestVerdict, REQUEST_TTL};
 
 use crate::events::{now_ts, null_sink, EgressEvents};
 
@@ -140,6 +143,9 @@ struct Flow {
     /// `Some` for an allowed flow (with its upstream + reply-relay task); `None`
     /// caches a denied `(guest, dst)` so repeats are dropped without re-emitting.
     forward: Option<Forward>,
+    /// A hold task is awaiting this flow's verdict (ADR-0021) and will replace
+    /// the entry; repeats are dropped until then.
+    held: bool,
 }
 
 struct Forward {
@@ -164,6 +170,9 @@ pub struct TransparentUdpProxy {
     connector: Arc<dyn UdpConnector>,
     sink: Arc<dyn ReplySink>,
     events: Arc<dyn EgressEvents>,
+    /// Where an undecided destination is parked for interactive approval
+    /// (ADR-0021); `None` keeps the plain drop-on-deny behavior (tests).
+    pending: Option<PendingRequests>,
 }
 
 impl TransparentUdpProxy {
@@ -179,7 +188,15 @@ impl TransparentUdpProxy {
             connector,
             sink,
             events: null_sink(),
+            pending: None,
         }
+    }
+
+    /// Park undecided destinations in this table instead of dropping them
+    /// (ADR-0021).
+    pub fn with_pending(mut self, pending: PendingRequests) -> Self {
+        self.pending = Some(pending);
+        self
     }
 
     pub fn with_events(mut self, events: Arc<dyn EgressEvents>) -> Self {
@@ -191,23 +208,16 @@ impl TransparentUdpProxy {
         self.socket.local_addr()
     }
 
-    fn emit(&self, dst: SocketAddrV4, verdict: Verdict, rule: Option<String>) {
-        self.events.emit(Event::Egress {
-            ts: now_ts(),
-            verdict,
-            proto: "udp".to_string(),
-            daddr: dst.ip().to_string(),
-            dport: dst.port(),
-            rule,
-        });
-    }
-
     /// Receive loop. Returns only on a fatal socket error (a fail-closed signal
     /// the supervisor acts on, like the TCP proxy).
     pub async fn serve(self) -> io::Result<()> {
         let fd = self.socket.as_raw_fd();
         let mut buf = vec![0u8; MAX_UDP];
-        let mut flows: HashMap<(SocketAddrV4, SocketAddrV4), Flow> = HashMap::new();
+        // Shared with the hold tasks (an approved request inserts its relay
+        // once the verdict lands, ADR-0021); the receive loop stays the sole
+        // decider for *new* flows.
+        let flows: Arc<Mutex<HashMap<(SocketAddrV4, SocketAddrV4), Flow>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         loop {
             let (n, guest, dst) = self
@@ -217,30 +227,66 @@ impl TransparentUdpProxy {
             let datagram = &buf[..n];
             let key = (guest, dst);
 
-            // Known flow: refresh and (if allowed) forward without re-deciding.
-            if let Some(flow) = flows.get_mut(&key) {
-                flow.last = Instant::now();
-                if let Some(f) = &flow.forward {
-                    let up = f.upstream.clone();
-                    let bytes = datagram.to_vec();
-                    tokio::spawn(async move {
-                        let _ = up.send(&bytes).await;
-                    });
-                }
-                continue;
-            }
-
-            // New flow: decide once, emit one event, and open a relay if allowed.
-            let decision = match self.allowlist.read() {
+            let evaluate = || match self.allowlist.read() {
                 Ok(al) => al.evaluate(SocketAddr::V4(dst), Proto::Udp, Instant::now()),
                 Err(_) => Decision::Deny, // poisoned lock -> fail closed
             };
 
-            self.prune(&mut flows);
+            // Known flow: refresh and forward without re-deciding. A held flow's
+            // repeats are dropped (the first datagram is what's held). A denial
+            // stands for FLOW_TTL from when it was made, so retransmits neither
+            // extend it nor re-ask, but a rule added since applies right away.
+            {
+                let mut map = flows.lock().unwrap();
+                if let Some(flow) = map.get_mut(&key) {
+                    if let Some(f) = &flow.forward {
+                        flow.last = Instant::now();
+                        let up = f.upstream.clone();
+                        let bytes = datagram.to_vec();
+                        tokio::spawn(async move {
+                            let _ = up.send(&bytes).await;
+                        });
+                        continue;
+                    }
+                    if flow.held || (flow.last.elapsed() <= FLOW_TTL && !evaluate().is_allow()) {
+                        continue;
+                    }
+                    map.remove(&key);
+                }
+            }
+
+            // New flow: decide once, emit one event, and open a relay if allowed.
+            let decision = evaluate();
+
+            self.prune(&flows);
 
             let forward = match decision {
                 Decision::Deny => {
-                    self.emit(dst, Verdict::Blocked, None);
+                    // Undecided, not dropped (ADR-0021): hold the first datagram
+                    // and let the user admit the flow from the TUI. The entry
+                    // goes in first, so the hold task's replacement is the last
+                    // write however quickly the verdict lands.
+                    if let Some(pending) = self.pending.clone() {
+                        flows.lock().unwrap().insert(
+                            key,
+                            Flow {
+                                last: Instant::now(),
+                                forward: None,
+                                held: true,
+                            },
+                        );
+                        let holder = HoldArgs {
+                            pending,
+                            allowlist: self.allowlist.clone(),
+                            connector: self.connector.clone(),
+                            sink: self.sink.clone(),
+                            events: self.events.clone(),
+                            flows: flows.clone(),
+                        };
+                        tokio::spawn(hold_udp_flow(holder, guest, dst, datagram.to_vec()));
+                        continue;
+                    }
+                    emit(&self.events, dst, Verdict::Blocked, None);
                     None
                 }
                 allow => {
@@ -249,55 +295,30 @@ impl TransparentUdpProxy {
                         Decision::AllowEphemeral { domain } => domain,
                         Decision::Deny => unreachable!(),
                     };
-                    self.emit(dst, Verdict::Allowed, Some(rule));
-                    self.open_flow(guest, dst, datagram)
+                    emit(&self.events, dst, Verdict::Allowed, Some(rule));
+                    open_flow(&self.connector, &self.sink, guest, dst, datagram)
                 }
             };
-            flows.insert(
+            flows.lock().unwrap().insert(
                 key,
                 Flow {
                     last: Instant::now(),
                     forward,
+                    held: false,
                 },
             );
         }
     }
 
-    /// Dial `dst` from the proxy's netns, send the first datagram, and spawn the
-    /// reply-relay task. Returns `None` (drops the datagram) if the dial fails.
-    fn open_flow(&self, guest: SocketAddrV4, dst: SocketAddrV4, first: &[u8]) -> Option<Forward> {
-        let upstream = match self.connector.connect(SocketAddr::V4(dst)) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                eprintln!("udp proxy: dial {dst} failed: {e}");
-                return None;
-            }
-        };
-        // Fire the first datagram.
-        {
-            let up = upstream.clone();
-            let bytes = first.to_vec();
-            tokio::spawn(async move {
-                let _ = up.send(&bytes).await;
-            });
-        }
-        // Relay replies until the flow is evicted (task aborted) or upstream dies.
-        let reader = tokio::spawn(relay_replies(
-            upstream.clone(),
-            self.sink.clone(),
-            guest,
-            dst,
-        ));
-        Some(Forward { upstream, reader })
-    }
-
     /// Drop flows idle past [`FLOW_TTL`]; if still over [`MAX_FLOWS`], evict the
-    /// oldest. Called before inserting a new flow.
-    fn prune(&self, flows: &mut HashMap<(SocketAddrV4, SocketAddrV4), Flow>) {
+    /// oldest. Called before inserting a new flow. Held flows stay: dropping one
+    /// would let a repeat start a second hold for the same flow.
+    fn prune(&self, flows: &Arc<Mutex<HashMap<(SocketAddrV4, SocketAddrV4), Flow>>>) {
+        let mut flows = flows.lock().unwrap();
         let now = Instant::now();
         let expired: Vec<_> = flows
             .iter()
-            .filter(|(_, f)| now.duration_since(f.last) > FLOW_TTL)
+            .filter(|(_, f)| !f.held && now.duration_since(f.last) > FLOW_TTL)
             .map(|(k, _)| *k)
             .collect();
         for k in expired {
@@ -306,7 +327,12 @@ impl TransparentUdpProxy {
             }
         }
         while flows.len() >= MAX_FLOWS {
-            let Some(oldest) = flows.iter().min_by_key(|(_, f)| f.last).map(|(k, _)| *k) else {
+            let Some(oldest) = flows
+                .iter()
+                .filter(|(_, f)| !f.held)
+                .min_by_key(|(_, f)| f.last)
+                .map(|(k, _)| *k)
+            else {
                 break;
             };
             if let Some(f) = flows.remove(&oldest) {
@@ -314,6 +340,99 @@ impl TransparentUdpProxy {
             }
         }
     }
+}
+
+/// Everything a spawned hold task needs to finish a parked UDP flow once its
+/// verdict lands (ADR-0021): re-decide, open the relay, and patch the flow map.
+struct HoldArgs {
+    pending: PendingRequests,
+    allowlist: SharedAllowlist,
+    connector: Arc<dyn UdpConnector>,
+    sink: Arc<dyn ReplySink>,
+    events: Arc<dyn EgressEvents>,
+    flows: Arc<Mutex<HashMap<(SocketAddrV4, SocketAddrV4), Flow>>>,
+}
+
+/// Park a denied-but-undecided UDP flow's first datagram. On approval the rule
+/// is already in the allowlist (approve *is* a persistent rule), so re-decide:
+/// allowed → open the relay and fire the held datagram; anything else → the
+/// datagram is dropped (best-effort, UDP) and the denial is cached. Either way
+/// this replaces the flow's held entry, which only this task can remove.
+async fn hold_udp_flow(args: HoldArgs, guest: SocketAddrV4, dst: SocketAddrV4, first: Vec<u8>) {
+    let (_, rx) = args
+        .pending
+        .hold("udp", &dst.ip().to_string(), Some(dst.port()));
+    let verdict = tokio::time::timeout(REQUEST_TTL, rx).await;
+    let approved = matches!(verdict, Ok(Ok(RequestVerdict::Approved)));
+    let decision = match args.allowlist.read() {
+        Ok(al) if approved => al.evaluate(SocketAddr::V4(dst), Proto::Udp, Instant::now()),
+        _ => Decision::Deny,
+    };
+    let forward = match decision {
+        Decision::AllowStatic | Decision::AllowEphemeral { .. } => {
+            emit(
+                &args.events,
+                dst,
+                Verdict::Allowed,
+                Some("granted".to_string()),
+            );
+            open_flow(&args.connector, &args.sink, guest, dst, &first)
+        }
+        Decision::Deny => {
+            emit(&args.events, dst, Verdict::Blocked, None);
+            None
+        }
+    };
+    args.flows.lock().unwrap().insert(
+        (guest, dst),
+        Flow {
+            last: Instant::now(),
+            forward,
+            held: false,
+        },
+    );
+}
+
+/// Emit one egress verdict event (free-standing so spawned hold tasks share
+/// the receive loop's emission shape).
+fn emit(events: &Arc<dyn EgressEvents>, dst: SocketAddrV4, verdict: Verdict, rule: Option<String>) {
+    events.emit(Event::Egress {
+        ts: now_ts(),
+        verdict,
+        proto: "udp".to_string(),
+        daddr: dst.ip().to_string(),
+        dport: dst.port(),
+        rule,
+    });
+}
+
+/// Dial `dst` from the proxy's netns, send the first datagram, and spawn the
+/// reply-relay task. Returns `None` (drops the datagram) if the dial fails.
+fn open_flow(
+    connector: &Arc<dyn UdpConnector>,
+    sink: &Arc<dyn ReplySink>,
+    guest: SocketAddrV4,
+    dst: SocketAddrV4,
+    first: &[u8],
+) -> Option<Forward> {
+    let upstream = match connector.connect(SocketAddr::V4(dst)) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("udp proxy: dial {dst} failed: {e}");
+            return None;
+        }
+    };
+    // Fire the first datagram.
+    {
+        let up = upstream.clone();
+        let bytes = first.to_vec();
+        tokio::spawn(async move {
+            let _ = up.send(&bytes).await;
+        });
+    }
+    // Relay replies until the flow is evicted (task aborted) or upstream dies.
+    let reader = tokio::spawn(relay_replies(upstream.clone(), sink.clone(), guest, dst));
+    Some(Forward { upstream, reader })
 }
 
 /// Relay every reply from `upstream` back to `guest`, forging source `dst`.
@@ -489,6 +608,224 @@ mod tests {
             Event::Egress { verdict, .. } => assert_eq!(verdict, Verdict::Blocked),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn undecided_datagram_is_held_then_relays_on_approval() {
+        // ADR-2021: a denied-but-undecided first datagram is held (its flow
+        // entry caches "no relay"), and the *held* datagram is fired once the
+        // request is approved and the rule is in the allowlist.
+        let echo = spawn_echo().await;
+        let listener = origdst_listener().await;
+        let dst = match listener.local_addr().unwrap() {
+            SocketAddr::V4(v4) => v4,
+            _ => unreachable!(),
+        };
+        let other = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 9999);
+        let al = allowlist_allowing(other);
+        let sink = Arc::new(RecordSink::default());
+        let pending = sodabox_common::request::shared();
+        let proxy = TransparentUdpProxy::new(
+            listener,
+            al.clone(),
+            Arc::new(FixedConnector { target: echo }),
+            sink.clone(),
+        )
+        .with_pending(pending.clone());
+        let paddr = proxy.local_addr().unwrap();
+        tokio::spawn(proxy.serve());
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let caddr = match client.local_addr().unwrap() {
+            SocketAddr::V4(v4) => v4,
+            _ => unreachable!(),
+        };
+        client.send_to(b"held", paddr).await.unwrap();
+
+        // The request is parked; nothing relayed yet.
+        let id = loop {
+            if let Some(r) = pending.list().first() {
+                break r.id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            sink.got.lock().unwrap().is_empty(),
+            "held datagram must not relay"
+        );
+
+        // Approve = rule first, then resolve.
+        let allow_dst = VmPolicy {
+            rules: vec![Rule::Ip {
+                cidr: dst.ip().to_string(),
+                ports: Some(dst.port().to_string()),
+                proto: Some("udp".into()),
+            }],
+            ..VmPolicy::default()
+        };
+        al.write().unwrap().swap_policy(&allow_dst).unwrap();
+        assert!(pending.resolve(id, true));
+
+        // The held datagram goes out, the echo replies, and the relay injects
+        // it back as (guest, src=dst, b"held").
+        for _ in 0..100 {
+            let done = sink
+                .got
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(g, s, b)| *g == caddr && *s == dst && b == b"held");
+            if done {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("approved flow never relayed");
+    }
+
+    /// A proxy that holds undecided datagrams, with its pending table and sink.
+    async fn holding_proxy() -> (
+        SocketAddrV4,
+        SharedAllowlist,
+        PendingRequests,
+        Arc<RecordSink>,
+        SocketAddr,
+    ) {
+        let echo = spawn_echo().await;
+        let listener = origdst_listener().await;
+        let dst = match listener.local_addr().unwrap() {
+            SocketAddr::V4(v4) => v4,
+            _ => unreachable!(),
+        };
+        let al = allowlist_allowing(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 9999));
+        let sink = Arc::new(RecordSink::default());
+        let pending = sodabox_common::request::shared();
+        let proxy = TransparentUdpProxy::new(
+            listener,
+            al.clone(),
+            Arc::new(FixedConnector { target: echo }),
+            sink.clone(),
+        )
+        .with_pending(pending.clone());
+        let paddr = proxy.local_addr().unwrap();
+        tokio::spawn(proxy.serve());
+        (dst, al, pending, sink, paddr)
+    }
+
+    async fn first_request(pending: &PendingRequests) -> u64 {
+        loop {
+            if let Some(r) = pending.list().first() {
+                return r.id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn allow(al: &SharedAllowlist, dst: SocketAddrV4) {
+        let policy = VmPolicy {
+            rules: vec![Rule::Ip {
+                cidr: dst.ip().to_string(),
+                ports: Some(dst.port().to_string()),
+                proto: Some("udp".into()),
+            }],
+            ..VmPolicy::default()
+        };
+        al.write().unwrap().swap_policy(&policy).unwrap();
+    }
+
+    #[tokio::test]
+    async fn denied_flow_stays_quiet_until_a_rule_allows_it() {
+        let (dst, al, pending, sink, paddr) = holding_proxy().await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"first", paddr).await.unwrap();
+        assert!(pending.resolve(first_request(&pending).await, false));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Retransmits while the denial stands don't ask again.
+        client.send_to(b"again", paddr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(pending.list().is_empty());
+        assert!(sink.got.lock().unwrap().is_empty());
+
+        // A rule added later applies to the very next datagram.
+        allow(&al, dst);
+        client.send_to(b"after", paddr).await.unwrap();
+        for _ in 0..100 {
+            if sink
+                .got
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, b)| b == b"after")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("flow stayed blackholed after a rule allowed it");
+    }
+
+    #[tokio::test]
+    async fn repeats_of_a_held_flow_relay_once_on_approval() {
+        let (dst, al, pending, sink, paddr) = holding_proxy().await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"held", paddr).await.unwrap();
+        let id = first_request(&pending).await;
+        client.send_to(b"repeat", paddr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        allow(&al, dst);
+        assert!(pending.resolve(id, true));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Only the held datagram went out, over one relay.
+        let got = sink.got.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(&got[0].2, b"held");
+    }
+
+    #[tokio::test]
+    async fn prune_never_evicts_a_held_flow() {
+        let proxy = TransparentUdpProxy::new(
+            origdst_listener().await,
+            allowlist_allowing(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 9999)),
+            Arc::new(DirectUdpConnector),
+            Arc::new(RecordSink::default()),
+        );
+        let key = |port| {
+            (
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+                SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 53),
+            )
+        };
+        let flow = |held| Flow {
+            last: Instant::now() - FLOW_TTL * 2,
+            forward: None,
+            held,
+        };
+        let flows = Arc::new(Mutex::new(HashMap::new()));
+        flows.lock().unwrap().insert(key(1), flow(true));
+        flows.lock().unwrap().insert(key(2), flow(false));
+
+        // Past the idle TTL: the cached denial goes, the held flow stays.
+        proxy.prune(&flows);
+        let map = flows.lock().unwrap();
+        assert!(map.contains_key(&key(1)));
+        assert!(!map.contains_key(&key(2)));
+        drop(map);
+
+        // At the cap with nothing evictable, prune gives up instead of spinning.
+        let fresh = |held| Flow {
+            last: Instant::now(),
+            forward: None,
+            held,
+        };
+        for port in 0..MAX_FLOWS as u16 {
+            flows.lock().unwrap().insert(key(port + 2), fresh(true));
+        }
+        proxy.prune(&flows);
+        assert!(flows.lock().unwrap().len() > MAX_FLOWS);
     }
 
     #[tokio::test]

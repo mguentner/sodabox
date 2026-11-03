@@ -572,11 +572,18 @@ async fn serve(
     let event_sink = Arc::new(BroadcastEvents(events_tx.clone()));
     let events: Arc<dyn EgressEvents> = event_sink.clone();
 
+    // Pending egress requests (ADR-0021): one per-VM table shared by the
+    // proxies, the resolver and the control socket, with its events routed
+    // onto the same ring so the CLI/TUI and the audit log both see them. Its
+    // sweep starts below, once the resolver's domain rules exist.
+    let pending = sodabox_common::request::shared().with_events(event_sink.clone().as_sink());
+
     // Filter proxy: enforce the allowlist, dial the allow-path from *this* (host)
     // netns so it isn't re-intercepted, and emit allowed/blocked events.
     let dialer = Arc::new(
         PolicyDialer::new(allowlist.clone(), Arc::new(DirectDialer), Proto::Tcp)
-            .with_events(events.clone()),
+            .with_events(events.clone())
+            .with_pending(pending.clone()),
     );
     // Inference gateway (ADR-0020): runs in this process and serves the
     // connections the proxy hands it for the gateway address. Not critical:
@@ -620,13 +627,29 @@ async fn serve(
     let resolver = Arc::new(
         FilteringResolver::new(&plan.policy, allowlist.clone(), plan.upstreams.clone())
             .map_err(|e| anyhow::anyhow!("resolver: {e}"))?
-            .with_events(event_sink.clone()),
+            .with_events(event_sink.clone())
+            .with_pending(pending.clone()),
     );
     // Grab the resolver's live domain-allowlist handle *before* it is moved into
     // the serve task, so a `PolicySet` can swap the resolver's domain rules too —
     // without it, allowing a new domain updates the proxy + UI but the resolver
     // keeps refusing the name, so the proxy never sees an allow.
     let domains = resolver.domains();
+    // The 1 s request sweep: release what a rule now covers, then deny whatever
+    // aged out (the TTL is the table's only clock).
+    {
+        let pending = pending.clone();
+        let allowlist = allowlist.clone();
+        let domains = domains.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                release_covered(&pending, &allowlist, &domains);
+                pending.expire_due();
+            }
+        });
+    }
     // The gateway's name resolves only while the policy grants access.
     let local_names = resolver.local_names();
     sync_gateway_name(
@@ -653,7 +676,8 @@ async fn serve(
         Arc::new(DirectUdpConnector),
         sink,
     )
-    .with_events(events);
+    .with_events(events)
+    .with_pending(pending.clone());
     let mut udp_task = tokio::spawn(udp_proxy.serve());
 
     // Control + event socket. Unlike the proxy/resolver, this is *not*
@@ -661,7 +685,8 @@ async fn serve(
     // control but cannot open egress, so its exit does not tear the guest down.
     let state = Arc::new(
         SupervisorState::new(plan.policy.clone(), allowlist.clone(), domains, events_tx)
-            .with_gateway(gateway, local_names),
+            .with_gateway(gateway, local_names)
+            .with_pending(pending),
     );
     let control = ControlServer::bind(&plan.name, state.clone())?;
     tokio::spawn(control.serve());
@@ -826,6 +851,46 @@ impl GatewayEvents for BroadcastEvents {
     }
 }
 
+/// Release held requests the live rules now cover (ADR-0021), however they came
+/// to: `soda allow`, a profile, a policy edit, or a DNS answer admitting an
+/// address. Polled rather than hooked into `policy_set`, since that last one
+/// never passes through it. Each holder re-checks the rules on its way out, so
+/// a rule removed in between still fails closed.
+fn release_covered(
+    pending: &sodabox_common::request::PendingRequests,
+    allowlist: &SharedAllowlist,
+    domains: &SharedDomainAllowlist,
+) {
+    for req in pending.list() {
+        let covered = match req.port {
+            None => domains
+                .read()
+                .is_ok_and(|d| d.matches(&req.destination).is_some()),
+            Some(port) => {
+                let (Ok(ip), Ok(proto)) = (req.destination.parse(), Proto::parse(&req.proto))
+                else {
+                    continue;
+                };
+                allowlist.read().is_ok_and(|al| {
+                    al.evaluate(SocketAddr::new(ip, port), proto, std::time::Instant::now())
+                        .is_allow()
+                })
+            }
+        };
+        if covered {
+            pending.resolve(req.id, true);
+        }
+    }
+}
+
+/// The pending-request table's event sink (ADR-0021) — the same ring, third
+/// trait shape: the table stores a plain `Fn`, so it needs a real closure.
+impl BroadcastEvents {
+    fn as_sink(self: Arc<Self>) -> Arc<dyn Fn(Event) + Send + Sync> {
+        Arc::new(move |e: Event| EgressEvents::emit(&*self, e))
+    }
+}
+
 /// The gateway as the proxy's local service at [`GATEWAY_IP`]. Access is
 /// checked per connection against the live policy: without it the connection
 /// is closed with the same `blocked` verdict as any destination not on the
@@ -878,6 +943,9 @@ pub struct SupervisorState {
     gateway: Option<Gateway>,
     /// The resolver's local names, where the gateway's name is published.
     local_names: LocalNames,
+    /// Parked egress requests (ADR-0021): the same table the proxies and the
+    /// resolver hold undecided traffic against.
+    pending: Option<sodabox_common::request::PendingRequests>,
 }
 
 impl SupervisorState {
@@ -895,7 +963,15 @@ impl SupervisorState {
             stop: Notify::new(),
             gateway: None,
             local_names: LocalNames::default(),
+            pending: None,
         }
+    }
+
+    /// Attach the pending-request table (ADR-0021), so the control socket can
+    /// resolve and list what the proxies and resolver hold.
+    pub fn with_pending(mut self, pending: sodabox_common::request::PendingRequests) -> Self {
+        self.pending = Some(pending);
+        self
     }
 
     /// Attach the inference gateway and the resolver's local names, so policy
@@ -993,6 +1069,22 @@ impl ControlHandler for SupervisorState {
 
     fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
+    }
+
+    // ADR-0021: resolve/list parked requests. Resolving is idempotent and
+    // race-tolerant — the table itself decides whether the id still exists.
+    fn request_resolve(&self, id: u64, allow: bool) -> Result<(), String> {
+        match &self.pending {
+            Some(p) => {
+                p.resolve(id, allow);
+                Ok(())
+            }
+            None => Err("this supervisor holds no pending requests".to_string()),
+        }
+    }
+
+    fn request_list(&self) -> Vec<sodabox_common::request::PendingRequest> {
+        self.pending.as_ref().map(|p| p.list()).unwrap_or_default()
     }
 
     fn quota_get(&self) -> Result<sodabox_common::quota::Balances, String> {
@@ -1097,6 +1189,103 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async { state.stopped().await });
+    }
+
+    #[test]
+    fn request_resolve_and_list_reach_the_pending_table() {
+        // ADR-0021: the control socket resolves and lists the same table the
+        // proxies/resolver hold against. Idempotent on unknown ids.
+        let (tx, _rx) = broadcast::channel(4);
+        let al = shared(Allowlist::from_policy(&VmPolicy::default()).unwrap());
+        let pending = sodabox_common::request::shared();
+        let state = SupervisorState::new(VmPolicy::default(), al, empty_domains(), tx)
+            .with_pending(pending.clone());
+
+        assert!(state.request_list().is_empty());
+        let (info, mut rx) = pending.hold("dns", "maybe.test", None);
+        assert_eq!(state.request_list(), vec![info.clone()]);
+
+        state.request_resolve(info.id, true).unwrap();
+        assert_eq!(
+            rx.try_recv(),
+            Ok(sodabox_common::request::RequestVerdict::Approved)
+        );
+        assert!(state.request_list().is_empty());
+
+        // Already resolved (e.g. raced an expiry): a no-op Ok.
+        state.request_resolve(info.id, true).unwrap();
+
+        // No table attached: the default handler declines.
+        let (tx2, _rx2) = broadcast::channel(4);
+        let bare = SupervisorState::new(
+            VmPolicy::default(),
+            shared(Allowlist::from_policy(&VmPolicy::default()).unwrap()),
+            empty_domains(),
+            tx2,
+        );
+        assert!(bare.request_resolve(1, true).is_err());
+        assert!(bare.request_list().is_empty());
+    }
+
+    #[test]
+    fn sweep_releases_only_what_the_rules_now_cover() {
+        use sodabox_common::allowlist::{EphemeralEntry, PortSpec};
+        use sodabox_common::policy::DomainScope;
+        use sodabox_common::request::RequestVerdict::Approved;
+
+        let policy = VmPolicy {
+            rules: vec![
+                Rule::Ip {
+                    cidr: "203.0.113.5".into(),
+                    ports: Some("443".into()),
+                    proto: Some("tcp".into()),
+                },
+                Rule::Resolve {
+                    name: "example.com".into(),
+                    scope: DomainScope::Subdomains,
+                },
+            ],
+            ..VmPolicy::default()
+        };
+        let al = shared(Allowlist::from_policy(&VmPolicy::default()).unwrap());
+        let domains = empty_domains();
+        let pending = sodabox_common::request::shared();
+
+        let (_, mut tcp_443) = pending.hold("tcp", "203.0.113.5", Some(443));
+        let (_, mut tcp_80) = pending.hold("tcp", "203.0.113.5", Some(80));
+        let (_, mut udp_443) = pending.hold("udp", "203.0.113.5", Some(443));
+        let (_, mut sub) = pending.hold("dns", "www.example.com", None);
+        let (_, mut other) = pending.hold("dns", "other.test", None);
+        let (_, mut admitted) = pending.hold("tcp", "198.51.100.7", Some(22));
+
+        // Nothing covers them yet.
+        release_covered(&pending, &al, &domains);
+        assert_eq!(pending.list().len(), 6);
+
+        // The rules arrive: only the exact flow and the name are released.
+        al.write().unwrap().swap_policy(&policy).unwrap();
+        domains.write().unwrap().swap_policy(&policy).unwrap();
+        release_covered(&pending, &al, &domains);
+        assert_eq!(tcp_443.try_recv(), Ok(Approved));
+        assert_eq!(sub.try_recv(), Ok(Approved));
+        assert!(tcp_80.try_recv().is_err());
+        assert!(udp_443.try_recv().is_err());
+        assert!(other.try_recv().is_err());
+        assert!(admitted.try_recv().is_err());
+        assert_eq!(pending.list().len(), 4);
+
+        // A DNS answer admitting an address reaches a hold on it too, with no
+        // policy change involved.
+        al.write().unwrap().insert_ephemeral(EphemeralEntry {
+            ip: "198.51.100.7".parse().unwrap(),
+            ports: PortSpec::any(),
+            proto: None,
+            expiry: std::time::Instant::now() + Duration::from_secs(60),
+            domain: "written.test".into(),
+        });
+        release_covered(&pending, &al, &domains);
+        assert_eq!(admitted.try_recv(), Ok(Approved));
+        assert_eq!(pending.list().len(), 3);
     }
 
     #[test]

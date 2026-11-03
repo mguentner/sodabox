@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use sodabox_common::allowlist::{Decision, Proto};
 use sodabox_common::event::{Event, Verdict};
+use sodabox_common::request::{RequestVerdict, REQUEST_TTL};
 // Re-exported so proxy callers keep a single import site.
 pub use sodabox_common::allowlist::{shared, SharedAllowlist};
 
@@ -34,6 +35,9 @@ pub struct PolicyDialer<D: Dialer> {
     /// Protocol of this proxy's connections (TCP for the transparent TCP proxy).
     proto: Proto,
     events: Arc<dyn EgressEvents>,
+    /// Where an undecided destination is parked for interactive approval
+    /// (ADR-0021); `None` keeps the plain refuse-on-deny behavior (tests).
+    pending: Option<sodabox_common::request::PendingRequests>,
 }
 
 impl<D: Dialer> PolicyDialer<D> {
@@ -43,7 +47,15 @@ impl<D: Dialer> PolicyDialer<D> {
             inner,
             proto,
             events: null_sink(),
+            pending: None,
         }
+    }
+
+    /// Park undecided destinations in this table instead of refusing them
+    /// (ADR-0021).
+    pub fn with_pending(mut self, pending: sodabox_common::request::PendingRequests) -> Self {
+        self.pending = Some(pending);
+        self
     }
 
     /// Attach an event sink so verdicts are reported (allowed/blocked).
@@ -87,6 +99,76 @@ impl<D: Dialer> Dialer for PolicyDialer<D> {
                 self.inner.dial(dst)
             }
             Decision::Deny => {
+                // Undecided, not refused (ADR-0021): park the connection for up
+                // to REQUEST_TTL and let the user admit it from the TUI. The
+                // guest-side socket is already ours (TPROXY), so it just sees a
+                // stalled connect. On approval the rule is already in the
+                // allowlist (approve *is* a persistent rule), so re-evaluate —
+                // fail closed on anything but a clean allow.
+                if let Some(pending) = self.pending.clone() {
+                    let allowlist = self.allowlist.clone();
+                    let inner = self.inner.clone();
+                    let events = self.events.clone();
+                    let proto = self.proto;
+                    let proto_s = match proto {
+                        Proto::Tcp => "tcp",
+                        Proto::Udp => "udp",
+                    }
+                    .to_string();
+                    let (info, rx) = pending.hold("tcp", &dst.ip().to_string(), Some(dst.port()));
+                    return Box::pin(async move {
+                        let verdict = tokio::time::timeout(REQUEST_TTL, rx).await;
+                        match verdict {
+                            Ok(Ok(RequestVerdict::Approved)) => {}
+                            _ => {
+                                events.emit(Event::Egress {
+                                    ts: now_ts(),
+                                    verdict: Verdict::Blocked,
+                                    proto: proto_s.clone(),
+                                    daddr: dst.ip().to_string(),
+                                    dport: dst.port(),
+                                    rule: None,
+                                });
+                                return Err(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    format!("egress denied by policy: {dst}"),
+                                ));
+                            }
+                        }
+                        // Re-check the (just-updated) allowlist.
+                        let decision = match allowlist.read() {
+                            Ok(al) => al.evaluate(dst, proto, Instant::now()),
+                            Err(_) => Decision::Deny,
+                        };
+                        match decision {
+                            Decision::AllowStatic | Decision::AllowEphemeral { .. } => {
+                                events.emit(Event::Egress {
+                                    ts: now_ts(),
+                                    verdict: Verdict::Allowed,
+                                    proto: proto_s.clone(),
+                                    daddr: dst.ip().to_string(),
+                                    dport: dst.port(),
+                                    rule: Some(format!("granted (request {})", info.id)),
+                                });
+                                inner.dial(dst).await
+                            }
+                            Decision::Deny => {
+                                events.emit(Event::Egress {
+                                    ts: now_ts(),
+                                    verdict: Verdict::Blocked,
+                                    proto: proto_s.clone(),
+                                    daddr: dst.ip().to_string(),
+                                    dport: dst.port(),
+                                    rule: None,
+                                });
+                                Err(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    format!("egress denied by policy: {dst}"),
+                                ))
+                            }
+                        }
+                    });
+                }
                 self.emit(dst, Verdict::Blocked, None);
                 Box::pin(async move {
                     Err(io::Error::new(
@@ -164,6 +246,104 @@ mod tests {
             .dial(denied)
             .await
             .expect_err("denied dial must fail");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn denied_dst_is_held_and_dials_after_approval() {
+        // ADR-0021: an undecided destination parks in the request table instead
+        // of failing. Approve *is* a persistent rule: add it, resolve the
+        // request, and the held dial goes through as if it had been allowed.
+        let echo = spawn_echo().await;
+        // Allowlist permits a different addr, so the echo is undecided.
+        let al = allowlist_allowing("203.0.113.1:9".parse().unwrap());
+        let pending = sodabox_common::request::shared();
+        let dialer = PolicyDialer::new(al.clone(), Arc::new(DirectDialer), Proto::Tcp)
+            .with_pending(pending.clone());
+
+        let fut = dialer.dial(echo);
+        // The request is parked (coalesced id 1); the dial has neither failed
+        // nor connected yet.
+        let id = loop {
+            let list = pending.list();
+            if let Some(r) = list.first() {
+                break r.id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(pending.list()[0].destination, echo.ip().to_string());
+        assert_eq!(pending.list()[0].port, Some(echo.port()));
+
+        // The TUI's approve path: rule first, then the resolve.
+        let allow_echo = VmPolicy {
+            rules: vec![Rule::Ip {
+                cidr: echo.ip().to_string(),
+                ports: Some(echo.port().to_string()),
+                proto: Some("tcp".into()),
+            }],
+            ..VmPolicy::default()
+        };
+        al.write().unwrap().swap_policy(&allow_echo).unwrap();
+        assert!(pending.resolve(id, true));
+
+        let mut up = fut.await.expect("approved dial should connect");
+        up.write_all(b"hi").await.unwrap();
+        let mut b = [0u8; 2];
+        up.read_exact(&mut b).await.unwrap();
+        assert_eq!(&b, b"hi");
+        assert!(pending.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_leaves_the_table_when_its_client_gives_up() {
+        use crate::tcp::TransparentProxy;
+        use std::time::Duration;
+        use tokio::net::TcpStream;
+
+        // Allowlist permits a different addr, so the proxy's own addr is undecided.
+        let al = allowlist_allowing("203.0.113.1:9".parse().unwrap());
+        let pending = sodabox_common::request::shared();
+        let dialer =
+            PolicyDialer::new(al, Arc::new(DirectDialer), Proto::Tcp).with_pending(pending.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = TransparentProxy::new(listener, Arc::new(dialer));
+        let paddr = proxy.local_addr().unwrap();
+        tokio::spawn(proxy.serve());
+
+        let client = TcpStream::connect(paddr).await.unwrap();
+        while pending.list().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(client);
+
+        // The supervisor's sweep removes the row once the hold has noticed.
+        for _ in 0..100 {
+            pending.expire_due();
+            if pending.list().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("request outlived its only client");
+    }
+
+    #[tokio::test]
+    async fn held_dst_fails_when_denied() {
+        let echo = spawn_echo().await;
+        let al = allowlist_allowing("203.0.113.1:9".parse().unwrap());
+        let pending = sodabox_common::request::shared();
+        let dialer = PolicyDialer::new(al.clone(), Arc::new(DirectDialer), Proto::Tcp)
+            .with_pending(pending.clone());
+
+        let fut = dialer.dial(echo);
+        let id = loop {
+            if let Some(r) = pending.list().first() {
+                break r.id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert!(pending.resolve(id, false));
+        let err = fut.await.expect_err("denied hold must fail");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
