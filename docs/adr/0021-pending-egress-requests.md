@@ -153,8 +153,11 @@ never narrows a written rule.
 - **Notifications.** A new `RequestPending` triggers a terminal notification:
   **OSC 9** (`ESC ] 9 ; <message> BEL`, the "growl" notification escape) plus
   the **terminal bell** (`BEL`). The message is the static text
-  `<vm> has new egress requests`: destinations are guest-controlled and must
-  not reach a raw escape sequence. The TUI key `n` cycles the mode:
+  `<vm> has new egress requests`: destinations are guest-controlled (a DNS name
+  can hold any byte) and must not reach a raw escape sequence. For the same
+  reason the TUI scrubs control characters from every frame, `soda logs` prints
+  them escaped, and a domain name containing them can't become a rule. The TUI
+  key `n` cycles the mode:
   `off | notification | bell | all` — which of the two mechanisms (or neither,
   or both) is emitted. The mode persists in the CLI/TUI config in the config
   dir (`$XDG_CONFIG_HOME/sodabox/tui.toml`, key `notify`), so it survives

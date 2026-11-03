@@ -11,8 +11,8 @@ use sodabox_common::event::{DnsVerdict, Event, Verdict};
 use sodabox_common::{paths, vm::VmMeta};
 
 /// `soda logs <vm> [-n N] [--json]`. Prints oldest-first. `lines` limits to the
-/// last N records (across both files); `json` passes the raw JSON lines through
-/// instead of the human-readable rendering.
+/// last N records (across both files); `json` prints the JSON lines (see
+/// [`json_safe`]) instead of the human-readable rendering.
 pub fn run(name: &str, lines: Option<usize>, json: bool) -> anyhow::Result<()> {
     if !VmMeta::path(name).is_file() {
         anyhow::bail!("no such VM '{name}' — run `soda create {name}` first");
@@ -31,7 +31,7 @@ pub fn run(name: &str, lines: Option<usize>, json: bool) -> anyhow::Result<()> {
     let start = lines.map(|n| records.len().saturating_sub(n)).unwrap_or(0);
     for raw in &records[start..] {
         if json {
-            println!("{raw}");
+            println!("{}", json_safe(raw));
         } else {
             println!("{}", render(raw));
         }
@@ -54,12 +54,39 @@ fn read_into(path: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
 
 /// Render one stored JSON record as a human-readable audit line. A line that
 /// doesn't parse (e.g. a torn final write from a live VM) is shown verbatim with
-/// a `?` marker rather than dropped, so nothing is silently hidden.
+/// a `?` marker rather than dropped, so nothing is silently hidden. Records carry
+/// guest-controlled text (a DNS name can hold any byte), so control characters
+/// are shown escaped, for the same reason, and never reach the terminal.
 fn render(raw: &str) -> String {
-    match serde_json::from_str::<Event>(raw) {
+    let line = match serde_json::from_str::<Event>(raw) {
         Ok(ev) => render_event(&ev),
         Err(_) => format!("{:<20} ?        {raw}", "?"),
+    };
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
     }
+    out
+}
+
+/// A stored JSON line, safe to print to a terminal and still the same JSON.
+/// `serde_json` leaves C1 controls such as U+009B (a CSI on some terminals) raw,
+/// so every control character becomes a `\uXXXX` escape. In a valid record they
+/// can only occur inside strings, where that escape means the same character.
+fn json_safe(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The detail of an inference event, shared with the TUI:
@@ -243,5 +270,59 @@ mod tests {
 
         // A torn/garbage line is surfaced with a `?` marker, not dropped.
         assert!(render("{not json").contains('?'));
+    }
+
+    /// A query name a guest can really send: label bytes are kept as-is.
+    const HOSTILE: &str = "x\u{7}\u{1b}]52;c;Zm9v\u{7}\u{9b}2J.evil.test";
+
+    fn hostile_records() -> Vec<String> {
+        [
+            Event::Dns {
+                ts: 0,
+                verdict: DnsVerdict::Refused,
+                qname: HOSTILE.into(),
+                answers: Vec::new(),
+                ttl: 0,
+            },
+            Event::RequestPending {
+                ts: 0,
+                id: 1,
+                proto: "dns".into(),
+                destination: HOSTILE.into(),
+                port: None,
+                expires_ts: 30,
+            },
+        ]
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn render_shows_control_characters_escaped() {
+        for raw in hostile_records() {
+            let line = render(&raw);
+            assert!(!line.contains(char::is_control), "{line:?}");
+            // Still visible for the audit, not silently dropped.
+            assert!(line.contains(r"\u{1b}]52;c;Zm9v"), "{line}");
+        }
+        // The fallback for an unparsable line prints it too.
+        let line = render("{torn \u{1b}]52;");
+        assert!(!line.contains(char::is_control), "{line:?}");
+    }
+
+    #[test]
+    fn json_output_has_no_control_characters_and_means_the_same() {
+        for raw in hostile_records() {
+            // The premise: serde_json alone leaves the C1 control in.
+            assert!(raw.contains('\u{9b}'), "{raw:?}");
+            let safe = json_safe(&raw);
+            assert!(!safe.contains(char::is_control), "{safe:?}");
+            let (a, b): (serde_json::Value, serde_json::Value) = (
+                serde_json::from_str(&raw).unwrap(),
+                serde_json::from_str(&safe).unwrap(),
+            );
+            assert_eq!(a, b);
+        }
     }
 }

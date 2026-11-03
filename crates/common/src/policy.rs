@@ -830,6 +830,13 @@ fn fresh_table(src: &toml_edit::Table) -> toml_edit::Table {
 /// no scheme/path/whitespace. Deliberately lenient (the DNS filter is the real
 /// authority) but rejects obvious mistakes like pasting a URL.
 fn validate_domain(name: &str) -> Result<(), String> {
+    // First, since the errors below echo the name: a guest's query can hold any
+    // byte, and this one is debug-formatted so it doesn't print them either.
+    if name.contains(char::is_control) {
+        return Err(format!(
+            "invalid domain {name:?}: contains control characters"
+        ));
+    }
     let n = name.strip_prefix("*.").unwrap_or(name);
     if n.is_empty() || n.len() > 253 {
         return Err(format!("invalid domain '{name}': empty or too long"));
@@ -865,6 +872,22 @@ mod tests {
         assert!(p.add_ip("not-a-cidr", None).is_err());
         assert!(p.add_ip("10.0.0.0/8", Some("notaport")).is_err());
         assert_eq!(p.rules.len(), 2);
+    }
+
+    #[test]
+    fn domain_with_control_characters_is_rejected_without_echoing_them() {
+        let mut p = VmPolicy::default();
+        for name in [
+            "x\u{1b}]52;c;Zm9v\u{7}.evil.test",
+            "x\u{9b}2J.evil.test",
+            // Would otherwise trip the checks that echo the name.
+            "x\u{1b}/y.evil.test",
+            "x\u{1b} y.evil.test",
+        ] {
+            let err = p.add_resolve(name, DomainScope::Subdomains).unwrap_err();
+            assert!(!err.contains(char::is_control), "{err:?}");
+        }
+        assert!(p.rules.is_empty());
     }
 
     #[test]

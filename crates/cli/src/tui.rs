@@ -1622,7 +1622,21 @@ fn request_resolve(app: &mut App, allow: bool) {
 ///
 /// Takes `app` mutably only to settle each flow panel's scroll window against
 /// the panel's actual height.
+///
+/// Panels show guest-controlled text (a DNS name can hold any byte), and the
+/// widgets copy control characters into cells, which the backend then writes to
+/// the terminal as escape sequences. So the finished frame is scrubbed here,
+/// whichever panel the text landed in.
 fn draw(f: &mut Frame, app: &mut App) {
+    draw_panels(f, app);
+    for cell in &mut f.buffer_mut().content {
+        if cell.symbol().contains(char::is_control) {
+            cell.set_symbol("?");
+        }
+    }
+}
+
+fn draw_panels(f: &mut Frame, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3221,6 +3235,45 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn guest_controlled_names_reach_the_screen_without_control_characters() {
+        let hostile = "x\u{7}\u{1b}]52;c;Zm9v\u{7}\u{9b}2J.evil.test";
+        let mut a = app();
+        a.ingest(Event::RequestPending {
+            ts: 0,
+            id: 1,
+            proto: "dns".into(),
+            destination: hostile.into(),
+            port: None,
+            expires_ts: u64::MAX,
+        });
+        a.ingest(Event::RequestPending {
+            ts: 0,
+            id: 2,
+            proto: "dns".into(),
+            destination: hostile.into(),
+            port: None,
+            expires_ts: u64::MAX,
+        });
+        a.ingest(Event::Dns {
+            ts: 0,
+            verdict: DnsVerdict::Refused,
+            qname: hostile.into(),
+            answers: Vec::new(),
+            ttl: 0,
+        });
+        // A highlighted row takes its own rendering path.
+        a.request_sel = Some(1);
+
+        let text = screen(&mut a);
+        assert!(text.contains("evil.test"), "{text}");
+        let stray: Vec<char> = text
+            .chars()
+            .filter(|c| c.is_control() && *c != '\n')
+            .collect();
+        assert!(stray.is_empty(), "{stray:?}\n{text}");
     }
 
     #[test]
