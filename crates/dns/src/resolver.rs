@@ -312,7 +312,7 @@ impl QueryHandler for FilteringResolver {
             // holds); retransmissions coalesce in the request table.
             let mut matched = matched;
             if matched.is_none() {
-                if let Some(pending) = pending {
+                if let Some(pending) = &pending {
                     let (_, rx) = pending.hold("dns", &name, None);
                     if matches!(
                         tokio::time::timeout(REQUEST_TTL, rx).await,
@@ -353,6 +353,19 @@ impl QueryHandler for FilteringResolver {
             } else {
                 Vec::new()
             };
+
+            // Remember which name these addresses came from, for the requests
+            // connecting to them will raise (ADR-0021). Before the reply goes out,
+            // so the guest can't get there first.
+            if let Some(pending) = &pending {
+                for answer in &answers {
+                    match answer.data {
+                        RecordData::A(ip) => pending.note_resolved(ip.into(), &name),
+                        RecordData::Aaaa(ip) => pending.note_resolved(ip.into(), &name),
+                        RecordData::Cname(_) => {}
+                    }
+                }
+            }
 
             // Allowed: report the name, the IPs it authorized into the ephemeral
             // egress set, and the soonest TTL those entries expire at.
@@ -592,6 +605,37 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[tokio::test]
+    async fn resolved_addresses_are_remembered_under_the_queried_name() {
+        // A `resolve` rule: the address gains no egress, so connecting to it is a
+        // request, and that request can say where the address came from.
+        let upstream = spawn_fake_upstream(Ipv4Addr::new(198, 51, 100, 5), 60).await;
+        let pol = VmPolicy {
+            rules: vec![Rule::Resolve {
+                name: "allowed.test".into(),
+                scope: DomainScope::Subdomains,
+            }],
+            ..VmPolicy::default()
+        };
+        let al = shared(Allowlist::from_policy(&pol).unwrap());
+        let pending = sodabox_common::request::shared();
+        let r = FilteringResolver::new(&pol, al, vec![upstream])
+            .unwrap()
+            .with_pending(pending.clone());
+
+        let (unseen, _rx) = pending.hold("tcp", "198.51.100.5", Some(443));
+        assert_eq!(unseen.via, None);
+
+        let q = wire::parse_query(&wire::build_query(0x56, "www.allowed.test", TYPE_A).unwrap())
+            .unwrap();
+        let Response::Packet(_) = r.handle(q, "127.0.0.1:1".parse().unwrap()).await else {
+            panic!("expected a reply");
+        };
+
+        let (seen, _rx) = pending.hold("tcp", "198.51.100.5", Some(22));
+        assert_eq!(seen.via.as_deref(), Some("www.allowed.test"));
     }
 
     #[tokio::test]

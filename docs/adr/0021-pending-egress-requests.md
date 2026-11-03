@@ -129,7 +129,7 @@ never narrows a written rule.
   (the current pending set, so a freshly started TUI shows held requests
   without waiting for new ones).
 - Two new `Event` variants (ADR-0009), also written to `events.log` for audit:
-  - `RequestPending { id, kind, proto, destination, port?, expires_ts }`
+  - `RequestPending { id, kind, proto, destination, port?, via?, expires_ts }`
   - `RequestResolved { id, verdict }` — verdict is `approved`, `denied`,
     `expired`, or `abandoned`.
 
@@ -138,6 +138,16 @@ never narrows a written rule.
 - New **Egress Requests** panel on the **Network tab, above the Egress panel**:
   one row per pending request with its destination and a per-row countdown of
   the remaining TTL.
+- An address row says where the address came from, since a connection carries
+  only an IP and port and the user needs more to judge it:
+  `tcp 203.0.113.5:443 via example.com`, the name whose lookup most recently
+  returned it (remembered for an hour, as applications cache answers past their
+  TTL), or `no recent lookup` when the guest reached it without one, which is
+  worth a second look. This is a hint, not proof: it says what the guest looked
+  up, not who owns the address, and a guest can point a name of its own at
+  anything. So it is shown dim rather than as a verified identity, long names
+  keep their end (the part that says who runs them), and the rule approving the
+  row is still for the IP and port.
 - `Enter`/`a` approves, `d` denies; the cursor/panel-focus model is the
   existing one (the new panel joins the focus cycle). The cursor follows the
   request, not the row position: when the highlighted request goes away the

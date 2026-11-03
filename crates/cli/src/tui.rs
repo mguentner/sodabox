@@ -68,13 +68,15 @@ use sodabox_common::policy::{
 };
 use sodabox_common::protocol::{Request, Response};
 use sodabox_common::quota::{self, Balances, Entry, Ledger, Reason};
-use sodabox_common::request::PendingRequest;
+use sodabox_common::request::{origin_label, PendingRequest};
 use sodabox_common::vm::VmMeta;
 use sodabox_supervisor::control::{ControlClient, EventStream};
 
 /// Per-panel retention. A tail only shows a screenful; this bounds memory well
 /// above any visible window while staying tiny.
 const PANEL_CAPACITY: usize = 2048;
+/// The longest name a request row shows (see [`name_tail`]).
+const MAX_VIA_CHARS: usize = 32;
 
 /// Redraw cadence. Events are coalesced between frames (ingested as they arrive,
 /// painted on this tick), so a burst of thousands/sec costs one redraw per
@@ -622,6 +624,7 @@ impl App {
                 proto,
                 destination,
                 port,
+                via,
                 expires_ts,
                 ..
             } => {
@@ -633,6 +636,7 @@ impl App {
                     proto,
                     destination,
                     port,
+                    via,
                     expires_ts,
                 });
                 self.queue_request_notification();
@@ -1827,6 +1831,15 @@ fn render_requests_panel(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw("  "),
             ];
             spans.push(countdown);
+            // Last, so a narrow panel clips this rather than the countdown. Dim:
+            // it's a hint about the guest's lookups, not a verified identity.
+            let via = req.via.as_deref().map(name_tail);
+            if let Some(origin) = origin_label(req.port, via.as_deref()) {
+                spans.push(Span::styled(
+                    format!("  {origin}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
             let line = Line::from(spans);
             if Some(i) == sel_index {
                 Line::styled(
@@ -1842,6 +1855,18 @@ fn render_requests_panel(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// `name`, cut to [`MAX_VIA_CHARS`] from the front if longer. The end of a name is
+/// the part that says who runs it: a guest could look up
+/// `github.com.<padding>.evil.test` to get a reassuring start past the panel's edge.
+fn name_tail(name: &str) -> String {
+    let len = name.chars().count();
+    if len <= MAX_VIA_CHARS {
+        return name.to_string();
+    }
+    let tail: String = name.chars().skip(len - (MAX_VIA_CHARS - 1)).collect();
+    format!("…{tail}")
 }
 
 /// The countdown's color ramp (ADR-0021): white → yellow → orange → red →
@@ -2213,6 +2238,7 @@ fn event_line(ev: &Event) -> Line<'static> {
             proto,
             destination,
             port,
+            via,
             expires_ts,
             ..
         } => {
@@ -2220,10 +2246,15 @@ fn event_line(ev: &Event) -> Line<'static> {
                 Some(p) => format!("{destination}:{p}"),
                 None => destination.clone(),
             };
+            let origin = origin_label(*port, via.as_deref())
+                .map(|o| format!(" {o}"))
+                .unwrap_or_default();
             Line::from(vec![
                 ts_span(*ts),
                 tag_span("REQ", Color::Yellow),
-                Span::raw(format!("hold {proto} {where_to} (expires {expires_ts})")),
+                Span::raw(format!(
+                    "hold {proto} {where_to}{origin} (expires {expires_ts})"
+                )),
             ])
         }
         Event::RequestResolved { ts, id, verdict } => Line::from(vec![
@@ -2359,6 +2390,7 @@ mod tests {
                 "203.0.113.5".into()
             },
             port: if proto == "dns" { None } else { Some(443) },
+            via: None,
             expires_ts: ts + 30,
         }
     }
@@ -2454,6 +2486,52 @@ mod tests {
     }
 
     #[test]
+    fn request_rows_say_where_their_address_came_from() {
+        let pending =
+            |id, destination: &str, port: Option<u16>, via: Option<&str>| Event::RequestPending {
+                ts: 0,
+                id,
+                proto: if port.is_some() { "tcp" } else { "dns" }.into(),
+                destination: destination.into(),
+                port,
+                via: via.map(str::to_string),
+                expires_ts: u64::MAX,
+            };
+        let mut a = app();
+        a.ingest(pending(1, "203.0.113.5", Some(443), Some("example.com")));
+        a.ingest(pending(2, "198.51.100.7", Some(22), None));
+        a.ingest(pending(3, "maybe.test", None, None));
+
+        let text = screen(&mut a);
+        let row = |needle: &str| {
+            text.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} row in\n{text}"))
+                .to_string()
+        };
+        assert!(row("203.0.113.5:443").contains("via example.com"), "{text}");
+        assert!(
+            row("198.51.100.7:22").contains("no recent lookup"),
+            "{text}"
+        );
+        // A dns row is a name already.
+        assert!(!row("dns maybe.test").contains("lookup"), "{text}");
+    }
+
+    #[test]
+    fn long_names_keep_their_end_which_says_who_runs_them() {
+        assert_eq!(name_tail("example.com"), "example.com");
+        let spoof = format!("github.com.{}.evil.test", "a".repeat(60));
+        let tail = name_tail(&spoof);
+        assert_eq!(tail.chars().count(), MAX_VIA_CHARS);
+        assert!(
+            tail.starts_with('…') && tail.ends_with(".evil.test"),
+            "{tail}"
+        );
+        assert!(!tail.contains("github.com"), "{tail}");
+    }
+
+    #[test]
     fn lost_events_flag_a_resync_that_reconciles_the_rows() {
         let mut a = app();
         a.ingest(request_pending(0, 1, "tcp"));
@@ -2471,6 +2549,7 @@ mod tests {
             proto: "tcp".into(),
             destination: "203.0.113.5".into(),
             port: Some(443),
+            via: None,
             expires_ts: 30,
         };
         a.sync_requests(vec![row(2)]);
@@ -2513,6 +2592,7 @@ mod tests {
             proto: "tcp".into(),
             destination: "203.0.113.5".into(),
             port: Some(443),
+            via: Some("example.com".into()),
             expires_ts: 30,
         };
         assert_eq!(
@@ -2528,6 +2608,7 @@ mod tests {
             proto: "dns".into(),
             destination: "maybe.test".into(),
             port: None,
+            via: None,
             expires_ts: 30,
         };
         assert_eq!(
@@ -3247,14 +3328,16 @@ mod tests {
             proto: "dns".into(),
             destination: hostile.into(),
             port: None,
+            via: None,
             expires_ts: u64::MAX,
         });
         a.ingest(Event::RequestPending {
             ts: 0,
             id: 2,
-            proto: "dns".into(),
-            destination: hostile.into(),
-            port: None,
+            proto: "tcp".into(),
+            destination: "203.0.113.5".into(),
+            port: Some(443),
+            via: Some(hostile.into()),
             expires_ts: u64::MAX,
         });
         a.ingest(Event::Dns {

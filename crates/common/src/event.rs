@@ -64,6 +64,10 @@ pub enum Event {
         destination: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         port: Option<u16>,
+        /// A name whose lookup recently returned this IP (tcp/udp). A hint, not
+        /// proof; see [`crate::request::PendingRequest::via`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<String>,
         /// Unix seconds when the request dies if unresolved.
         expires_ts: u64,
     },

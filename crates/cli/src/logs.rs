@@ -181,6 +181,7 @@ fn render_event(ev: &Event) -> String {
             proto,
             destination,
             port,
+            via,
             expires_ts,
             ..
         } => {
@@ -188,10 +189,13 @@ fn render_event(ev: &Event) -> String {
                 Some(p) => format!("{destination}:{p}"),
                 None => destination.clone(),
             };
+            let origin = sodabox_common::request::origin_label(*port, via.as_deref())
+                .map(|o| format!(" {o}"))
+                .unwrap_or_default();
             (
                 *ts,
                 "REQ",
-                format!("hold {proto} {where_to} (expires {expires_ts})"),
+                format!("hold {proto} {where_to}{origin} (expires {expires_ts})"),
             )
         }
         Event::RequestResolved { ts, id, verdict } => {
@@ -290,12 +294,50 @@ mod tests {
                 proto: "dns".into(),
                 destination: HOSTILE.into(),
                 port: None,
+                via: None,
+                expires_ts: 30,
+            },
+            Event::RequestPending {
+                ts: 0,
+                id: 2,
+                proto: "tcp".into(),
+                destination: "203.0.113.5".into(),
+                port: Some(443),
+                via: Some(HOSTILE.into()),
                 expires_ts: 30,
             },
         ]
         .iter()
         .map(|e| serde_json::to_string(e).unwrap())
         .collect()
+    }
+
+    #[test]
+    fn render_says_where_a_held_address_came_from() {
+        let line = |via: Option<&str>| {
+            render(
+                &serde_json::to_string(&Event::RequestPending {
+                    ts: 0,
+                    id: 1,
+                    proto: "tcp".into(),
+                    destination: "203.0.113.5".into(),
+                    port: Some(443),
+                    via: via.map(str::to_string),
+                    expires_ts: 30,
+                })
+                .unwrap(),
+            )
+        };
+        assert!(
+            line(Some("example.com")).contains("hold tcp 203.0.113.5:443 via example.com"),
+            "{}",
+            line(Some("example.com"))
+        );
+        assert!(
+            line(None).contains("hold tcp 203.0.113.5:443 no recent lookup"),
+            "{}",
+            line(None)
+        );
     }
 
     #[test]

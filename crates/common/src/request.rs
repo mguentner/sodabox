@@ -11,6 +11,8 @@
 //! adds one (ADR-0006) before resolving, so the held flow proceeds through the
 //! normal allow path — the guest only ever observed latency.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +31,13 @@ pub const MAX_PENDING: usize = 64;
 /// the cap, a further call for a held destination is denied on the spot, and a
 /// new destination makes room by denying the oldest entries.
 pub const MAX_WAITERS: usize = 256;
+/// How long a lookup's answer is remembered for [`PendingRequest::via`]. Longer
+/// than DNS TTLs, which floor as low as seconds: applications cache answers past
+/// them, and a row must not claim no lookup happened because of that.
+const ORIGIN_RETENTION: Duration = Duration::from_secs(3600);
+/// Remembered answers per VM (oldest dropped past this). The guest can make these
+/// churn through a wildcard-ish approved name, so they need a bound.
+const MAX_ORIGINS: usize = 4096;
 
 /// The outcome of a held request. `Expired` and `Abandoned` only ever originate
 /// from the sweep; a resolved request is `Approved` or `Denied`.
@@ -64,8 +73,30 @@ pub struct PendingRequest {
     /// The destination port (tcp/udp); `None` for dns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// For tcp/udp, the name whose lookup most recently returned this IP. A hint,
+    /// not proof: it says what the guest looked up, not who owns the address,
+    /// since a guest can point a name of its own at anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     /// Unix seconds at which the request is denied if still unresolved.
     pub expires_ts: u64,
+}
+
+/// How a row describes where its address came from: `via <name>`, or that the
+/// guest reached it without a recent lookup, which is worth noticing. `None` for
+/// a dns request (no `port`), which is a name already.
+pub fn origin_label(port: Option<u16>, via: Option<&str>) -> Option<String> {
+    port?;
+    Some(match via {
+        Some(name) => format!("via {name}"),
+        None => "no recent lookup".to_string(),
+    })
+}
+
+/// A remembered lookup answer: which name returned an address, and when.
+struct Origin {
+    name: String,
+    noted: Instant,
 }
 
 /// An entry in the table: its wire shape, its deadline, and the enforcement
@@ -95,6 +126,8 @@ struct Inner {
     /// Where [`Event::RequestPending`]/[`Event::RequestResolved`] go. The sink
     /// must not call back into this table (it would deadlock on the entry lock).
     events: Mutex<Option<EventSink>>,
+    /// What the resolver answered, for [`PendingRequest::via`].
+    origins: Mutex<HashMap<IpAddr, Origin>>,
 }
 
 impl Default for Inner {
@@ -103,6 +136,7 @@ impl Default for Inner {
             entries: Mutex::new(Vec::new()),
             next_id: Mutex::new(0),
             events: Mutex::new(None),
+            origins: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -125,6 +159,36 @@ impl PendingRequests {
         if let Some(sink) = sink {
             sink(event);
         }
+    }
+
+    /// Remember that looking up `name` returned `ip`, so a request to that address
+    /// can say so. The latest name wins when several share an address.
+    pub fn note_resolved(&self, ip: IpAddr, name: &str) {
+        let mut origins = self.inner.origins.lock().unwrap();
+        if !origins.contains_key(&ip) && origins.len() >= MAX_ORIGINS {
+            let oldest = origins
+                .iter()
+                .min_by_key(|(_, o)| o.noted)
+                .map(|(ip, _)| *ip);
+            if let Some(oldest) = oldest {
+                origins.remove(&oldest);
+            }
+        }
+        origins.insert(
+            ip,
+            Origin {
+                name: name.trim_end_matches('.').to_string(),
+                noted: Instant::now(),
+            },
+        );
+    }
+
+    /// The remembered name for `destination`, if it's an address with a recent one.
+    fn origin_of(&self, destination: &str) -> Option<String> {
+        let ip: IpAddr = destination.parse().ok()?;
+        let origins = self.inner.origins.lock().unwrap();
+        let origin = origins.get(&ip)?;
+        (origin.noted.elapsed() <= ORIGIN_RETENTION).then(|| origin.name.clone())
     }
 
     /// Park a request. A matching entry (same proto/destination/port) is reused,
@@ -178,6 +242,7 @@ impl PendingRequests {
             proto: proto.to_string(),
             destination: destination.to_string(),
             port,
+            via: self.origin_of(destination),
             expires_ts: now_ts() + REQUEST_TTL.as_secs(),
         };
         entries.push(Entry {
@@ -191,6 +256,7 @@ impl PendingRequests {
             proto: info.proto.clone(),
             destination: info.destination.clone(),
             port: info.port,
+            via: info.via.clone(),
             expires_ts: info.expires_ts,
         });
         (info, rx)
@@ -346,6 +412,68 @@ mod tests {
         assert_eq!(table.expire_due(), 1);
         assert_eq!(rx.try_recv(), Ok(RequestVerdict::Expired));
         assert!(table.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn requests_name_the_lookup_that_returned_their_address() {
+        let table = shared();
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+
+        // No lookup yet.
+        let (before, _rx1) = table.hold("tcp", "203.0.113.5", Some(443));
+        assert_eq!(before.via, None);
+
+        table.note_resolved(ip, "www.example.com.");
+        let (tcp, _rx2) = table.hold("tcp", "203.0.113.5", Some(80));
+        assert_eq!(tcp.via.as_deref(), Some("www.example.com"));
+        let (udp, _rx3) = table.hold("udp", "203.0.113.5", Some(53));
+        assert_eq!(udp.via.as_deref(), Some("www.example.com"));
+
+        // A dns request is a name already.
+        let (dns, _rx4) = table.hold("dns", "maybe.test", None);
+        assert_eq!(dns.via, None);
+
+        // The latest name wins on a shared address.
+        table.note_resolved(ip, "other.test");
+        let (latest, _rx5) = table.hold("tcp", "203.0.113.5", Some(22));
+        assert_eq!(latest.via.as_deref(), Some("other.test"));
+
+        // Past the retention it's no longer a recent lookup.
+        table
+            .inner
+            .origins
+            .lock()
+            .unwrap()
+            .get_mut(&ip)
+            .unwrap()
+            .noted = Instant::now() - ORIGIN_RETENTION - Duration::from_secs(1);
+        let (stale, _rx6) = table.hold("tcp", "203.0.113.5", Some(23));
+        assert_eq!(stale.via, None);
+    }
+
+    #[test]
+    fn remembered_lookups_are_bounded_dropping_the_oldest() {
+        let table = shared();
+        let ip = |n: u32| IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n));
+        for n in 0..=MAX_ORIGINS as u32 {
+            table.note_resolved(ip(n), "example.com");
+        }
+        let origins = table.inner.origins.lock().unwrap();
+        assert_eq!(origins.len(), MAX_ORIGINS);
+        assert!(origins.contains_key(&ip(MAX_ORIGINS as u32)));
+    }
+
+    #[test]
+    fn origin_label_flags_an_address_with_no_lookup() {
+        assert_eq!(
+            origin_label(Some(443), Some("example.com")).as_deref(),
+            Some("via example.com")
+        );
+        assert_eq!(
+            origin_label(Some(443), None).as_deref(),
+            Some("no recent lookup")
+        );
+        assert_eq!(origin_label(None, None), None);
     }
 
     #[tokio::test]
