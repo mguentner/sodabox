@@ -20,4 +20,4 @@ anyhow.workspace = true
 toml.workspace = true
 serde_json.workspace = true
 ratatui.workspace = true
-nix = { version = "0.29", features = ["sched", "process"] }
+nix = { version = "0.29", features = ["sched", "process", "poll"] }

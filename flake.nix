@@ -45,9 +45,11 @@
             pname = "sodabox";
             version = "0.0.0";
 
-            # Rust sources plus guest-default/, profiles/ and nix/dotfiles.nix (embedded via
-            # include_str! in crates/cli/src/{guest,profile}.rs and crates/common/src/dotfiles.rs)
-            # — keep docs/, target/ out of the build.
+            # Rust sources plus guest-default/, profiles/, the logo asset and
+            # nix/dotfiles.nix (embedded via include_str!/include_bytes! in
+            # crates/cli/src/{guest,profile,tui}.rs and
+            # crates/common/src/dotfiles.rs) — keep docs/, target/ out of the
+            # build.
             src =
               let
                 fs = pkgs.lib.fileset;
@@ -60,6 +62,7 @@
                   ./crates
                   ./guest-default
                   ./profiles
+                  ./assets/logo_120x256.png
                   ./nix/dotfiles.nix
                 ];
               };

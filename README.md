@@ -1,6 +1,6 @@
 # sodabox
 
-![sodabox](./assets/logo.png)
+![sodabox](./assets/readme_header.png)
 
 microVMs for agents, analyses and experiments powered by NixOS
 

@@ -13,7 +13,11 @@
 //!   - **Egress** — flow verdicts (proto, dst:port, matched rule).
 //!   - **DNS** — query verdicts (name, resolved IPs, TTL).
 //!   - **Policy** — the live policy version and its rules.
-//!   - **Status** — VM state, configured CPU/RAM, and uptime.
+//!   - **Status** — the sodabox logo beside VM state, configured CPU/RAM, and
+//!     uptime. The logo is the PNG itself, placed over the panel's cells via
+//!     the kitty graphics protocol (kitty, Ghostty, WezTerm, Konsole, foot, …)
+//!     and scaled to the panel's lines; terminals that don't answer the
+//!     protocol probe get the fields alone.
 //! - **Inference** (ADR-0020)
 //!   - **Inference** — gateway requests (alias → upstream, status, tokens) and
 //!     used-up quotas.
@@ -51,7 +55,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -77,6 +81,35 @@ use sodabox_supervisor::control::{ControlClient, EventStream};
 const PANEL_CAPACITY: usize = 2048;
 /// The longest name a request row shows (see [`name_tail`]).
 const MAX_VIA_CHARS: usize = 32;
+
+/// The sodabox logo (`assets/logo_120x256.png`), embedded for the Status
+/// panel: transmitted once over the kitty graphics protocol and placed over
+/// the panel's cells every frame (see [`detect_graphics`]).
+const LOGO_PNG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/logo_120x256.png"
+));
+/// Graphics-protocol id under which the logo is transmitted and placed.
+const LOGO_ID: u32 = 1;
+/// The logo PNG's pixel size — the aspect reference for cell sizing.
+const LOGO_W: u32 = 120;
+const LOGO_H: u32 = 256;
+
+/// How long the graphics-protocol probe waits for the terminal's reply. Generous
+/// for slow links: a terminal that answers ends the wait at once, and a reply
+/// missing this deadline would decode as keystrokes in the event loop.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Width the status lines need beside the logo — the longest field,
+/// `uptime  365d 23:59:59`, plus a little slack.
+const STATUS_TEXT_WIDTH: u16 = 22;
+
+/// Cell columns the logo spans at `rows` cell rows, keeping its aspect:
+/// terminal cells are about twice as tall as wide, so the 120×256 image
+/// needs `rows × 2 × 120 / 256` columns.
+fn logo_cols(rows: u16) -> u16 {
+    ((u32::from(rows) * 2 * LOGO_W + LOGO_H / 2) / LOGO_H) as u16
+}
 
 /// Redraw cadence. Events are coalesced between frames (ingested as they arrive,
 /// painted on this tick), so a burst of thousands/sec costs one redraw per
@@ -483,6 +516,193 @@ fn notify_terminal(mode: NotifyMode, msg: &str) {
     let _ = out.flush();
 }
 
+/// Probe for the kitty graphics protocol (kitty, Ghostty, WezTerm, Konsole,
+/// foot, …): ask the terminal to load a dummy 1×1 image and race its reply
+/// against the primary device attributes — a graphics reply first means the
+/// protocol is supported, the spec's own detection recipe. Runs in the raw
+/// mode `ratatui::init` already set, before the event loop owns stdin.
+fn detect_graphics() -> bool {
+    use std::io::{IsTerminal, Write};
+    use std::os::fd::AsFd;
+
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    let mut out = std::io::stdout();
+    // GI query (dummy RGBA pixel) + primary DA: graphics-capable terminals
+    // answer the query immediately, before the DA reply.
+    if out
+        .write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c")
+        .is_err()
+    {
+        return false;
+    }
+    let _ = out.flush();
+
+    // A duplicate of the descriptor as a `File`: `Stdin` buffers, and could
+    // keep bytes past the reply where crossterm's reader never sees them.
+    let Ok(stdin) = std::io::stdin().as_fd().try_clone_to_owned() else {
+        return false;
+    };
+    read_probe_reply(std::fs::File::from(stdin), PROBE_TIMEOUT)
+}
+
+/// Read the probe's reply from `input`, on the calling thread so that no reader
+/// is left competing with the event loop for keys, and until the DA reply that
+/// always comes last: anything left unread would reach the key handler, where
+/// the reply's bytes decode as keystrokes. Keys typed during the probe go with
+/// it — they were pressed before the panels they would act on were drawn.
+/// A reply later than `timeout` still lands in the event loop.
+fn read_probe_reply(mut input: impl std::io::Read + std::os::fd::AsFd, timeout: Duration) -> bool {
+    use nix::errno::Errno;
+    use nix::poll::{poll, PollFd, PollFlags};
+
+    let deadline = Instant::now() + timeout;
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 64];
+    while !has_da_reply(&seen) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        // Rounded up, so the last fraction of a millisecond doesn't spin.
+        let millis = u16::try_from(left.as_millis() + 1).unwrap_or(u16::MAX);
+        let mut fds = [PollFd::new(input.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, millis) {
+            Ok(0) => break,
+            Ok(_) | Err(Errno::EINTR) => {}
+            Err(_) => break,
+        }
+        if !fds[0].revents().is_some_and(|r| !r.is_empty()) {
+            continue;
+        }
+        match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    has_graphics_reply(&seen)
+}
+
+/// Does the probe's accumulated reply contain a graphics answer (ESC _ G …)?
+/// Any answer — even an error — means the terminal speaks the protocol.
+fn has_graphics_reply(seen: &[u8]) -> bool {
+    find(seen, b"\x1b_G").is_some()
+}
+
+/// Does it contain a primary-device-attributes answer (ESC [ ? … c) — what a
+/// terminal without the graphics protocol replies with?
+fn has_da_reply(seen: &[u8]) -> bool {
+    find(seen, b"\x1b[?").is_some_and(|p| seen[p + 3..].contains(&b'c'))
+}
+
+/// First index of `needle` in `hay`.
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Transmit the logo PNG once, base64-chunked over the graphics protocol
+/// (`a=t` with an id, no placement yet — frames place it). `q=2` silences the
+/// acks; chunks stay well under any terminal's escape-length limit.
+fn transmit_logo() {
+    let b64 = base64(LOGO_PNG);
+    let bytes = b64.as_bytes();
+    let mut out = std::io::stdout();
+    let mut pos = 0;
+    let mut first = true;
+    while pos < bytes.len() {
+        let end = (pos + 4096).min(bytes.len());
+        let last = end == bytes.len();
+        let m = if last { 0 } else { 1 };
+        if first {
+            let _ = write!(
+                out,
+                "\x1b_Ga=t,i={LOGO_ID},f=100,q=2,m={m};{}\x1b\\",
+                String::from_utf8_lossy(&bytes[pos..end])
+            );
+        } else {
+            let _ = write!(
+                out,
+                "\x1b_Gm={m};{}\x1b\\",
+                String::from_utf8_lossy(&bytes[pos..end])
+            );
+        }
+        pos = end;
+        first = false;
+    }
+    let _ = out.flush();
+}
+
+/// Place the transmitted logo (see [`transmit_logo`]) at the rect the last
+/// frame recorded, in cells: cursor to the top-left cell, then the placement
+/// command with the cell rectangle — the terminal letterboxes the PNG into
+/// it, so the aspect ratio survives. `q=2` keeps the terminal from acking on
+/// stdin; the cursor is hidden, so the placement's cursor move is invisible
+/// and the next frame repositions it anyway. A frame with no room for the logo
+/// takes the placement down — the terminal would keep showing it otherwise —
+/// but keeps the image data (lowercase `d=i`) for when it fits again.
+fn place_logo(out: &mut impl IoWrite, app: &mut App) {
+    match app.logo_place {
+        Some(rect) => {
+            let _ = write!(
+                out,
+                "\x1b[{};{}H\x1b_Ga=p,i={LOGO_ID},p=1,q=2,c={},r={}\x1b\\",
+                rect.y + 1,
+                rect.x + 1,
+                rect.width,
+                rect.height
+            );
+            app.logo_placed = true;
+        }
+        None if app.logo_placed => {
+            let _ = write!(out, "\x1b_Ga=d,d=i,i={LOGO_ID},p=1,q=2\x1b\\");
+            app.logo_placed = false;
+        }
+        None => return,
+    }
+    let _ = out.flush();
+}
+
+/// Free the transmitted logo on the way out — the uppercase `d=I` drops the
+/// image data too. Runs while the alternate screen is still up, since images
+/// are per screen and the main one may hold another program's image under this
+/// id. `q=2` keeps any reply from landing on the shell's prompt after exit.
+fn delete_logo() {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b_Ga=d,d=I,i={LOGO_ID},q=2\x1b\\");
+    let _ = out.flush();
+}
+
+/// Standard base64 (RFC 4648) — the graphics protocol's payload encoding.
+/// Hand-rolled: it is all the protocol needs beyond the escapes themselves.
+fn base64(data: &[u8]) -> String {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TBL[(n >> 18) as usize] as char);
+        out.push(TBL[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TBL[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TBL[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// The monitor's UI state.
 pub struct App {
     vm: String,
@@ -545,6 +765,14 @@ pub struct App {
     pending_deny: Option<String>,
     /// The last quick-action's outcome, shown in the footer.
     notice: Option<Notice>,
+    /// Whether the terminal answered the graphics-protocol probe: the Status
+    /// logo is then transmitted once and placed as a real PNG over the panel.
+    graphics: bool,
+    /// Where the last frame put the Status logo — the graphics-protocol
+    /// placement rect, applied between frames.
+    logo_place: Option<Rect>,
+    /// Whether the terminal currently shows a logo placement.
+    logo_placed: bool,
     /// Set when the event stream closes (VM stopped).
     disconnected: bool,
     should_quit: bool,
@@ -593,6 +821,9 @@ impl App {
             notice: None,
             should_quit: false,
             disconnected: false,
+            graphics: false,
+            logo_place: None,
+            logo_placed: false,
         }
     }
 
@@ -978,7 +1209,17 @@ pub fn run(vm: &str) -> anyhow::Result<()> {
         // (ADR-0021); live events keep it current from here on.
         app.requests = fetch_requests(vm).await.unwrap_or_default();
         let mut terminal = ratatui::init();
+        // The Status logo: probe for the graphics protocol and, where it
+        // answers, transmit the PNG once — every frame places it.
+        app.graphics = detect_graphics();
+        if app.graphics {
+            transmit_logo();
+        }
         let res = event_loop(&mut terminal, &mut app, stream).await;
+        // Free the terminal's copy of the logo, on the screen that holds it.
+        if app.graphics {
+            delete_logo();
+        }
         ratatui::restore();
         res
     })
@@ -1249,7 +1490,7 @@ async fn event_loop(
     let mut keys = spawn_input_reader();
     let mut redraw = tokio::time::interval(REDRAW_INTERVAL);
 
-    terminal.draw(|f| draw(f, app))?;
+    draw_frame(terminal, app)?;
     loop {
         tokio::select! {
             ev = stream.recv(), if !app.disconnected => match ev {
@@ -1265,7 +1506,7 @@ async fn event_loop(
             },
             _ = redraw.tick() => {
                 app.prune_expired_requests(sodabox_common::event::now_ts());
-                terminal.draw(|f| draw(f, app))?;
+                draw_frame(terminal, app)?;
             }
         }
 
@@ -1403,6 +1644,18 @@ async fn event_loop(
         if app.should_quit {
             break;
         }
+    }
+    Ok(())
+}
+
+/// Paint one frame and, when the terminal speaks the graphics protocol, put
+/// the logo image over the cells the frame reserved for it. Repeating the
+/// same placement id every frame lets the terminal swap it in place without
+/// flicker — and follow resizes.
+fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+    terminal.draw(|f| draw(f, app))?;
+    if app.graphics {
+        place_logo(&mut std::io::stdout(), app);
     }
     Ok(())
 }
@@ -1677,7 +1930,7 @@ fn draw_panels(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Inference,
             app.unique,
         );
-        f.render_widget(status_panel(app), right[0]);
+        render_status_panel(f, right[0], app);
         render_gateway_panel(f, right[1], app);
         f.render_widget(footer(app), outer[2]);
         return;
@@ -1716,7 +1969,7 @@ fn draw_panels(f: &mut Frame, app: &mut App) {
         app.focus == Focus::Dns,
         app.unique,
     );
-    f.render_widget(status_panel(app), right[0]);
+    render_status_panel(f, right[0], app);
     render_policy_panel(f, right[1], app);
 
     f.render_widget(footer(app), outer[2]);
@@ -1945,7 +2198,8 @@ fn render_flow_panel(
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn status_panel(app: &App) -> Paragraph<'static> {
+/// The Status panel's lines: VM state, configured CPU/RAM, and uptime.
+fn status_lines(app: &App) -> Vec<Line<'static>> {
     let field = |k: &str| Span::styled(format!("{k:<8}"), Style::default().fg(Color::DarkGray));
     let state_color = match app.state.as_str() {
         "running" => Color::Green,
@@ -1958,7 +2212,7 @@ fn status_panel(app: &App) -> Paragraph<'static> {
         .unwrap_or_else(|| "?".into());
     let mem = app.mem.clone().unwrap_or_else(|| "?".into());
     let uptime = app.uptime().map(fmt_uptime).unwrap_or_else(|| "?".into());
-    let lines = vec![
+    vec![
         Line::from(vec![
             field("state"),
             Span::styled(app.state.clone(), Style::default().fg(state_color)),
@@ -1966,8 +2220,37 @@ fn status_panel(app: &App) -> Paragraph<'static> {
         Line::from(vec![field("cpu"), Span::raw(cpu)]),
         Line::from(vec![field("mem"), Span::raw(mem)]),
         Line::from(vec![field("uptime"), Span::raw(uptime)]),
-    ];
-    Paragraph::new(lines).block(Block::bordered().title(" Status "))
+    ]
+}
+
+/// The Status panel: the VM's state, configured CPU/RAM, and uptime beside
+/// the sodabox logo, which sits at the panel's right edge. The logo's height
+/// is constrained to the lines' — its placement rectangle is the panel's
+/// inner height, whatever that is. Terminals that don't answer the
+/// graphics-protocol probe get the fields alone.
+fn render_status_panel(f: &mut Frame, area: Rect, app: &mut App) {
+    let block = Block::bordered().title(" Status ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // The logo only where the status lines still fit beside it.
+    let cols = logo_cols(inner.height);
+    let logo_area = (cols > 0 && inner.width >= cols + 1 + STATUS_TEXT_WIDTH).then_some(Rect {
+        x: inner.x + inner.width - cols,
+        y: inner.y,
+        width: cols,
+        height: inner.height,
+    });
+    app.logo_place = if app.graphics { logo_area } else { None };
+    // The lines fill the left, one cell clear of the logo (or the whole panel).
+    let text = match logo_area {
+        Some(a) => Rect {
+            width: inner.width - a.width - 1,
+            ..inner
+        },
+        None => inner,
+    };
+    f.render_widget(Paragraph::new(status_lines(app)), text);
 }
 
 /// Policy panel: version header then one line per rule. When focused the border
@@ -3316,6 +3599,133 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The probe's reply classification: a graphics answer wins (even an
+    /// error — the protocol answered), a lone device-attributes answer means
+    /// no support.
+    #[test]
+    fn probe_replies_are_classified() {
+        // kitty-style: the graphics answer comes first, then the DA reply.
+        let both = b"\x1b_Gi=31;OK\x1b\\\x1b[?62;22c";
+        assert!(has_graphics_reply(both));
+        assert!(has_graphics_reply(b"\x1b_Gi=31;EBADF: nope\x1b\\"));
+        // A terminal without the protocol answers only the device attributes.
+        let da = b"\x1b[?62;22c";
+        assert!(!has_graphics_reply(da));
+        assert!(has_da_reply(da));
+        // The graphics check runs first, so a DA reply in the same stream
+        // doesn't turn support into its absence.
+        assert!(has_da_reply(both));
+    }
+
+    /// The probe consumes the reply through its final DA answer, even split
+    /// across reads, and leaves no reader behind: the next key stays on the
+    /// input for the event loop.
+    #[test]
+    fn the_probe_drains_its_reply_and_leaves_keys_alone() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut term, tui) = UnixStream::pair().unwrap();
+        term.write_all(b"\x1b_Gi=31;OK\x1b\\").unwrap();
+        let mut late = term.try_clone().unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            late.write_all(b"\x1b[?62;22c").unwrap();
+        });
+        assert!(read_probe_reply(&tui, Duration::from_secs(5)));
+        writer.join().unwrap();
+
+        term.write_all(b"j").unwrap();
+        let mut key = [0u8; 8];
+        let n = (&tui).read(&mut key).unwrap();
+        assert_eq!(&key[..n], b"j");
+    }
+
+    /// A lone DA answer ends the probe at once with no support, as does
+    /// silence once the timeout passes; a closed input doesn't hang it.
+    #[test]
+    fn the_probe_settles_without_a_graphics_reply() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let (mut term, tui) = UnixStream::pair().unwrap();
+        term.write_all(b"\x1b[?62;22c").unwrap();
+        let start = Instant::now();
+        assert!(!read_probe_reply(&tui, Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_secs(5));
+
+        let (term, tui) = UnixStream::pair().unwrap();
+        assert!(!read_probe_reply(&tui, Duration::from_millis(20)));
+
+        drop(term);
+        assert!(!read_probe_reply(&tui, Duration::from_secs(5)));
+    }
+
+    /// RFC 4648 test vectors — the graphics protocol's payload encoding.
+    #[test]
+    fn base64_matches_rfc4648() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// The logo's placement rectangle is the status lines' height, with the
+    /// fields flowing to its right — and nothing at all when the terminal
+    /// didn't answer the graphics-protocol probe.
+    #[test]
+    fn the_logo_is_constrained_to_the_status_lines() {
+        let mut a = app();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &mut a)).unwrap();
+        assert_eq!(a.logo_place, None);
+
+        a.graphics = true;
+        term.draw(|f| draw(f, &mut a)).unwrap();
+        // The panel's four lines → a 4×4-cell rectangle (the 120×256 PNG's
+        // aspect), flush against the panel's inner right edge.
+        assert_eq!(
+            a.logo_place,
+            Some(Rect {
+                x: 115,
+                y: 2,
+                width: 4,
+                height: 4
+            })
+        );
+        let buf = term.backend().buffer();
+        // The fields start at the panel's inner left.
+        assert_eq!(buf[(73, 2)].symbol(), "s");
+        assert_eq!(buf[(73, 5)].symbol(), "u");
+    }
+
+    /// At a width where the logo fits on the Inference tab's wider right column
+    /// but not on the Network tab's, switching tabs takes the placement down
+    /// once and keeps the image data; switching back places it again.
+    #[test]
+    fn a_logo_that_stops_fitting_leaves_the_screen() {
+        let mut a = app();
+        a.graphics = true;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 24)).unwrap();
+        let mut frame = |a: &mut App, tab| {
+            a.show_tab(tab);
+            term.draw(|f| draw(f, a)).unwrap();
+            let mut out = Vec::new();
+            place_logo(&mut out, a);
+            String::from_utf8(out).unwrap()
+        };
+
+        assert!(frame(&mut a, Tab::Inference).contains("a=p,i=1,p=1"));
+        assert_eq!(
+            frame(&mut a, Tab::Network),
+            "\x1b_Ga=d,d=i,i=1,p=1,q=2\x1b\\"
+        );
+        // Nothing left to take down on the frames after that.
+        assert_eq!(frame(&mut a, Tab::Network), "");
+        assert!(frame(&mut a, Tab::Inference).contains("a=p,i=1,p=1"));
     }
 
     #[test]
