@@ -865,7 +865,7 @@ fn resolve_vm(vm: Option<String>) -> anyhow::Result<String> {
 /// Load `<vm>`'s persisted policy, apply `mutate`, validate + version-bump, then
 /// **persist to `policy.toml` and, if the VM is running, push it live** over the
 /// control socket (ADR-0009/0006). `mutate` returns a human
-/// summary of what changed, or `Ok(None)` for a no-op (skip write + push).
+/// summary of what changed, or `Ok(None)` for a no-op (skip the write, still push).
 ///
 /// The persisted file is the source of truth; the live push is best-effort in the
 /// sense that a stopped VM simply picks the new policy up at next start. Validation
@@ -888,8 +888,11 @@ fn apply_edit(
     let _lock = PolicyFile::lock(vm)?;
     let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
     let Some(summary) = mutate(&mut file)? else {
+        // Nothing to save, but the file isn't necessarily live (a failed push, a
+        // hand edit), and repeating the command has to be able to repair that.
         println!("no change");
-        return Ok(());
+        let policy = file.policy().map_err(|e| anyhow::anyhow!(e))?;
+        return push_live(vm, &policy);
     };
 
     // Validate the whole policy compiles before persisting (fail-closed).
