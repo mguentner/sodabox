@@ -369,7 +369,7 @@ impl PolicyView {
 }
 
 /// Which panel the selection cursor is on. Egress/DNS are the flow panels (allow
-/// a just-blocked destination); Policy is the rule list (deny a selected
+/// a just-blocked destination); Policy is the rule list (revoke a selected
 /// rule). Inference (gateway requests) and Gateway (the alias table: grant
 /// tokens, switch metering) are on the Inference tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -920,9 +920,9 @@ pub struct App {
     policy_sel: Option<usize>,
     /// A quick-action requested this frame, applied (async) after the select.
     pending_allow: Option<AllowTarget>,
-    /// A deny quick-action (the target `spec` for `remove_matching`) requested on
+    /// A revoke quick-action (the target `spec` for `remove_matching`) requested on
     /// the Policy panel this frame, applied (async) after the select.
-    pending_deny: Option<String>,
+    pending_revoke: Option<String>,
     /// The last quick-action's outcome, shown in the footer.
     notice: Option<Notice>,
     /// Whether the terminal answered the graphics-protocol probe: the Status
@@ -978,7 +978,7 @@ impl App {
             focus: Focus::Egress,
             policy_sel: None,
             pending_allow: None,
-            pending_deny: None,
+            pending_revoke: None,
             notice: None,
             should_quit: false,
             disconnected: false,
@@ -1140,7 +1140,7 @@ impl App {
         });
     }
 
-    /// Keep the Policy cursor valid after the rule list changes (e.g. a deny
+    /// Keep the Policy cursor valid after the rule list changes (e.g. a revoke
     /// removed rows or a re-fetch shrank the list).
     fn clamp_policy_sel(&mut self) {
         let len = self.policy.rules.len();
@@ -1287,9 +1287,9 @@ impl App {
     }
 
     /// The `remove_matching` target for the highlighted rule (its IP cidr or
-    /// domain name), or why there is nothing to deny. Mirrors
-    /// [`App::selected_allow_target`] for the deny direction.
-    fn selected_deny_target(&self) -> Result<String, &'static str> {
+    /// domain name), or why there is nothing to revoke. Mirrors
+    /// [`App::selected_allow_target`] for the revoke direction.
+    fn selected_revoke_target(&self) -> Result<String, &'static str> {
         match self.selected_rule() {
             None => Err("select a rule first (↑/↓)"),
             Some(Rule::Ip { cidr, .. }) => Ok(cidr.clone()),
@@ -1494,14 +1494,14 @@ fn save_bumped(vm: &str, file: &mut PolicyFile) -> anyhow::Result<VmPolicy> {
     file.policy().map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Apply a deny quick-action: remove every rule matching `spec` from
+/// Apply a revoke quick-action: remove every rule matching `spec` from
 /// `vm`'s persisted policy, validate, version-bump, save `policy.toml`, and push
 /// the whole new policy live via `PolicySet` — the same edit-then-push path as
-/// `soda deny`, so the file and the live allowlist never split-brain (the live
+/// `soda revoke`, so the file and the live allowlist never split-brain (the live
 /// swap also purges a removed domain's ephemerals). Returns the new policy
 /// (so the panel refreshes without a round trip) and a human summary. A `spec`
 /// that matches nothing short-circuits with no version bump.
-async fn apply_deny(vm: &str, spec: &str) -> anyhow::Result<(VmPolicy, String)> {
+async fn apply_revoke(vm: &str, spec: &str) -> anyhow::Result<(VmPolicy, String)> {
     let _lock = PolicyFile::lock(vm)?;
     let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
     let removed = file.remove_matching(spec).map_err(|e| anyhow::anyhow!(e))?;
@@ -1529,7 +1529,7 @@ async fn apply_deny(vm: &str, spec: &str) -> anyhow::Result<(VmPolicy, String)> 
             let plural = if removed == 1 { "rule" } else { "rules" };
             Ok((
                 policy.clone(),
-                format!("denied {spec} ({removed} {plural}) (v{})", policy.version),
+                format!("revoked {spec} ({removed} {plural}) (v{})", policy.version),
             ))
         }
         Response::Error { msg } => anyhow::bail!("supervisor rejected: {msg}"),
@@ -1717,10 +1717,10 @@ async fn event_loop(
             }
         }
 
-        // A deny quick-action on the Policy panel (`d`/Enter): remove + push live,
+        // A revoke quick-action on the Policy panel (`d`/Enter): remove + push live,
         // then reflect the result in the footer and refresh the panel.
-        if let Some(spec) = app.pending_deny.take() {
-            match apply_deny(&app.vm, &spec).await {
+        if let Some(spec) = app.pending_revoke.take() {
+            match apply_revoke(&app.vm, &spec).await {
                 Ok((policy, summary)) => {
                     app.policy = PolicyView::from(policy);
                     app.clamp_policy_sel();
@@ -1880,7 +1880,7 @@ struct KeyPress {
 /// switch panel within the tab (`Tab`), move the cursor (`↑`/`↓`, `k`/`j`),
 /// toggle the unique view of the flow panels (`u`). On the Egress/DNS panels
 /// `a`/Enter allows the highlighted blocked destination; on the Policy panel
-/// `d`/Enter denies the highlighted rule; on the Gateway panel `g`/Enter grants
+/// `d`/Enter revokes the highlighted rule; on the Gateway panel `g`/Enter grants
 /// tokens to the highlighted alias and `m` switches it between limited and
 /// unlimited. While the grant prompt or the allow popup is open, keys edit it
 /// instead.
@@ -1912,7 +1912,7 @@ fn handle_key(app: &mut App, k: KeyPress) {
             Focus::Requests => app.request_select(1),
             _ => app.select_newer(),
         },
-        // `a` allows (Egress/DNS/Requests); `d` denies (Policy/Requests);
+        // `a` allows (Egress/DNS/Requests); `d` revokes (Policy) or denies (Requests);
         // `g` grants and `m` switches metering (Gateway); `n` cycles the
         // pending-request notification mode (off|notification|bell|all).
         // Enter is "act on the selection".
@@ -1926,12 +1926,12 @@ fn handle_key(app: &mut App, k: KeyPress) {
         }
         KeyCode::Char('a') if matches!(app.focus, Focus::Egress | Focus::Dns) => request_allow(app),
         KeyCode::Char('a') if app.focus == Focus::Requests => request_resolve(app, true),
-        KeyCode::Char('d') if app.focus == Focus::Policy => request_deny(app),
+        KeyCode::Char('d') if app.focus == Focus::Policy => request_revoke(app),
         KeyCode::Char('d') if app.focus == Focus::Requests => request_resolve(app, false),
         KeyCode::Char('g') if app.focus == Focus::Gateway => open_grant_prompt(app),
         KeyCode::Char('m') if app.focus == Focus::Gateway => request_metering(app),
         KeyCode::Enter => match app.focus {
-            Focus::Policy => request_deny(app),
+            Focus::Policy => request_revoke(app),
             Focus::Gateway => open_grant_prompt(app),
             Focus::Egress | Focus::Dns => request_allow(app),
             Focus::Requests => request_resolve(app, true),
@@ -2071,10 +2071,10 @@ fn request_allow(app: &mut App) {
     }
 }
 
-/// Queue a deny of the highlighted policy rule, or surface why it can't.
-fn request_deny(app: &mut App) {
-    match app.selected_deny_target() {
-        Ok(spec) => app.pending_deny = Some(spec),
+/// Queue a revoke of the highlighted policy rule, or surface why it can't.
+fn request_revoke(app: &mut App) {
+    match app.selected_revoke_target() {
+        Ok(spec) => app.pending_revoke = Some(spec),
         Err(msg) => {
             app.notice = Some(Notice {
                 text: msg.to_string(),
@@ -2697,7 +2697,7 @@ fn footer(app: &App) -> Paragraph<'static> {
     let action = match app.focus {
         Focus::Egress | Focus::Dns => "a allow  ",
         Focus::Requests => "a approve  d deny  ",
-        Focus::Policy => "d deny  ",
+        Focus::Policy => "d revoke  ",
         Focus::Gateway => "g grant  m unlimited/limited  ",
         Focus::Inference => "",
     };
@@ -3911,7 +3911,7 @@ mod tests {
     }
 
     #[test]
-    fn deny_target_is_the_selected_rules_ip_or_domain() {
+    fn revoke_target_is_the_selected_rules_ip_or_domain() {
         let mut a = app_with_rules(vec![
             ip_rule("203.0.113.0/24"),
             Rule::Domain {
@@ -3923,13 +3923,13 @@ mod tests {
         ]);
         a.focus = Focus::Policy;
         // Nothing selected yet -> declined gracefully.
-        assert!(a.selected_deny_target().is_err());
+        assert!(a.selected_revoke_target().is_err());
 
         a.policy_select(1); // first rule (ip)
-        assert_eq!(a.selected_deny_target(), Ok("203.0.113.0/24".to_string()));
+        assert_eq!(a.selected_revoke_target(), Ok("203.0.113.0/24".to_string()));
 
-        a.policy_select(1); // second rule (domain) -> its name is the deny spec
-        assert_eq!(a.selected_deny_target(), Ok("example.com".to_string()));
+        a.policy_select(1); // second rule (domain) -> its name is the revoke spec
+        assert_eq!(a.selected_revoke_target(), Ok("example.com".to_string()));
     }
 
     fn egress_to(daddr: &str, dport: u16, verdict: Verdict, ts: u64) -> Event {
@@ -4100,7 +4100,7 @@ mod tests {
         a.policy_select(1);
         a.policy_select(1);
         assert_eq!(a.policy_sel, Some(1));
-        // Simulate a deny removing the last rule; the cursor clamps into range.
+        // Simulate a revoke removing the last rule; the cursor clamps into range.
         a.policy = PolicyView {
             version: 2,
             rules: vec![ip_rule("10.0.0.0/8")],

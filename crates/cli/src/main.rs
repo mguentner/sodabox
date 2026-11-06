@@ -157,8 +157,8 @@ enum Cmd {
         #[command(subcommand)]
         what: AllowWhat,
     },
-    /// remove/deny a rule from a VM's egress policy
-    Deny {
+    /// remove an allow rule from a VM's egress policy
+    Revoke {
         rule: String,
         #[arg(long, add = ArgValueCandidates::new(complete::vms))]
         vm: Option<String>,
@@ -381,7 +381,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Stop { name } => stop(&name),
         Cmd::Ls => ls(),
         Cmd::Allow { what } => allow(what),
-        Cmd::Deny { rule, vm } => deny(&rule, vm),
+        Cmd::Revoke { rule, vm } => revoke(&rule, vm),
         Cmd::Policy { action } => policy(action),
         Cmd::Profile { action } => match action {
             ProfileAction::Ls => profile::ls(),
@@ -1027,13 +1027,13 @@ fn allow(what: AllowWhat) -> anyhow::Result<()> {
     }
 }
 
-/// `soda deny <rule>` — remove matching rule(s) (persist + push live).
-fn deny(rule: &str, vm: Option<String>) -> anyhow::Result<()> {
+/// `soda revoke <rule>` — remove matching rule(s) (persist + push live).
+fn revoke(rule: &str, vm: Option<String>) -> anyhow::Result<()> {
     let vm = resolve_vm(vm)?;
     apply_edit(&vm, |p| {
         let n = p.remove_matching(rule).map_err(|e| anyhow::anyhow!(e))?;
         if n == 0 {
-            anyhow::bail!("no allow rule matching '{rule}' — nothing to deny");
+            anyhow::bail!("no allow rule matching '{rule}' — nothing to revoke");
         }
         Ok(Some(format!("removed {n} rule(s) matching '{rule}'")))
     })

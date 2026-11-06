@@ -289,7 +289,7 @@ impl VmPolicy {
 
     /// Remove every rule whose target matches `spec`: an [`Rule::Ip`] whose `cidr`
     /// equals `spec`, or a [`Rule::Domain`] whose `name` equals `spec`
-    /// (the `deny` verb). Returns how many rules were removed.
+    /// (the `revoke` verb). Returns how many rules were removed.
     pub fn remove_matching(&mut self, spec: &str) -> usize {
         let before = self.rules.len();
         self.rules.retain(|r| r.target() != spec);
@@ -386,7 +386,7 @@ pub enum ModelChange {
 }
 
 impl Rule {
-    /// What `soda deny <spec>` matches: the CIDR, domain or service name.
+    /// What `soda revoke <spec>` matches: the CIDR, domain or service name.
     pub fn target(&self) -> &str {
         match self {
             Rule::Ip { cidr, .. } => cidr,
@@ -429,7 +429,7 @@ impl Rule {
 
 /// Header written into a freshly-created `policy.toml`.
 pub const POLICY_HEADER: &str =
-    "# sodabox egress policy (deny-by-default). Edit via `soda allow/deny/policy edit`.\n\
+    "# sodabox egress policy (deny-by-default). Edit via `soda allow/revoke/policy edit`.\n\
      # `version` is managed automatically — it bumps on every change.\n";
 
 /// How long [`PolicyFile::lock`] waits for another writer. Writers hold the lock
@@ -1005,7 +1005,7 @@ mod tests {
         assert!(reparsed.rules[0].validate().is_ok());
         assert!(Allowlist::from_policy(&reparsed).is_ok());
 
-        // `soda deny <name>` removes it like any other rule.
+        // `soda revoke <name>` removes it like any other rule.
         assert_eq!(file.remove_matching("example.com"), Ok(1));
     }
 

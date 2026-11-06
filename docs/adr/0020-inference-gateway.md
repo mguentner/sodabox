@@ -410,7 +410,7 @@ soda quota unlimited [<alias>] [--vm <vm>]      # no alias: the whole VM
 soda quota limited [<alias>] [--vm <vm>]
 soda gateway enable|disable [--vm <vm>]   # the [gateway] section
 soda allow service inference [--vm <vm>]  # the access rule
-soda deny inference [--vm <vm>]           # removes the access rule
+soda revoke inference [--vm <vm>]         # removes the access rule
 ```
 
 - An **Inference tab** in the existing per-VM `soda tui` (ADR-0009), next to
@@ -421,7 +421,7 @@ soda deny inference [--vm <vm>]           # removes the access rule
     footer. Like `soda quota grant`, it appends to the ledger and has the
     gateway re-read it.
   - `m` switches the alias between limited and unlimited, with the same
-    persist-then-push path as allow/deny.
+    persist-then-push path as allow/revoke.
   - Adding, re-pointing and removing aliases stay with `soda model`, since
     they need several fields typed in.
 - `soda provider test` checks a provider before a VM depends on it: it fetches

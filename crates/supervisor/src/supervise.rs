@@ -1120,7 +1120,7 @@ impl ControlHandler for SupervisorState {
     }
 
     fn deny(&self, _rule: &str) -> Result<(), String> {
-        Err("use `soda deny …` (it edits policy.toml and pushes PolicySet)".to_string())
+        Err("use `soda revoke …` (it edits policy.toml and pushes PolicySet)".to_string())
     }
 
     fn stop(&self) {

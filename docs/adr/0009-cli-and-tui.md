@@ -36,7 +36,7 @@ soda stop <vm>
 soda ls
 soda allow ip <cidr> [--ports …] [--vm <vm>]
 soda allow domain <name> [--exact|--wildcard] [--vm <vm>]
-soda deny <rule>
+soda revoke <rule>
 soda policy show|edit|push
 soda tui <vm>          # live monitor
 soda logs <vm>

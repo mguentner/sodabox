@@ -73,7 +73,7 @@ EphemeralAllow { ip, ports?, proto?, expires_at, origin_domain }
 
 ### Runtime updates
 
-- CLI verbs: `soda allow ip …`, `soda allow domain …`, `soda deny …`,
+- CLI verbs: `soda allow ip …`, `soda allow domain …`, `soda revoke …`,
   `soda policy show|edit|push`, scoped to a VM.
 - The CLI writes the persisted policy **and** pushes the new version to the
   running supervisor over the control socket; the supervisor atomically swaps the
