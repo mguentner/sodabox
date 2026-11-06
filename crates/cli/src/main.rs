@@ -260,6 +260,7 @@ enum AllowWhat {
 enum PolicyAction {
     Show(PolicyTarget),
     Edit(PolicyTarget),
+    Push(PolicyTarget),
 }
 
 #[derive(Args)]
@@ -877,7 +878,6 @@ fn apply_edit(
     vm: &str,
     mutate: impl FnOnce(&mut sodabox_common::policy::PolicyFile) -> anyhow::Result<Option<String>>,
 ) -> anyhow::Result<()> {
-    use sodabox_common::allowlist::Allowlist;
     use sodabox_common::policy::PolicyFile;
 
     // A VM must exist to have a policy (catches typos before we write a file).
@@ -895,7 +895,21 @@ fn apply_edit(
         return push_live(vm, &policy);
     };
 
-    // Validate the whole policy compiles before persisting (fail-closed).
+    let policy = validate_and_save(vm, &mut file)?;
+    println!("{summary}");
+    println!("persisted policy v{} for '{vm}'", policy.version);
+
+    push_live(vm, &policy)
+}
+
+/// Check that the whole policy compiles (fail-closed), then bump its version and
+/// write it. The caller holds the policy lock.
+fn validate_and_save(
+    vm: &str,
+    file: &mut sodabox_common::policy::PolicyFile,
+) -> anyhow::Result<sodabox_common::policy::VmPolicy> {
+    use sodabox_common::allowlist::Allowlist;
+
     let policy = file
         .policy()
         .map_err(|e| anyhow::anyhow!("invalid policy after edit: {e}"))?;
@@ -907,11 +921,7 @@ fn apply_edit(
     file.set_version(policy.version + 1);
     file.save(vm)
         .map_err(|e| anyhow::anyhow!("writing policy.toml: {e}"))?;
-    let policy = file.policy().map_err(|e| anyhow::anyhow!(e))?;
-    println!("{summary}");
-    println!("persisted policy v{} for '{vm}'", policy.version);
-
-    push_live(vm, &policy)
+    file.policy().map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Push `policy` to the running supervisor via `PolicySet`. If the VM is not
@@ -1051,12 +1061,29 @@ fn profile_add(names: &[String], vm: Option<String>) -> anyhow::Result<()> {
     })
 }
 
-/// `soda policy show|edit`.
+/// `soda policy show|edit|push`.
 fn policy(action: PolicyAction) -> anyhow::Result<()> {
     match action {
         PolicyAction::Show(t) => policy_show(resolve_vm(t.vm)?),
         PolicyAction::Edit(t) => policy_edit(resolve_vm(t.vm)?),
+        PolicyAction::Push(t) => policy_push(resolve_vm(t.vm)?),
     }
+}
+
+/// Apply `policy.toml` as it stands, for a file changed outside `soda`. The
+/// version always bumps, since a hand edit leaves it alone and the live version
+/// is how `policy show` and the TUI notice a change.
+fn policy_push(vm: String) -> anyhow::Result<()> {
+    use sodabox_common::policy::PolicyFile;
+
+    if !sodabox_common::vm::VmMeta::path(&vm).is_file() {
+        anyhow::bail!("no such VM '{vm}' — run `soda create {vm}` first");
+    }
+    let _lock = PolicyFile::lock(&vm)?;
+    let mut file = PolicyFile::load(&vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
+    let policy = validate_and_save(&vm, &mut file)?;
+    println!("persisted policy v{} for '{vm}'", policy.version);
+    push_live(&vm, &policy)
 }
 
 /// Print the persisted `policy.toml` as written (comments, including profile
