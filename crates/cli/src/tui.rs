@@ -29,9 +29,9 @@
 //!
 //! Quick-actions: the focused flow panel has a selectable cursor
 //! (`Tab` switches panels, `↑`/`↓` move it), and `a`/`Enter` allows the
-//! highlighted **blocked** destination on the spot — an egress `BLOCK` becomes
-//! an `ip` allow of its proto and dst:port, a DNS `REFUSED` becomes a `resolve`
-//! allow of its name. Like `soda allow`, that edits `policy.toml` and pushes
+//! highlighted **blocked** destination — an egress `BLOCK` becomes an `ip` allow
+//! of its proto and dst:port on the spot, a DNS `REFUSED` opens a popup asking
+//! what its name should grant (ADR-0021). Like `soda allow`, that edits `policy.toml` and pushes
 //! the whole new policy via `PolicySet` (the supervisor rejects raw single-rule edits so the
 //! CLI stays the sole writer of `policy.toml`); the result shows in the footer.
 //! While a row is held the panel is frozen on it: new events land below the
@@ -61,10 +61,11 @@ use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind,
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use tokio::sync::mpsc;
 
+use sodabox_common::allowlist::{is_public_ip, PortSpec};
 use sodabox_common::event::{DnsVerdict, Event, Verdict};
 use sodabox_common::paths;
 use sodabox_common::policy::{
@@ -81,6 +82,11 @@ use sodabox_supervisor::control::{ControlClient, EventStream};
 const PANEL_CAPACITY: usize = 2048;
 /// The longest name a request row shows (see [`name_tail`]).
 const MAX_VIA_CHARS: usize = 32;
+/// The allow popup's widest: the choices then fit on one line, with room for
+/// some ports.
+const POPUP_WIDTH: u16 = 88;
+/// The longest port list the allow popup takes.
+const MAX_PORT_FIELD: usize = 64;
 
 /// The sodabox logo (`assets/logo_120x256.png`), embedded for the Status
 /// panel: transmitted once over the kitty graphics protocol and placed over
@@ -403,6 +409,158 @@ enum AllowTarget {
         port: u16,
         proto: String,
     },
+    /// The name and what it resolves to (subdomains scope), on these ports: one
+    /// `domain` rule per grant.
+    Domain { name: String, grants: Vec<Grant> },
+}
+
+/// The ports and protocol of one `domain` rule; `None` means any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Grant {
+    ports: Option<String>,
+    proto: Option<String>,
+}
+
+impl Grant {
+    fn new(ports: Option<&str>, proto: Option<&str>) -> Grant {
+        Grant {
+            ports: ports.map(str::to_string),
+            proto: proto.map(str::to_string),
+        }
+    }
+}
+
+/// The choices of the allow popup, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllowChoice {
+    /// What the row grants with no name involved: see [`AllowPopup::narrow`].
+    Narrow,
+    Https,
+    HttpHttps,
+    AllPorts,
+    Tcp,
+    Udp,
+}
+
+const ALLOW_CHOICES: [AllowChoice; 6] = [
+    AllowChoice::Narrow,
+    AllowChoice::Https,
+    AllowChoice::HttpHttps,
+    AllowChoice::AllPorts,
+    AllowChoice::Tcp,
+    AllowChoice::Udp,
+];
+
+/// The popup asking what allowing a name should grant (ADR-0021), open over the
+/// panels until confirmed or cancelled.
+struct AllowPopup {
+    /// The held request being decided; `None` for a refused row on the DNS panel,
+    /// which has nothing to release.
+    request: Option<PendingRequest>,
+    /// The name a `domain` rule would be for.
+    name: String,
+    /// The narrowest grant: resolving the name, or the row's own IP and port.
+    narrow: AllowTarget,
+    choice: AllowChoice,
+    tcp_ports: String,
+    udp_ports: String,
+    /// Why the last confirm was turned down.
+    error: Option<String>,
+}
+
+impl AllowPopup {
+    /// A popup for `name`, with the choice that grants the row what it asks for
+    /// preselected: HTTPS for a dns row, else the row's own port.
+    fn new(request: Option<PendingRequest>, name: String, narrow: AllowTarget) -> AllowPopup {
+        let mut popup = AllowPopup {
+            request,
+            name,
+            narrow,
+            choice: AllowChoice::Https,
+            tcp_ports: String::new(),
+            udp_ports: String::new(),
+            error: None,
+        };
+        if let AllowTarget::Flow { port, proto, .. } = &popup.narrow {
+            let (port, proto) = (*port, proto.clone());
+            let tcp = proto == "tcp";
+            popup.choice = match port {
+                443 => AllowChoice::Https,
+                80 if tcp => AllowChoice::HttpHttps,
+                _ if tcp => AllowChoice::Tcp,
+                _ => AllowChoice::Udp,
+            };
+            if tcp {
+                popup.tcp_ports = port.to_string();
+            } else {
+                popup.udp_ports = port.to_string();
+            }
+        }
+        popup
+    }
+
+    /// The port field under the cursor, if the choice has one.
+    fn field(&mut self) -> Option<&mut String> {
+        match self.choice {
+            AllowChoice::Tcp => Some(&mut self.tcp_ports),
+            AllowChoice::Udp => Some(&mut self.udp_ports),
+            _ => None,
+        }
+    }
+
+    /// Move the cursor along the choices, wrapping around.
+    fn step(&mut self, forward: bool) {
+        let n = ALLOW_CHOICES.len();
+        let at = ALLOW_CHOICES
+            .iter()
+            .position(|c| *c == self.choice)
+            .unwrap_or(0);
+        self.choice = ALLOW_CHOICES[(at + if forward { 1 } else { n - 1 }) % n];
+        self.error = None;
+    }
+
+    /// What the current choice would add. An empty port field is refused here:
+    /// the policy reads no ports as *any* port, which is its own choice.
+    fn target(&self) -> Result<AllowTarget, String> {
+        let domain = |grants| AllowTarget::Domain {
+            name: self.name.clone(),
+            grants,
+        };
+        let listed = |ports: &str, proto| {
+            let ports = ports.trim();
+            if ports.is_empty() {
+                return Err("enter ports, e.g. 443,8000-8100".to_string());
+            }
+            PortSpec::parse(Some(ports))?;
+            Ok(domain(vec![Grant::new(Some(ports), Some(proto))]))
+        };
+        match self.choice {
+            AllowChoice::Narrow => Ok(self.narrow.clone()),
+            // No proto on 443: HTTP/3 is HTTPS too, and runs over UDP.
+            AllowChoice::Https => Ok(domain(vec![Grant::new(Some("443"), None)])),
+            AllowChoice::HttpHttps => Ok(domain(vec![
+                Grant::new(Some("80"), Some("tcp")),
+                Grant::new(Some("443"), None),
+            ])),
+            AllowChoice::AllPorts => Ok(domain(vec![Grant::new(None, None)])),
+            AllowChoice::Tcp => listed(&self.tcp_ports, "tcp"),
+            AllowChoice::Udp => listed(&self.udp_ports, "udp"),
+        }
+    }
+}
+
+/// The name a popup for `req` would offer a `domain` rule on, if any: a dns row's
+/// own name, or the name an address came from. An address with no recent lookup
+/// has no name to offer, and a non-public one can't be opened through a name, so
+/// those rows approve directly.
+fn request_allow_name(req: &PendingRequest) -> Option<String> {
+    match req.port {
+        None => Some(strip_trailing_dot(&req.destination)),
+        Some(_) => req
+            .via
+            .clone()
+            .filter(|_| req.destination.parse().is_ok_and(is_public_ip)),
+    }
 }
 
 /// The rule approving `req` adds (ADR-0021): resolving the name for a dns
@@ -723,7 +881,9 @@ pub struct App {
     /// Where `notify` persists.
     notify_path: PathBuf,
     /// A queued request verdict to apply after the select.
-    pending_resolve: Option<(PendingRequest, bool)>,
+    pending_resolve: Option<(PendingRequest, Option<AllowTarget>)>,
+    /// The allow popup, when open: it takes the keys and covers the panels.
+    allow_popup: Option<AllowPopup>,
     /// Set when `requests` may have missed events; re-fetched after the select.
     requests_dirty: bool,
     /// A notification to emit after the select (set by `ingest`).
@@ -799,6 +959,7 @@ impl App {
             notify: load_notify_from(&notify_path),
             notify_path,
             pending_resolve: None,
+            allow_popup: None,
             requests_dirty: false,
             notify_msg: None,
             tab: Tab::Network,
@@ -1275,6 +1436,20 @@ async fn apply_allow(vm: &str, target: &AllowTarget) -> anyhow::Result<(VmPolicy
                 .map_err(|e| anyhow::anyhow!(e))?,
             format!("allowed {proto} {ip}:{port}"),
         ),
+        AllowTarget::Domain { name, grants } => {
+            let mut added = false;
+            for g in grants {
+                added |= file
+                    .add_domain_for_proto(
+                        name,
+                        DomainScope::Subdomains,
+                        g.ports.as_deref(),
+                        g.proto.as_deref(),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            }
+            (added, format!("allowed {name}"))
+        }
     };
     if !added {
         // Already present — nothing to persist or push.
@@ -1380,28 +1555,36 @@ async fn fetch_requests(vm: &str) -> Option<Vec<PendingRequest>> {
     }
 }
 
-/// Apply a request verdict (ADR-0021): an **approve** first adds the persistent
-/// allowlist rule (the same quick-allow path as `soda allow` — approve *is* a
-/// rule, so the held flow proceeds through the normal allow path), then
-/// resolves the parked request over the control socket. A **deny** only
-/// resolves. Resolving an id that expired in between is `Ok` (idempotent), so an
-/// approve first checks the request is still pending: a stale row must not add a
-/// persistent rule or report an approval that admitted nothing.
+/// Apply a request verdict (ADR-0021): an **approve** (`target` is what it adds)
+/// first adds the persistent allowlist rule (the same quick-allow path as
+/// `soda allow` — approve *is* a rule, so the held flow proceeds through the
+/// normal allow path), then resolves the parked request over the control socket.
+/// A **deny** only resolves. Resolving an id that expired in between is `Ok`
+/// (idempotent), so an approve first checks the request is still pending: a stale
+/// row must not add a persistent rule or report an approval that admitted nothing.
 /// Returns the new policy on approve (so the panel refreshes) and a summary.
 async fn apply_resolve(
     vm: &str,
     req: &PendingRequest,
-    allow: bool,
+    target: Option<&AllowTarget>,
 ) -> anyhow::Result<(Option<VmPolicy>, String)> {
     let mut policy = None;
-    if allow {
+    let allow = target.is_some();
+    if let Some(target) = target {
         let live = fetch_requests(vm)
             .await
             .ok_or_else(|| anyhow::anyhow!("couldn't list pending requests"))?;
         if !live.iter().any(|r| r.id == req.id) {
             anyhow::bail!("request #{} is no longer pending", req.id);
         }
-        let (p, _) = apply_allow(vm, &request_allow_target(req)).await?;
+        let (p, summary) = apply_allow(vm, target).await?;
+        // A `domain` rule picked on an address row isn't resolved here: the sweep
+        // releases this row and its siblings once it has restored their permits,
+        // and only if the rule covers them. Approving now would fail the proxy's
+        // re-check.
+        if matches!(target, AllowTarget::Domain { .. }) && req.port.is_some() {
+            return Ok((Some(p), summary));
+        }
         policy = Some(p);
     }
 
@@ -1556,8 +1739,8 @@ async fn event_loop(
         // A request verdict (ADR-0021: `a`/Enter approves, `d` denies on the
         // Egress Requests panel): approve adds the rule then resolves the held
         // request over the control socket; deny just resolves.
-        if let Some((req, allow)) = app.pending_resolve.take() {
-            match apply_resolve(&app.vm, &req, allow).await {
+        if let Some((req, target)) = app.pending_resolve.take() {
+            match apply_resolve(&app.vm, &req, target.as_ref()).await {
                 Ok((policy, summary)) => {
                     if let Some(p) = policy {
                         app.policy = PolicyView::from(p);
@@ -1697,10 +1880,15 @@ struct KeyPress {
 /// `a`/Enter allows the highlighted blocked destination; on the Policy panel
 /// `d`/Enter denies the highlighted rule; on the Gateway panel `g`/Enter grants
 /// tokens to the highlighted alias and `m` switches it between limited and
-/// unlimited. While the grant prompt is open, keys edit it instead.
+/// unlimited. While the grant prompt or the allow popup is open, keys edit it
+/// instead.
 fn handle_key(app: &mut App, k: KeyPress) {
     if app.prompt.is_some() {
         prompt_key(app, k);
+        return;
+    }
+    if app.allow_popup.is_some() {
+        allow_popup_key(app, k);
         return;
     }
     match k.code {
@@ -1784,6 +1972,45 @@ fn prompt_key(app: &mut App, k: KeyPress) {
     }
 }
 
+/// Keys while the allow popup is open: `←`/`→` or `Tab` move between the choices,
+/// typing edits the port field of TCP and UDP, Enter confirms, Esc cancels.
+fn allow_popup_key(app: &mut App, k: KeyPress) {
+    let Some(popup) = app.allow_popup.as_mut() else {
+        return;
+    };
+    match k.code {
+        KeyCode::Esc => app.allow_popup = None,
+        KeyCode::Char('c') if k.mods.contains(KeyModifiers::CONTROL) => app.allow_popup = None,
+        KeyCode::Left | KeyCode::BackTab => popup.step(false),
+        KeyCode::Right | KeyCode::Tab => popup.step(true),
+        KeyCode::Backspace => {
+            if let Some(field) = popup.field() {
+                field.pop();
+            }
+            popup.error = None;
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() || c == ',' || c == '-' => {
+            if let Some(field) = popup.field() {
+                if field.len() < MAX_PORT_FIELD {
+                    field.push(c);
+                }
+            }
+            popup.error = None;
+        }
+        KeyCode::Enter => match popup.target() {
+            Err(e) => popup.error = Some(e),
+            Ok(target) => {
+                match popup.request.take() {
+                    Some(req) => app.pending_resolve = Some((req, Some(target))),
+                    None => app.pending_allow = Some(target),
+                }
+                app.allow_popup = None;
+            }
+        },
+        _ => {}
+    }
+}
+
 /// Open the grant prompt for the highlighted alias.
 fn open_grant_prompt(app: &mut App) {
     match app.selected_alias() {
@@ -1826,6 +2053,11 @@ fn request_metering(app: &mut App) {
 /// Queue an allow of the highlighted blocked flow, or surface why it can't.
 fn request_allow(app: &mut App) {
     match app.selected_allow_target() {
+        // A refused name: ask what allowing it should grant.
+        Ok(AllowTarget::Resolve(name)) => {
+            let narrow = AllowTarget::Resolve(name.clone());
+            app.allow_popup = Some(AllowPopup::new(None, name, narrow));
+        }
         // Defer the actual edit+push to the async loop; capture the target now.
         Ok(target) => app.pending_allow = Some(target),
         Err(msg) => {
@@ -1853,10 +2085,17 @@ fn request_deny(app: &mut App) {
 /// Queue an approve (`allow == true`) or deny of the highlighted pending
 /// egress request (ADR-0021). Applied in the async loop: an approve first adds
 /// the persistent rule (the quick-allow path), then resolves the request over
-/// the control socket.
+/// the control socket. Approving a row with a name asks what to grant first.
 fn request_resolve(app: &mut App, allow: bool) {
     match app.selected_request() {
-        Some(req) => app.pending_resolve = Some((req, allow)),
+        Some(req) if !allow => app.pending_resolve = Some((req, None)),
+        Some(req) => {
+            let narrow = request_allow_target(&req);
+            match request_allow_name(&req) {
+                Some(name) => app.allow_popup = Some(AllowPopup::new(Some(req), name, narrow)),
+                None => app.pending_resolve = Some((req, Some(narrow))),
+            }
+        }
         None => {
             app.notice = Some(Notice {
                 text: "no pending request selected".into(),
@@ -1886,6 +2125,11 @@ fn request_resolve(app: &mut App, allow: bool) {
 /// whichever panel the text landed in.
 fn draw(f: &mut Frame, app: &mut App) {
     draw_panels(f, app);
+    if let Some(popup) = &app.allow_popup {
+        render_allow_popup(f, popup);
+        // The logo is an image above the cells, and would cover the popup.
+        app.logo_place = None;
+    }
     for cell in &mut f.buffer_mut().content {
         if cell.symbol().contains(char::is_control) {
             cell.set_symbol("?");
@@ -1973,6 +2217,113 @@ fn draw_panels(f: &mut Frame, app: &mut App) {
     render_policy_panel(f, right[1], app);
 
     f.render_widget(footer(app), outer[2]);
+}
+
+/// The allow popup, centered over the panels (see [`AllowPopup`]).
+fn render_allow_popup(f: &mut Frame, popup: &AllowPopup) {
+    let chosen = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+    let hint = Style::default().fg(Color::DarkGray);
+
+    let mut options = Vec::new();
+    for choice in ALLOW_CHOICES {
+        if !options.is_empty() {
+            options.push(Span::styled(" | ", hint));
+        }
+        let selected = choice == popup.choice;
+        let cursor = if selected { "▏" } else { "" };
+        let label = match choice {
+            AllowChoice::Narrow => match popup.narrow {
+                AllowTarget::Flow { .. } => "This IP:port only".to_string(),
+                _ => "Resolve only".to_string(),
+            },
+            AllowChoice::Https => "HTTPS".to_string(),
+            AllowChoice::HttpHttps => "HTTP+HTTPS".to_string(),
+            AllowChoice::AllPorts => "all ports".to_string(),
+            AllowChoice::Tcp => format!("TCP [{}{cursor}]", popup.tcp_ports),
+            AllowChoice::Udp => format!("UDP [{}{cursor}]", popup.udp_ports),
+        };
+        options.push(if selected {
+            Span::styled(format!(" {label} "), chosen)
+        } else {
+            Span::raw(format!(" {label} "))
+        });
+    }
+    let options = Line::from(options);
+
+    let bottom = match &popup.error {
+        Some(e) => Line::from(Span::styled(
+            format!(" {e}"),
+            Style::default().fg(Color::Red),
+        )),
+        None if matches!(popup.choice, AllowChoice::Tcp | AllowChoice::Udp) => {
+            Line::from(Span::styled(
+                " type ports, e.g. 443,8000-8100 · ←/→ choose · Esc cancel",
+                hint,
+            ))
+        }
+        None => Line::from(Span::styled(
+            " ←/→ choose · Enter confirm · Esc cancel",
+            hint,
+        )),
+    };
+
+    let area = f.area();
+    let width = area.width.min(POPUP_WIDTH);
+    let inner_width = width.saturating_sub(2).max(1);
+    let option_rows = (options.width() as u16).div_ceil(inner_width) + 1;
+    let height = area.height.min(option_rows + 4);
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+
+    let what = match (&popup.narrow, &popup.request) {
+        (AllowTarget::Flow { ip, port, proto }, _) => {
+            format!("{proto} {ip}:{port} via {}", name_tail(&popup.name))
+        }
+        _ => name_tail(&popup.name),
+    };
+    let mut title = vec![Span::raw(format!(" allow {what} "))];
+    if let Some(req) = &popup.request {
+        let remaining = req
+            .expires_ts
+            .saturating_sub(sodabox_common::event::now_ts());
+        title.push(Span::styled(
+            format!("{remaining}s "),
+            Style::default().fg(ttl_color(remaining)),
+        ));
+    }
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Line::from(title));
+
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    f.render_widget(Paragraph::new(options).wrap(Wrap { trim: true }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "[confirm] ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .alignment(ratatui::layout::Alignment::Right),
+        rows[1],
+    );
+    f.render_widget(Paragraph::new(bottom), rows[2]);
 }
 
 fn header(app: &App) -> Paragraph<'static> {
@@ -2723,18 +3074,296 @@ mod tests {
         press(&mut a, KeyCode::Char('k'));
         assert_eq!(a.request_sel, Some(1));
 
+        // An address with no recent lookup has no name to ask about.
         press(&mut a, KeyCode::Enter);
+        assert!(a.allow_popup.is_none());
         assert_eq!(
-            a.pending_resolve.as_ref().map(|(r, allow)| (r.id, *allow)),
+            a.pending_resolve
+                .as_ref()
+                .map(|(r, target)| (r.id, target.is_some())),
             Some((1, true))
         );
         a.pending_resolve = None;
 
         press(&mut a, KeyCode::Char('j'));
         press(&mut a, KeyCode::Char('d'));
+        assert!(a.allow_popup.is_none());
         assert_eq!(
-            a.pending_resolve.as_ref().map(|(r, allow)| (r.id, *allow)),
+            a.pending_resolve
+                .as_ref()
+                .map(|(r, target)| (r.id, target.is_some())),
             Some((2, false))
+        );
+    }
+
+    /// The Requests panel with one held address row selected.
+    fn app_with_address_row(destination: &str, port: u16, proto: &str, via: Option<&str>) -> App {
+        let mut a = app();
+        a.ingest(Event::RequestPending {
+            ts: 0,
+            id: 1,
+            proto: proto.into(),
+            destination: destination.into(),
+            port: Some(port),
+            via: via.map(Into::into),
+            expires_ts: 30,
+        });
+        a.focus = Focus::Requests;
+        a.request_sel = Some(1);
+        a
+    }
+
+    fn domain_target(name: &str, grants: &[(Option<&str>, Option<&str>)]) -> AllowTarget {
+        AllowTarget::Domain {
+            name: name.into(),
+            grants: grants.iter().map(|(p, t)| Grant::new(*p, *t)).collect(),
+        }
+    }
+
+    /// `a` then Enter is the common case: a dns row opens with HTTPS picked, TCP
+    /// and UDP on 443 alike, and queues it against the held request.
+    #[test]
+    fn approving_a_dns_row_asks_with_https_preselected() {
+        let mut a = app();
+        a.ingest(request_pending(0, 7, "dns"));
+        a.focus = Focus::Requests;
+        a.request_sel = Some(7);
+
+        press(&mut a, KeyCode::Char('a'));
+        assert_eq!(a.allow_popup.as_ref().unwrap().choice, AllowChoice::Https);
+        assert!(a.pending_resolve.is_none());
+        press(&mut a, KeyCode::Enter);
+        assert!(a.allow_popup.is_none());
+        let (req, target) = a.pending_resolve.take().unwrap();
+        assert_eq!(req.id, 7);
+        assert_eq!(
+            target,
+            Some(domain_target("maybe.test", &[(Some("443"), None)]))
+        );
+    }
+
+    #[test]
+    fn each_choice_grants_what_it_says() {
+        let popup = |choice| AllowPopup {
+            choice,
+            ..AllowPopup::new(
+                None,
+                "maybe.test".into(),
+                AllowTarget::Resolve("maybe.test".into()),
+            )
+        };
+        assert_eq!(
+            popup(AllowChoice::Narrow).target(),
+            Ok(AllowTarget::Resolve("maybe.test".into()))
+        );
+        assert_eq!(
+            popup(AllowChoice::HttpHttps).target(),
+            Ok(domain_target(
+                "maybe.test",
+                &[(Some("80"), Some("tcp")), (Some("443"), None)]
+            ))
+        );
+        assert_eq!(
+            popup(AllowChoice::AllPorts).target(),
+            Ok(domain_target("maybe.test", &[(None, None)]))
+        );
+    }
+
+    /// An empty field would read as any port, so it and malformed lists are
+    /// refused in place. The popup stays open and nothing is queued.
+    #[test]
+    fn port_fields_take_only_a_valid_list() {
+        let mut a = app();
+        a.ingest(request_pending(0, 7, "dns"));
+        a.focus = Focus::Requests;
+        a.request_sel = Some(7);
+        press(&mut a, KeyCode::Enter);
+        // HTTPS → HTTP+HTTPS → all ports → TCP.
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Right);
+        }
+        assert_eq!(a.allow_popup.as_ref().unwrap().choice, AllowChoice::Tcp);
+
+        press(&mut a, KeyCode::Enter);
+        assert!(a.allow_popup.as_ref().unwrap().error.is_some());
+        assert!(a.pending_resolve.is_none());
+
+        for c in ['8', ',', ',', 'x', 'q'] {
+            press(&mut a, KeyCode::Char(c));
+        }
+        assert_eq!(a.allow_popup.as_ref().unwrap().tcp_ports, "8,,");
+        press(&mut a, KeyCode::Enter);
+        assert!(a.allow_popup.as_ref().unwrap().error.is_some());
+        assert!(a.pending_resolve.is_none());
+
+        press(&mut a, KeyCode::Backspace);
+        press(&mut a, KeyCode::Backspace);
+        for c in ",9-10".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(
+            a.pending_resolve.take().unwrap().1,
+            Some(domain_target(
+                "maybe.test",
+                &[(Some("8,9-10"), Some("tcp"))]
+            ))
+        );
+    }
+
+    /// Keys stay in the popup: Esc closes it rather than the TUI, arrows don't
+    /// switch tabs, and nothing is queued on the way out.
+    #[test]
+    fn the_popup_holds_the_keys_until_cancelled() {
+        let mut a = app();
+        a.ingest(request_pending(0, 7, "dns"));
+        a.focus = Focus::Requests;
+        a.request_sel = Some(7);
+        press(&mut a, KeyCode::Enter);
+        for code in [KeyCode::Right, KeyCode::Left, KeyCode::Char('q')] {
+            press(&mut a, code);
+        }
+        assert!(a.allow_popup.is_some() && a.tab == Tab::Network && !a.should_quit);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.allow_popup.is_none() && !a.should_quit);
+        assert!(a.pending_resolve.is_none());
+    }
+
+    /// An address row's popup offers the row itself or its name, preselecting a
+    /// choice that covers the row and is on the row's own port.
+    #[test]
+    fn an_address_row_preselects_a_choice_covering_it() {
+        let opened = |port, proto| {
+            let mut a = app_with_address_row("203.0.113.5", port, proto, Some("www.example.com"));
+            press(&mut a, KeyCode::Char('a'));
+            a.allow_popup.unwrap()
+        };
+        assert_eq!(opened(443, "tcp").choice, AllowChoice::Https);
+        assert_eq!(opened(443, "udp").choice, AllowChoice::Https);
+        assert_eq!(opened(80, "tcp").choice, AllowChoice::HttpHttps);
+        assert_eq!(opened(80, "udp").choice, AllowChoice::Udp);
+        let ssh = opened(22, "tcp");
+        assert_eq!(
+            (ssh.choice, ssh.tcp_ports.as_str()),
+            (AllowChoice::Tcp, "22")
+        );
+        assert_eq!(
+            ssh.target(),
+            Ok(domain_target(
+                "www.example.com",
+                &[(Some("22"), Some("tcp"))]
+            ))
+        );
+
+        let mut narrow = opened(22, "tcp");
+        narrow.choice = AllowChoice::Narrow;
+        assert_eq!(
+            narrow.target(),
+            Ok(AllowTarget::Flow {
+                ip: "203.0.113.5".into(),
+                port: 22,
+                proto: "tcp".into(),
+            })
+        );
+    }
+
+    /// A rule on a name can't open a non-public address, so offering one would
+    /// leave the row waiting. It approves directly, like a row with no name.
+    #[test]
+    fn a_non_public_address_row_approves_directly() {
+        let mut a = app_with_address_row("192.168.1.1", 443, "tcp", Some("www.example.com"));
+        press(&mut a, KeyCode::Char('a'));
+        assert!(a.allow_popup.is_none());
+        assert_eq!(
+            a.pending_resolve.take().unwrap().1,
+            Some(AllowTarget::Flow {
+                ip: "192.168.1.1".into(),
+                port: 443,
+                proto: "tcp".into(),
+            })
+        );
+    }
+
+    /// A refused row on the DNS panel has no held request: the choice goes
+    /// straight to the policy.
+    #[test]
+    fn a_refused_dns_row_asks_too() {
+        let mut a = app();
+        a.ingest(Event::Dns {
+            ts: 0,
+            verdict: DnsVerdict::Refused,
+            qname: "www.example.com.".into(),
+            answers: Vec::new(),
+            ttl: 0,
+        });
+        a.focus = Focus::Dns;
+        a.dns.sel = Some(0);
+        press(&mut a, KeyCode::Char('a'));
+        assert!(a.pending_allow.is_none());
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(
+            a.pending_allow.take(),
+            Some(domain_target("www.example.com", &[(Some("443"), None)]))
+        );
+        assert!(a.pending_resolve.is_none());
+    }
+
+    /// The popup shows the labels and takes the logo down while open, since the
+    /// logo is an image above the cells. Guest-chosen text in it gets scrubbed.
+    #[test]
+    fn the_popup_renders_over_the_panels_and_hides_the_logo() {
+        let mut a = app();
+        a.graphics = true;
+        a.ingest(Event::RequestPending {
+            ts: 0,
+            id: 7,
+            proto: "dns".into(),
+            destination: "x\u{1b}]52;c;Zm9v\u{7}.evil.test".into(),
+            port: None,
+            via: None,
+            expires_ts: 30,
+        });
+        a.focus = Focus::Requests;
+        a.request_sel = Some(7);
+        press(&mut a, KeyCode::Enter);
+
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &mut a)).unwrap();
+        assert_eq!(a.logo_place, None);
+        let buf = term.backend().buffer();
+        let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+        for label in [
+            "Resolve only",
+            "HTTPS",
+            "HTTP+HTTPS",
+            "all ports",
+            "TCP [",
+            "UDP [",
+            "[confirm]",
+        ] {
+            assert!(text.contains(label), "{label} missing from {text:?}");
+        }
+        assert!(!text.contains(char::is_control));
+
+        press(&mut a, KeyCode::Esc);
+        term.draw(|f| draw(f, &mut a)).unwrap();
+        assert!(a.logo_place.is_some());
+
+        // A narrow terminal wraps the choices rather than losing them.
+        press(&mut a, KeyCode::Enter);
+        let mut narrow =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 24)).unwrap();
+        narrow.draw(|f| draw(f, &mut a)).unwrap();
+        let text: String = narrow
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("UDP [") && text.contains("[confirm]"),
+            "{text:?}"
         );
     }
 

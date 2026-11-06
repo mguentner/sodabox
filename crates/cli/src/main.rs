@@ -240,6 +240,10 @@ enum AllowWhat {
         exact: bool,
         #[arg(long, group = "scope")]
         wildcard: bool,
+        #[arg(long)]
+        ports: Option<String>,
+        #[arg(long, value_parser = ["tcp", "udp"])]
+        proto: Option<String>,
         #[arg(long, add = ArgValueCandidates::new(complete::vms))]
         vm: Option<String>,
     },
@@ -960,6 +964,8 @@ fn allow(what: AllowWhat) -> anyhow::Result<()> {
             name,
             exact,
             wildcard,
+            ports,
+            proto,
             vm,
         } => {
             let vm = resolve_vm(vm)?;
@@ -972,9 +978,19 @@ fn allow(what: AllowWhat) -> anyhow::Result<()> {
             };
             apply_edit(&vm, |p| {
                 let added = p
-                    .add_domain(&name, scope, None)
+                    .add_domain_for_proto(&name, scope, ports.as_deref(), proto.as_deref())
                     .map_err(|e| anyhow::anyhow!(e))?;
-                Ok(added.then(|| format!("allow domain {name} ({scope:?})")))
+                Ok(added.then(|| {
+                    let ps = ports
+                        .as_deref()
+                        .map(|p| format!(" ports {p}"))
+                        .unwrap_or_default();
+                    let pr = proto
+                        .as_deref()
+                        .map(|p| format!(" proto {p}"))
+                        .unwrap_or_default();
+                    format!("allow domain {name} ({scope:?}){ps}{pr}")
+                }))
             })
         }
         AllowWhat::Service { name, vm } => {
@@ -1290,6 +1306,20 @@ fn confirm(question: &str) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allow_domain_takes_ports_and_a_known_proto() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["soda", "allow", "domain", "example.com"]
+                    .iter()
+                    .chain(args),
+            )
+        };
+        assert!(parse(&["--ports", "80,443", "--proto", "tcp"]).is_ok());
+        assert!(parse(&["--proto", "udp", "--exact"]).is_ok());
+        assert!(parse(&["--proto", "icmp"]).is_err());
+    }
 
     #[test]
     fn log_tail_returns_last_n_lines() {

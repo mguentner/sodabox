@@ -60,6 +60,57 @@ impl Decision {
     }
 }
 
+/// Whether `ip` may enter the ephemeral set: the address is one on the public
+/// internet, not the host, its LAN or a link-local service such as a cloud
+/// metadata endpoint. Whoever controls a name picks what it resolves to, so a
+/// DNS answer alone must not open these (ADR-0021). An `ip` rule still can.
+/// IPv6 forms that embed an IPv4 address are judged by that address.
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || a == 0
+                || a >= 240
+                // Shared address space (CGNAT), RFC 6598.
+                || (a == 100 && (64..128).contains(&b))
+                // Benchmarking, RFC 2544.
+                || (a == 198 && (b == 18 || b == 19)))
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let embedded = |hi: u16, lo: u16| {
+                is_public_ip(IpAddr::V4(std::net::Ipv4Addr::from(
+                    (u32::from(hi) << 16) | u32::from(lo),
+                )))
+            };
+            match s {
+                // IPv4-mapped (::ffff:0:0/96) and NAT64 (64:ff9b::/96).
+                [0, 0, 0, 0, 0, 0xffff, hi, lo] | [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => {
+                    embedded(hi, lo)
+                }
+                // 6to4 (2002::/16).
+                [0x2002, hi, lo, ..] => embedded(hi, lo),
+                _ => {
+                    !(v6.is_unspecified()
+                        || v6.is_loopback()
+                        || v6.is_multicast()
+                        // Unique local (fc00::/7).
+                        || (s[0] & 0xfe00) == 0xfc00
+                        // Link-local (fe80::/10) and the old site-local (fec0::/10).
+                        || (s[0] & 0xff80) == 0xfe80
+                        || (s[0] & 0xffc0) == 0xfec0)
+                }
+            }
+        }
+    }
+}
+
 /// A set of TCP/UDP ports: `None` means "any port".
 #[derive(Debug, Clone, Default)]
 pub struct PortSpec {
@@ -393,6 +444,47 @@ mod tests {
             cidr: cidr.into(),
             ports: ports.map(Into::into),
             proto: proto.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn only_public_addresses_count_as_public() {
+        for ip in [
+            "93.184.216.34",
+            "203.0.113.5",
+            "172.32.0.1",
+            "100.128.0.1",
+            "2606:4700::1111",
+            "::ffff:93.184.216.34",
+            "64:ff9b::5db8:d822",
+            "2002:5db8:d822::1",
+        ] {
+            assert!(is_public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "0.0.0.0",
+            "10.1.2.3",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fc00::1",
+            "fd00:ec2::254",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
+            "::ffff:192.168.1.1",
+            "64:ff9b::a9fe:a9fe",
+            "2002:c0a8:101::1",
+        ] {
+            assert!(!is_public_ip(ip.parse().unwrap()), "{ip}");
         }
     }
 

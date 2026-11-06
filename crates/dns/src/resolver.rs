@@ -20,7 +20,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use sodabox_common::allowlist::{EphemeralEntry, SharedAllowlist};
+use sodabox_common::allowlist::{is_public_ip, EphemeralEntry, Proto, SharedAllowlist};
 use sodabox_common::event::{now_ts, DnsVerdict, Event};
 use sodabox_common::policy::{Limits, VmPolicy};
 use sodabox_common::request::{PendingRequests, RequestVerdict, REQUEST_TTL};
@@ -36,6 +36,9 @@ use crate::wire::{
 /// Grace added to every ephemeral TTL to absorb the race between a DNS answer
 /// and the guest's connection using it.
 const TTL_GRACE: Duration = Duration::from_secs(5);
+/// How long a permit restored from a remembered lookup lasts. Short: it only
+/// spares repeat connections the check, and the next one simply restores it.
+const READMIT_TTL: Duration = Duration::from_secs(60);
 /// How long to wait for an upstream reply before trying the next one.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -188,11 +191,22 @@ fn answer_ip(a: &wire::Answer) -> Option<String> {
     }
 }
 
-/// Admit `answers`' A/AAAA IPs into the ephemeral set and collect the records to
-/// return to the guest. Returns the admitted answers.
+/// The rules granting `name`, owned so they can outlive the lock. A poisoned lock
+/// means a writer panicked mid-swap: no rules, so the name is treated as unlisted
+/// (fail closed).
+fn rules_for(domains: &SharedDomainAllowlist, name: &str) -> Vec<DomainRule> {
+    domains
+        .read()
+        .map(|d| d.matches(name).into_iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Admit `answers`' A/AAAA IPs into the ephemeral set, once per rule that admits
+/// (each with its own ports and proto), and collect the records to return to the
+/// guest. Returns the admitted answers.
 fn admit(
     allowlist: &SharedAllowlist,
-    rule: &DomainRule,
+    rules: &[DomainRule],
     answers: &[wire::Rr],
     limits: &Limits,
 ) -> Vec<wire::Answer> {
@@ -229,17 +243,21 @@ fn admit(
         // guest (no point handing it addresses the proxy will refuse). A
         // `resolve` rule admits nothing: the guest gets the address, and the
         // proxy holds whatever it dials there as its own request (ADR-0021).
-        let admitted = !rule.admits
-            || al.try_insert_ephemeral(
-                EphemeralEntry {
-                    ip,
-                    ports: rule.ports.clone(),
-                    proto: rule.proto,
-                    expiry: now + Duration::from_secs(ttl as u64) + TTL_GRACE,
-                    domain: rule.name.clone(),
-                },
-                limits,
-            );
+        // Nor does a non-public address, whatever the rule: the name's owner
+        // picks its records, so the user decides on those one by one.
+        let admitted = !is_public_ip(ip)
+            || rules.iter().filter(|r| r.admits).all(|rule| {
+                al.try_insert_ephemeral(
+                    EphemeralEntry {
+                        ip,
+                        ports: rule.ports.clone(),
+                        proto: rule.proto,
+                        expiry: now + Duration::from_secs(ttl as u64) + TTL_GRACE,
+                        domain: rule.name.clone(),
+                    },
+                    limits,
+                )
+            });
         if !admitted {
             break;
         }
@@ -253,6 +271,48 @@ fn admit(
         });
     }
     out
+}
+
+/// Restore the permit for an address `name` returned earlier, if a `domain` rule
+/// on that name covers the connection (ADR-0021). The address's permit can be
+/// missing though the rule stands: applications cache answers past their TTL, and
+/// a lookup made before the rule existed admitted nothing. Returns whether a
+/// permit was added; the same limits apply as for a fresh answer.
+pub fn readmit_remembered(
+    allowlist: &SharedAllowlist,
+    domains: &SharedDomainAllowlist,
+    limits: &Limits,
+    name: &str,
+    dst: SocketAddr,
+    proto: Proto,
+) -> bool {
+    if !is_public_ip(dst.ip()) {
+        return false;
+    }
+    let covering: Vec<DomainRule> = rules_for(domains, name)
+        .into_iter()
+        .filter(|r| r.admits && r.proto.map_or(true, |p| p == proto))
+        .filter(|r| r.ports.contains(dst.port()))
+        .collect();
+    let Ok(mut al) = allowlist.write() else {
+        return false;
+    };
+    let now = Instant::now();
+    al.prune_expired(now);
+    let mut added = false;
+    for rule in covering {
+        added |= al.try_insert_ephemeral(
+            EphemeralEntry {
+                ip: dst.ip(),
+                ports: rule.ports,
+                proto: rule.proto,
+                expiry: now + READMIT_TTL,
+                domain: rule.name,
+            },
+            limits,
+        );
+    }
+    added
 }
 
 impl QueryHandler for FilteringResolver {
@@ -292,11 +352,7 @@ impl QueryHandler for FilteringResolver {
         // Filter: match synchronously, before any upstream work. A
         // poisoned lock means a writer panicked mid-swap; fail closed (refuse)
         // rather than trust a possibly-inconsistent set.
-        let matched = self
-            .domains
-            .read()
-            .ok()
-            .and_then(|d| d.matches(&name).cloned());
+        let matched = rules_for(&self.domains, &name);
         let allowlist = self.allowlist.clone();
         let domains = self.domains.clone();
         let pending = self.pending.clone();
@@ -311,7 +367,7 @@ impl QueryHandler for FilteringResolver {
             // leaks to the host resolver (the ADR-0005 anti-exfil property
             // holds); retransmissions coalesce in the request table.
             let mut matched = matched;
-            if matched.is_none() {
+            if matched.is_empty() {
                 if let Some(pending) = &pending {
                     let (_, rx) = pending.hold("dns", &name, None);
                     if matches!(
@@ -320,11 +376,11 @@ impl QueryHandler for FilteringResolver {
                     ) {
                         // Approve *is* a persistent rule: re-read the (just
                         // updated) domain allowlist, exactly like the live swap.
-                        matched = domains.read().ok().and_then(|d| d.matches(&name).cloned());
+                        matched = rules_for(&domains, &name);
                     }
                 }
             }
-            let Some(rule) = matched else {
+            if matched.is_empty() {
                 // Not allowlisted -> REFUSED (anti-exfil). Report the blocked
                 // query so the TUI/log can surface exfil attempts.
                 events.emit(Event::Dns {
@@ -335,7 +391,7 @@ impl QueryHandler for FilteringResolver {
                     ttl: 0,
                 });
                 return Response::Packet(wire::build_response(&query, RCODE_REFUSED, &[]));
-            };
+            }
 
             // Resolve. An upstream failure is an infrastructure error,
             // not a filter verdict, so it emits no allowed/refused event.
@@ -349,7 +405,7 @@ impl QueryHandler for FilteringResolver {
             // Admit only for address queries; other types are forwarded
             // as-is without touching the egress set.
             let answers = if qtype == TYPE_A || qtype == TYPE_AAAA {
-                admit(&allowlist, &rule, &parsed.answers, &limits)
+                admit(&allowlist, &matched, &parsed.answers, &limits)
             } else {
                 Vec::new()
             };
@@ -386,7 +442,7 @@ impl QueryHandler for FilteringResolver {
 mod tests {
     use super::*;
     use crate::events::ChannelEvents;
-    use sodabox_common::allowlist::{shared, Allowlist, Proto};
+    use sodabox_common::allowlist::{shared, Allowlist};
     use sodabox_common::policy::{DomainScope, Rule, VmPolicy};
 
     #[test]
@@ -438,21 +494,140 @@ mod tests {
             ..VmPolicy::default()
         };
         let al = shared(Allowlist::from_policy(&pol).unwrap());
-        let domains = DomainAllowlist::from_policy(&pol).unwrap();
-        let rule = domains.matches("www.allowed.test").unwrap().clone();
+        let domains = domain::shared(DomainAllowlist::from_policy(&pol).unwrap());
+        let rules = rules_for(&domains, "www.allowed.test");
         let answers = vec![wire::Rr {
             name: "www.allowed.test".into(),
             ttl: 60,
             data: RData::A("203.0.113.10".parse().unwrap()),
         }];
 
-        assert_eq!(admit(&al, &rule, &answers, &Limits::default()).len(), 1);
+        assert_eq!(admit(&al, &rules, &answers, &Limits::default()).len(), 1);
         let decision = al.read().unwrap().evaluate(
             "203.0.113.10:443".parse().unwrap(),
             Proto::Tcp,
             Instant::now(),
         );
         assert_eq!(decision, sodabox_common::allowlist::Decision::Deny);
+    }
+
+    /// A non-public answer still reaches the guest, but opens nothing: connecting
+    /// to it is a request of its own, while the public one in the same answer is
+    /// admitted as usual.
+    #[test]
+    fn a_domain_rule_does_not_admit_non_public_answers() {
+        let pol = VmPolicy {
+            rules: vec![Rule::Domain {
+                name: "allowed.test".into(),
+                scope: DomainScope::Subdomains,
+                ports: None,
+                proto: None,
+            }],
+            ..VmPolicy::default()
+        };
+        let al = shared(Allowlist::from_policy(&pol).unwrap());
+        let domains = domain::shared(DomainAllowlist::from_policy(&pol).unwrap());
+        let rules = rules_for(&domains, "allowed.test");
+        let record = |ip: &str| wire::Rr {
+            name: "allowed.test".into(),
+            ttl: 60,
+            data: RData::A(ip.parse().unwrap()),
+        };
+        let answers = vec![record("169.254.169.254"), record("203.0.113.10")];
+
+        assert_eq!(admit(&al, &rules, &answers, &Limits::default()).len(), 2);
+        let allowed = |dst: &str| {
+            al.read()
+                .unwrap()
+                .evaluate(dst.parse().unwrap(), Proto::Tcp, Instant::now())
+                .is_allow()
+        };
+        assert!(!allowed("169.254.169.254:80"));
+        assert!(allowed("203.0.113.10:80"));
+    }
+
+    /// A remembered address gets its permit back only where a `domain` rule on
+    /// its name covers the connection, and never for a non-public address.
+    #[test]
+    fn readmitting_needs_a_covering_rule_and_a_public_address() {
+        let pol = VmPolicy {
+            rules: vec![
+                Rule::Domain {
+                    name: "allowed.test".into(),
+                    scope: DomainScope::Subdomains,
+                    ports: Some("443".into()),
+                    proto: Some("tcp".into()),
+                },
+                Rule::Resolve {
+                    name: "named.test".into(),
+                    scope: DomainScope::Subdomains,
+                },
+            ],
+            ..VmPolicy::default()
+        };
+        let al = shared(Allowlist::from_policy(&pol).unwrap());
+        let domains = domain::shared(DomainAllowlist::from_policy(&pol).unwrap());
+        let readmit = |name: &str, dst: &str, proto| {
+            readmit_remembered(
+                &al,
+                &domains,
+                &Limits::default(),
+                name,
+                dst.parse().unwrap(),
+                proto,
+            )
+        };
+
+        assert!(!readmit("allowed.test", "203.0.113.10:80", Proto::Tcp));
+        assert!(!readmit("allowed.test", "203.0.113.10:443", Proto::Udp));
+        assert!(!readmit("named.test", "203.0.113.10:443", Proto::Tcp));
+        assert!(!readmit("other.test", "203.0.113.10:443", Proto::Tcp));
+        assert!(!readmit("allowed.test", "192.168.1.1:443", Proto::Tcp));
+        assert_eq!(al.read().unwrap().ephemeral_len(), 0);
+
+        assert!(readmit("www.allowed.test", "203.0.113.10:443", Proto::Tcp));
+        let decision = al.read().unwrap().evaluate(
+            "203.0.113.10:443".parse().unwrap(),
+            Proto::Tcp,
+            Instant::now(),
+        );
+        assert!(decision.is_allow());
+    }
+
+    /// Two rules for one name both reach the proxy, each with its own ports and
+    /// proto, and one answer is still returned to the guest once.
+    #[test]
+    fn every_matching_rule_admits_its_own_ports() {
+        let rule = |ports: &str, proto: &str| Rule::Domain {
+            name: "allowed.test".into(),
+            scope: DomainScope::Subdomains,
+            ports: Some(ports.into()),
+            proto: Some(proto.into()),
+        };
+        let pol = VmPolicy {
+            rules: vec![rule("443", "tcp"), rule("53", "udp")],
+            ..VmPolicy::default()
+        };
+        let al = shared(Allowlist::from_policy(&pol).unwrap());
+        let domains = domain::shared(DomainAllowlist::from_policy(&pol).unwrap());
+        let rules = rules_for(&domains, "allowed.test");
+        let answers = vec![wire::Rr {
+            name: "allowed.test".into(),
+            ttl: 60,
+            data: RData::A("203.0.113.10".parse().unwrap()),
+        }];
+
+        assert_eq!(admit(&al, &rules, &answers, &Limits::default()).len(), 1);
+        let allowed = |dst: &str, proto| {
+            al.read()
+                .unwrap()
+                .evaluate(dst.parse().unwrap(), proto, Instant::now())
+                .is_allow()
+        };
+        assert!(allowed("203.0.113.10:443", Proto::Tcp));
+        assert!(allowed("203.0.113.10:53", Proto::Udp));
+        assert!(!allowed("203.0.113.10:53", Proto::Tcp));
+        assert!(!allowed("203.0.113.10:443", Proto::Udp));
     }
 
     #[tokio::test]
@@ -882,7 +1057,7 @@ mod tests {
             ..VmPolicy::default()
         })
         .unwrap();
-        let rule = rule.matches("allowed.test").unwrap().clone();
+        let rule: Vec<DomainRule> = rule.matches("allowed.test").into_iter().cloned().collect();
         let limits = Limits {
             max_ephemeral_entries: 10,
             ttl_floor_s: 30,
@@ -934,7 +1109,7 @@ mod tests {
             ..VmPolicy::default()
         })
         .unwrap();
-        let rule = rule.matches("allowed.test").unwrap().clone();
+        let rule: Vec<DomainRule> = rule.matches("allowed.test").into_iter().cloned().collect();
         let limits = Limits {
             max_ephemeral_entries: 3,
             ttl_floor_s: 30,

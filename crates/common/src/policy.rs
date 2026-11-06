@@ -242,23 +242,34 @@ impl VmPolicy {
         scope: DomainScope,
         ports: Option<&str>,
     ) -> Result<bool, String> {
+        self.add_domain_for_proto(name, scope, ports, None)
+    }
+
+    /// [`Self::add_domain`], optionally limited to one protocol.
+    pub fn add_domain_for_proto(
+        &mut self,
+        name: &str,
+        scope: DomainScope,
+        ports: Option<&str>,
+        proto: Option<&str>,
+    ) -> Result<bool, String> {
         validate_domain(name)?;
+        // Parsing reads an empty list as any port, which nobody means by it.
+        if ports.is_some_and(|p| p.trim().is_empty()) {
+            return Err("empty port list".to_string());
+        }
         crate::allowlist::PortSpec::parse(ports)?;
-        let name = name.to_string();
-        let ports = ports.map(str::to_string);
-        let dup = self.rules.iter().any(|r| {
-            matches!(r, Rule::Domain { name: n, scope: s, ports: p, proto: None }
-                if *n == name && *s == scope && *p == ports)
-        });
-        if dup {
+        proto.map(crate::allowlist::Proto::parse).transpose()?;
+        let rule = Rule::Domain {
+            name: name.to_string(),
+            scope,
+            ports: ports.map(str::to_string),
+            proto: proto.map(str::to_string),
+        };
+        if self.rules.contains(&rule) {
             return Ok(false);
         }
-        self.rules.push(Rule::Domain {
-            name,
-            scope,
-            ports,
-            proto: None,
-        });
+        self.rules.push(rule);
         Ok(true)
     }
 
@@ -522,8 +533,19 @@ impl PolicyFile {
         scope: DomainScope,
         ports: Option<&str>,
     ) -> Result<bool, String> {
+        self.add_domain_for_proto(name, scope, ports, None)
+    }
+
+    /// [`VmPolicy::add_domain_for_proto`], applied to the document.
+    pub fn add_domain_for_proto(
+        &mut self,
+        name: &str,
+        scope: DomainScope,
+        ports: Option<&str>,
+        proto: Option<&str>,
+    ) -> Result<bool, String> {
         let mut p = self.policy()?;
-        if !p.add_domain(name, scope, ports)? {
+        if !p.add_domain_for_proto(name, scope, ports, proto)? {
             return Ok(false);
         }
         self.push_rule(p.rules.last().expect("just pushed"))?;
@@ -950,6 +972,38 @@ mod tests {
         assert_eq!(check("203.0.113.5:443", Proto::Tcp), Decision::AllowStatic);
         assert_eq!(check("203.0.113.5:80", Proto::Tcp), Decision::Deny);
         assert_eq!(check("203.0.113.5:443", Proto::Udp), Decision::Deny);
+    }
+
+    #[test]
+    fn domain_rules_can_be_limited_to_a_proto() {
+        let s = DomainScope::Subdomains;
+        let mut f = PolicyFile::new();
+        assert_eq!(
+            f.add_domain_for_proto("example.com", s, Some("443"), Some("tcp")),
+            Ok(true)
+        );
+        // Another proto or port is a rule of its own; the same one is not.
+        assert_eq!(
+            f.add_domain_for_proto("example.com", s, Some("443"), Some("tcp")),
+            Ok(false)
+        );
+        assert_eq!(
+            f.add_domain_for_proto("example.com", s, Some("443"), Some("udp")),
+            Ok(true)
+        );
+        assert_eq!(f.add_domain("example.com", s, Some("443")), Ok(true));
+        assert!(f
+            .add_domain_for_proto("example.com", s, Some("443"), Some("icmp"))
+            .is_err());
+        assert!(f
+            .add_domain_for_proto("example.com", s, Some(" "), None)
+            .is_err());
+        let parsed = PolicyFile::parse(&f.to_string()).unwrap().policy().unwrap();
+        assert_eq!(parsed.rules.len(), 3);
+        assert!(matches!(
+            &parsed.rules[0],
+            Rule::Domain { proto: Some(p), .. } if p == "tcp"
+        ));
     }
 
     #[test]

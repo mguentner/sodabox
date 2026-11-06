@@ -90,17 +90,20 @@ impl DomainAllowlist {
         Ok(DomainAllowlist { rules })
     }
 
-    /// Return the most-specific matching rule for `qname` (case-insensitive),
-    /// or `None` if the name is not allowlisted. "Most specific" = longest
-    /// matching rule name, so a rule for `api.example.com` wins over one for
-    /// `example.com`. A `domain` rule wins over any `resolve` rule: an approved
-    /// DNS request must not narrow what a written rule grants.
-    pub fn matches(&self, qname: &str) -> Option<&DomainRule> {
+    /// The rules granting `qname` (case-insensitive), empty if the name is not
+    /// allowlisted. Every matching `domain` rule applies, since the policy only
+    /// holds allows: a rule added for another port or a subdomain adds to what
+    /// is granted rather than replacing it. `resolve` rules count only when no
+    /// `domain` rule matches: an approved DNS request must not narrow what a
+    /// written rule grants.
+    pub fn matches(&self, qname: &str) -> Vec<&DomainRule> {
         let q = normalize(qname);
-        self.rules
-            .iter()
-            .filter(|r| r.matches(&q))
-            .max_by_key(|r| (r.admits, r.name.len()))
+        let matching = || self.rules.iter().filter(|r| r.matches(&q));
+        if matching().any(|r| r.admits) {
+            matching().filter(|r| r.admits).collect()
+        } else {
+            matching().collect()
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -159,52 +162,55 @@ mod tests {
             resolve("api.example.com"),
             resolve("other.test"),
         ]);
-        assert!(a.matches("api.example.com").unwrap().admits);
-        assert!(a.matches("www.example.com").unwrap().admits);
-        assert!(!a.matches("www.other.test").unwrap().admits);
+        assert!(a.matches("api.example.com").iter().all(|r| r.admits));
+        assert_eq!(a.matches("api.example.com").len(), 1);
+        assert!(a.matches("www.example.com")[0].admits);
+        assert!(!a.matches("www.other.test")[0].admits);
     }
 
     #[test]
     fn exact_scope() {
         let a = al(vec![domain_rule("example.com", DomainScope::Exact)]);
-        assert!(a.matches("example.com").is_some());
-        assert!(a.matches("EXAMPLE.COM.").is_some()); // case + trailing dot
-        assert!(a.matches("www.example.com").is_none());
+        assert!(!a.matches("example.com").is_empty());
+        assert!(!a.matches("EXAMPLE.COM.").is_empty()); // case + trailing dot
+        assert!(a.matches("www.example.com").is_empty());
     }
 
     #[test]
     fn subdomains_scope_includes_apex() {
         let a = al(vec![domain_rule("example.com", DomainScope::Subdomains)]);
-        assert!(a.matches("example.com").is_some());
-        assert!(a.matches("www.example.com").is_some());
-        assert!(a.matches("a.b.example.com").is_some());
-        assert!(a.matches("notexample.com").is_none());
-        assert!(a.matches("example.com.evil.test").is_none());
+        assert!(!a.matches("example.com").is_empty());
+        assert!(!a.matches("www.example.com").is_empty());
+        assert!(!a.matches("a.b.example.com").is_empty());
+        assert!(a.matches("notexample.com").is_empty());
+        assert!(a.matches("example.com.evil.test").is_empty());
     }
 
     #[test]
     fn wildcard_scope_excludes_apex() {
         let a = al(vec![domain_rule("example.com", DomainScope::Wildcard)]);
-        assert!(a.matches("example.com").is_none()); // apex not matched
-        assert!(a.matches("www.example.com").is_some());
+        assert!(a.matches("example.com").is_empty()); // apex not matched
+        assert!(!a.matches("www.example.com").is_empty());
     }
 
     #[test]
     fn default_deny_for_unlisted() {
         let a = al(vec![domain_rule("allowed.test", DomainScope::Subdomains)]);
-        assert!(a.matches("evil.test").is_none());
-        assert!(al(vec![]).matches("anything.test").is_none());
+        assert!(a.matches("evil.test").is_empty());
+        assert!(al(vec![]).matches("anything.test").is_empty());
     }
 
+    /// Rules add up: a second rule for a name or a subdomain must not take away
+    /// what an earlier one granted.
     #[test]
-    fn most_specific_rule_wins() {
+    fn every_matching_domain_rule_applies() {
         let a = al(vec![
             domain_rule("example.com", DomainScope::Subdomains),
+            domain_rule("example.com", DomainScope::Exact),
             domain_rule("api.example.com", DomainScope::Subdomains),
         ]);
-        assert_eq!(
-            a.matches("api.example.com").unwrap().name,
-            "api.example.com"
-        );
+        let names = |q| -> Vec<String> { a.matches(q).iter().map(|r| r.name.clone()).collect() };
+        assert_eq!(names("api.example.com"), ["example.com", "api.example.com"]);
+        assert_eq!(names("example.com"), ["example.com", "example.com"]);
     }
 }

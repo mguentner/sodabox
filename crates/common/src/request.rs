@@ -12,13 +12,14 @@
 //! normal allow path — the guest only ever observed latency.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use crate::allowlist::Proto;
 use crate::event::{now_ts, Event};
 
 /// How long a request is held before it is denied by expiry. Fixed (ADR-0021).
@@ -112,6 +113,12 @@ struct Entry {
 /// onto its broadcast ring).
 pub type EventSink = Arc<dyn Fn(Event) + Send + Sync>;
 
+/// Restores the permit for an address a name returned earlier, if a rule on that
+/// name covers the connection: `(name, destination, proto)` → restored. Set by
+/// the supervisor, which holds the domain rules. Must not call back into this
+/// table.
+pub type Readmit = Arc<dyn Fn(&str, SocketAddr, Proto) -> bool + Send + Sync>;
+
 /// The per-VM pending-request table. Cloning the `Shared` handle is how the
 /// supervisor, the proxies and the resolver all reach the same table (they run
 /// as tasks in one process, ADR-0007).
@@ -128,6 +135,8 @@ struct Inner {
     events: Mutex<Option<EventSink>>,
     /// What the resolver answered, for [`PendingRequest::via`].
     origins: Mutex<HashMap<IpAddr, Origin>>,
+    /// See [`Readmit`].
+    readmit: Mutex<Option<Readmit>>,
 }
 
 impl Default for Inner {
@@ -137,6 +146,7 @@ impl Default for Inner {
             next_id: Mutex::new(0),
             events: Mutex::new(None),
             origins: Mutex::new(HashMap::new()),
+            readmit: Mutex::new(None),
         }
     }
 }
@@ -152,6 +162,28 @@ impl PendingRequests {
     pub fn with_events(self, sink: EventSink) -> Self {
         *self.inner.events.lock().unwrap() = Some(sink);
         self
+    }
+
+    /// Set how remembered lookups restore permits (see [`Readmit`]). Separate from
+    /// construction because the rules it reads belong to the resolver, which is
+    /// built around this table.
+    pub fn set_readmit(&self, readmit: Readmit) {
+        *self.inner.readmit.lock().unwrap() = Some(readmit);
+    }
+
+    /// Try to restore the permit for an address request from the name remembered
+    /// for it. Returns whether one was restored.
+    pub fn readmit(&self, proto: &str, destination: &str, port: u16) -> bool {
+        let Some(readmit) = self.inner.readmit.lock().unwrap().clone() else {
+            return false;
+        };
+        let (Ok(ip), Ok(proto)) = (destination.parse::<IpAddr>(), Proto::parse(proto)) else {
+            return false;
+        };
+        let Some(name) = self.origin_of(destination) else {
+            return false;
+        };
+        readmit(&name, SocketAddr::new(ip, port), proto)
     }
 
     fn emit(&self, event: Event) {
@@ -198,6 +230,9 @@ impl PendingRequests {
     /// should also bound its wait by [`REQUEST_TTL`] (see [`Self::resolve`] and
     /// [`Self::expire_due`], which drive this side) so a missing sweep cannot
     /// wedge a flow forever. On table overflow the oldest entry is denied early.
+    ///
+    /// An address a rule already covers through its remembered name is approved
+    /// right here: there is no decision to ask for, so no row and no notification.
     pub fn hold(
         &self,
         proto: &str,
@@ -205,6 +240,18 @@ impl PendingRequests {
         port: Option<u16>,
     ) -> (PendingRequest, oneshot::Receiver<RequestVerdict>) {
         let (tx, rx) = oneshot::channel();
+        if port.is_some_and(|p| self.readmit(proto, destination, p)) {
+            let _ = tx.send(RequestVerdict::Approved);
+            let info = PendingRequest {
+                id: self.next_id(),
+                proto: proto.to_string(),
+                destination: destination.to_string(),
+                port,
+                via: self.origin_of(destination),
+                expires_ts: now_ts(),
+            };
+            return (info, rx);
+        }
         let mut entries = self.inner.entries.lock().unwrap();
 
         let held = |entries: &[Entry]| entries.iter().map(|e| e.waiters.len()).sum::<usize>();
@@ -232,13 +279,8 @@ impl PendingRequests {
             }
         }
 
-        let id = {
-            let mut next = self.inner.next_id.lock().unwrap();
-            *next += 1;
-            *next
-        };
         let info = PendingRequest {
-            id,
+            id: self.next_id(),
             proto: proto.to_string(),
             destination: destination.to_string(),
             port,
@@ -260,6 +302,12 @@ impl PendingRequests {
             expires_ts: info.expires_ts,
         });
         (info, rx)
+    }
+
+    fn next_id(&self) -> u64 {
+        let mut next = self.inner.next_id.lock().unwrap();
+        *next += 1;
+        *next
     }
 
     /// Resolve a request by id (approve or deny). Idempotent: an unknown or
@@ -372,6 +420,32 @@ mod tests {
         // Resolving again is a no-op (the TUI may race an expiry).
         assert!(!table.resolve(info.id, true));
         assert!(table.list().is_empty());
+    }
+
+    /// An address covered through its remembered name is approved without a row
+    /// or an event; a name the hook turns down, or no lookup at all, is held.
+    #[tokio::test]
+    async fn a_covered_remembered_address_never_becomes_a_request() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = events.clone();
+        let table = shared().with_events(Arc::new(move |e: Event| {
+            sink_events.lock().unwrap().push(e);
+        }));
+        table.set_readmit(Arc::new(|name, dst, proto| {
+            name == "covered.test" && dst.port() == 443 && proto == Proto::Tcp
+        }));
+        table.note_resolved("203.0.113.5".parse().unwrap(), "covered.test");
+
+        let (_, mut rx) = table.hold("tcp", "203.0.113.5", Some(443));
+        assert_eq!(rx.try_recv(), Ok(RequestVerdict::Approved));
+        assert!(table.list().is_empty());
+        assert!(events.lock().unwrap().is_empty());
+
+        let (_, mut other_port) = table.hold("tcp", "203.0.113.5", Some(22));
+        let (_, mut no_lookup) = table.hold("tcp", "198.51.100.1", Some(443));
+        assert!(other_port.try_recv().is_err());
+        assert!(no_lookup.try_recv().is_err());
+        assert_eq!(table.list().len(), 2);
     }
 
     #[tokio::test]

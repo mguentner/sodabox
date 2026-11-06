@@ -51,7 +51,7 @@ use sodabox_common::{paths, storage};
 use sodabox_dns::domain::SharedDomainAllowlist;
 use sodabox_dns::events::DnsEvents;
 use sodabox_dns::frontend::DnsFrontend;
-use sodabox_dns::resolver::LocalNames;
+use sodabox_dns::resolver::{readmit_remembered, LocalNames};
 use sodabox_dns::FilteringResolver;
 
 use sodabox_gateway::{Gateway, GatewayEvents, ProviderFiles};
@@ -682,6 +682,15 @@ async fn serve(
     // without it, allowing a new domain updates the proxy + UI but the resolver
     // keeps refusing the name, so the proxy never sees an allow.
     let domains = resolver.domains();
+    // A `domain` rule also covers addresses its name returned earlier (ADR-0021).
+    {
+        let allowlist = allowlist.clone();
+        let domains = domains.clone();
+        let limits = plan.policy.limits.clone();
+        pending.set_readmit(Arc::new(move |name, dst, proto| {
+            readmit_remembered(&allowlist, &domains, &limits, name, dst, proto)
+        }));
+    }
     // The 1 s request sweep: release what a rule now covers, then deny whatever
     // aged out (the TTL is the table's only clock).
     {
@@ -912,16 +921,21 @@ fn release_covered(
         let covered = match req.port {
             None => domains
                 .read()
-                .is_ok_and(|d| d.matches(&req.destination).is_some()),
+                .is_ok_and(|d| !d.matches(&req.destination).is_empty()),
             Some(port) => {
                 let (Ok(ip), Ok(proto)) = (req.destination.parse(), Proto::parse(&req.proto))
                 else {
                     continue;
                 };
-                allowlist.read().is_ok_and(|al| {
-                    al.evaluate(SocketAddr::new(ip, port), proto, std::time::Instant::now())
-                        .is_allow()
-                })
+                let allowed = || {
+                    allowlist.read().is_ok_and(|al| {
+                        al.evaluate(SocketAddr::new(ip, port), proto, std::time::Instant::now())
+                            .is_allow()
+                    })
+                };
+                // A rule added on the name the address came from releases the
+                // row too, so one decision clears all of that name's rows.
+                allowed() || (pending.readmit(&req.proto, &req.destination, port) && allowed())
             }
         };
         if covered {
@@ -1359,6 +1373,65 @@ mod tests {
         assert_eq!(pending.list().len(), 3);
     }
 
+    /// One rule on a name clears every held row that name's lookups explain and
+    /// the rule covers, and the proxy's re-check then passes. Rows it doesn't
+    /// cover stay for the user to decide.
+    #[test]
+    fn a_domain_rule_releases_the_rows_of_its_remembered_name() {
+        use sodabox_common::policy::DomainScope;
+        use sodabox_common::request::RequestVerdict::Approved;
+
+        let policy = VmPolicy {
+            rules: vec![Rule::Domain {
+                name: "example.com".into(),
+                scope: DomainScope::Subdomains,
+                ports: Some("443".into()),
+                proto: None,
+            }],
+            ..VmPolicy::default()
+        };
+        let al = shared(Allowlist::from_policy(&VmPolicy::default()).unwrap());
+        let domains = empty_domains();
+        let pending = sodabox_common::request::shared();
+        {
+            let (al, domains) = (al.clone(), domains.clone());
+            let limits = policy.limits.clone();
+            pending.set_readmit(Arc::new(move |name, dst, proto| {
+                readmit_remembered(&al, &domains, &limits, name, dst, proto)
+            }));
+        }
+        for ip in ["203.0.113.1", "203.0.113.2", "192.168.1.1"] {
+            pending.note_resolved(ip.parse().unwrap(), "www.example.com");
+        }
+
+        let (_, mut first) = pending.hold("tcp", "203.0.113.1", Some(443));
+        let (_, mut second) = pending.hold("udp", "203.0.113.2", Some(443));
+        let (_, mut other_port) = pending.hold("tcp", "203.0.113.1", Some(22));
+        let (_, mut private) = pending.hold("tcp", "192.168.1.1", Some(443));
+        let (_, mut no_lookup) = pending.hold("tcp", "198.51.100.1", Some(443));
+        release_covered(&pending, &al, &domains);
+        assert_eq!(pending.list().len(), 5);
+
+        al.write().unwrap().swap_policy(&policy).unwrap();
+        domains.write().unwrap().swap_policy(&policy).unwrap();
+        release_covered(&pending, &al, &domains);
+        assert_eq!(first.try_recv(), Ok(Approved));
+        assert_eq!(second.try_recv(), Ok(Approved));
+        assert!(other_port.try_recv().is_err());
+        assert!(private.try_recv().is_err());
+        assert!(no_lookup.try_recv().is_err());
+        assert_eq!(pending.list().len(), 3);
+        assert!(al
+            .read()
+            .unwrap()
+            .evaluate(
+                "203.0.113.1:443".parse().unwrap(),
+                Proto::Tcp,
+                std::time::Instant::now()
+            )
+            .is_allow());
+    }
+
     #[test]
     fn policy_set_rebuilds_allowlist_and_rejects_bad() {
         let (tx, _rx) = broadcast::channel(4);
@@ -1453,7 +1526,11 @@ mod tests {
         let state = SupervisorState::new(VmPolicy::default(), al, domains.clone(), tx);
 
         // Boot state: nothing allowed, so the resolver refuses the domain.
-        assert!(domains.read().unwrap().matches("api.example.com").is_none());
+        assert!(domains
+            .read()
+            .unwrap()
+            .matches("api.example.com")
+            .is_empty());
 
         // Allow it live.
         let good = VmPolicy {
@@ -1469,7 +1546,11 @@ mod tests {
         assert!(state.policy_set(good).is_ok());
 
         // The resolver's shared handle now matches the newly-allowed domain.
-        assert!(domains.read().unwrap().matches("api.example.com").is_some());
+        assert!(!domains
+            .read()
+            .unwrap()
+            .matches("api.example.com")
+            .is_empty());
     }
 
     #[test]
