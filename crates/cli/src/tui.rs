@@ -1422,8 +1422,11 @@ async fn fetch_policy(vm: &str) -> Option<VmPolicy> {
 /// `PolicySet` — the same edit-then-push path as `soda allow`, so the file and
 /// the live allowlist never split-brain. Returns the new policy (so the panel can
 /// refresh without a round trip) and a human summary. An add that duplicates an
-/// existing rule short-circuits with no version bump.
+/// existing rule writes nothing and bumps no version, but still pushes: a rule in
+/// the file isn't necessarily live (a failed push, a hand edit), and approving a
+/// request against one the supervisor lacks would be refused by the proxy.
 async fn apply_allow(vm: &str, target: &AllowTarget) -> anyhow::Result<(VmPolicy, String)> {
+    let _lock = PolicyFile::lock(vm)?;
     let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
     let (added, summary) = match target {
         AllowTarget::Resolve(name) => (
@@ -1451,15 +1454,11 @@ async fn apply_allow(vm: &str, target: &AllowTarget) -> anyhow::Result<(VmPolicy
             (added, format!("allowed {name}"))
         }
     };
-    if !added {
-        // Already present — nothing to persist or push.
-        return Ok((
-            file.policy().map_err(|e| anyhow::anyhow!(e))?,
-            "already allowed".into(),
-        ));
-    }
-
-    let policy = save_bumped(vm, &mut file)?;
+    let policy = if added {
+        save_bumped(vm, &mut file)?
+    } else {
+        file.policy().map_err(|e| anyhow::anyhow!(e))?
+    };
 
     let mut client = ControlClient::connect(vm)
         .await
@@ -1470,6 +1469,7 @@ async fn apply_allow(vm: &str, target: &AllowTarget) -> anyhow::Result<(VmPolicy
         })
         .await?
     {
+        Response::Ok if !added => Ok((policy, "already allowed".into())),
         Response::Ok => Ok((policy.clone(), format!("{summary} (v{})", policy.version))),
         Response::Error { msg } => anyhow::bail!("supervisor rejected: {msg}"),
         other => anyhow::bail!("unexpected response: {other:?}"),
@@ -1502,6 +1502,7 @@ fn save_bumped(vm: &str, file: &mut PolicyFile) -> anyhow::Result<VmPolicy> {
 /// (so the panel refreshes without a round trip) and a human summary. A `spec`
 /// that matches nothing short-circuits with no version bump.
 async fn apply_deny(vm: &str, spec: &str) -> anyhow::Result<(VmPolicy, String)> {
+    let _lock = PolicyFile::lock(vm)?;
     let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
     let removed = file.remove_matching(spec).map_err(|e| anyhow::anyhow!(e))?;
     if removed == 0 {
@@ -1637,6 +1638,7 @@ async fn apply_metering(
     alias: &str,
     mode: QuotaMode,
 ) -> anyhow::Result<(VmPolicy, String)> {
+    let _lock = PolicyFile::lock(vm)?;
     let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
     file.set_quota_mode(Some(alias), mode)
         .map_err(|e| anyhow::anyhow!(e))?;

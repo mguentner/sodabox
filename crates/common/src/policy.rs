@@ -432,6 +432,63 @@ pub const POLICY_HEADER: &str =
     "# sodabox egress policy (deny-by-default). Edit via `soda allow/deny/policy edit`.\n\
      # `version` is managed automatically — it bumps on every change.\n";
 
+/// How long [`PolicyFile::lock`] waits for another writer. Writers hold the lock
+/// for a load, a save and a round trip to the supervisor, so anything longer
+/// means one is stuck, and the TUI can't redraw while it waits.
+const POLICY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Exclusive hold on a VM's `policy.toml`, released on drop (or by the kernel if
+/// the process dies). Take it before loading the file and keep it until the new
+/// policy has reached the supervisor: unlocked, two writers can overwrite each
+/// other's rules, or push their versions in the wrong order.
+///
+/// It lives in a file of its own because [`PolicyFile::save`] renames a new file
+/// over `policy.toml`, and a lock belongs to the replaced inode. It is advisory,
+/// so it only binds `soda` processes.
+#[derive(Debug)]
+pub struct PolicyLock {
+    _lock: nix::fcntl::Flock<std::fs::File>,
+}
+
+impl PolicyLock {
+    fn acquire(path: &std::path::Path, wait: std::time::Duration) -> std::io::Result<PolicyLock> {
+        use nix::errno::Errno;
+        use nix::fcntl::{Flock, FlockArg};
+
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => return Ok(PolicyLock { _lock: lock }),
+                Err((f, Errno::EWOULDBLOCK)) if std::time::Instant::now() < deadline => {
+                    file = f;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err((_, Errno::EWOULDBLOCK)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "policy is being changed by another soda process",
+                    ))
+                }
+                Err((_, errno)) => {
+                    return Err(std::io::Error::other(format!(
+                        "locking {}: {errno}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+    }
+}
+
 /// `policy.toml` as a format-preserving document (ADR-0006, ADR-0015).
 ///
 /// Every edit — `allow`, `deny`, `policy edit`, `profile add`, the version
@@ -480,6 +537,11 @@ impl PolicyFile {
     /// Writes to a sibling temp file and renames so a reader never observes a
     /// half-written policy (an empty/truncated file would read as deny-all, but a
     /// syntactically broken one fails the load — atomicity avoids both).
+    /// Take `vm`'s policy lock. See [`PolicyLock`].
+    pub fn lock(vm: &str) -> std::io::Result<PolicyLock> {
+        PolicyLock::acquire(&paths::data_dir(vm).join("policy.lock"), POLICY_LOCK_WAIT)
+    }
+
     pub fn save(&self, vm: &str) -> std::io::Result<()> {
         let dir = paths::data_dir(vm);
         std::fs::create_dir_all(&dir)?;
@@ -972,6 +1034,35 @@ mod tests {
         assert_eq!(check("203.0.113.5:443", Proto::Tcp), Decision::AllowStatic);
         assert_eq!(check("203.0.113.5:80", Proto::Tcp), Decision::Deny);
         assert_eq!(check("203.0.113.5:443", Proto::Udp), Decision::Deny);
+    }
+
+    /// The lock excludes a second holder until dropped, however long it has been
+    /// waited for, and survives the rename `save` does to the policy next to it.
+    #[test]
+    fn the_policy_lock_is_exclusive_until_dropped() {
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sodabox-policy-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = dir.join("policy.lock");
+
+        let first = PolicyLock::acquire(&path, Duration::ZERO).unwrap();
+        let busy = PolicyLock::acquire(&path, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(busy.kind(), std::io::ErrorKind::WouldBlock);
+
+        // A waiter gets it once the holder lets go.
+        let waiter = std::thread::spawn({
+            let path = path.clone();
+            move || PolicyLock::acquire(&path, Duration::from_secs(5)).map(|_| ())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        drop(first);
+        waiter.join().unwrap().unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

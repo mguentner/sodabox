@@ -885,6 +885,7 @@ fn apply_edit(
         anyhow::bail!("no such VM '{vm}' — run `soda create {vm}` first");
     }
 
+    let _lock = PolicyFile::lock(vm)?;
     let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
     let Some(summary) = mutate(&mut file)? else {
         println!("no change");
@@ -1095,41 +1096,64 @@ fn policy_edit(vm: String) -> anyhow::Result<()> {
     if !sodabox_common::vm::VmMeta::path(&vm).is_file() {
         anyhow::bail!("no such VM '{vm}' — run `soda create {vm}` first");
     }
-    // Ensure the file exists so the editor opens something meaningful, and record
-    // the version *before* the edit (tool-managed; the user's typed version is
-    // overridden so the live push always registers as newer).
+    // Ensure the file exists so the editor opens something meaningful.
     let path = PolicyFile::path(&vm);
-    if !path.is_file() {
-        PolicyFile::new().save(&vm)?;
+    {
+        let _lock = PolicyFile::lock(&vm)?;
+        if !path.is_file() {
+            PolicyFile::new().save(&vm)?;
+        }
     }
-    let prior = PolicyFile::load(&vm).map(|f| f.version()).unwrap_or(0);
     let before = std::fs::read_to_string(&path).unwrap_or_default();
+
+    // The editor gets a copy: it can stay open for as long as the user likes, so
+    // it can't hold the policy lock, and the live file must not be half-edited
+    // meanwhile. Per process, so a kept copy (below) isn't overwritten by the next
+    // edit.
+    let copy = path.with_file_name(format!(".policy.edit.{}.toml", std::process::id()));
+    std::fs::write(&copy, &before)?;
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let status = std::process::Command::new(&editor)
-        .arg(&path)
+        .arg(&copy)
         .status()
         .map_err(|e| anyhow::anyhow!("launching editor '{editor}': {e}"))?;
     if !status.success() {
+        let _ = std::fs::remove_file(&copy);
         anyhow::bail!("editor '{editor}' exited with {status}; policy left unchanged");
     }
 
-    let after = std::fs::read_to_string(&path)?;
+    let after = std::fs::read_to_string(&copy)?;
     if after == before {
+        let _ = std::fs::remove_file(&copy);
         println!("no change");
         return Ok(());
     }
 
-    // Validate the edited file; on failure the user's text is kept for a re-edit.
+    // Validate the edit; on failure the user's text stays in the copy for a re-edit.
     // Only `version` is rewritten, so the user's comments and layout stay.
+    let kept = copy.display();
     let mut file = PolicyFile::parse(&after)
-        .map_err(|e| anyhow::anyhow!("policy.toml is not valid after edit (left in place): {e}"))?;
-    let policy = file.policy().map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(|e| anyhow::anyhow!("edited policy is not valid (kept at {kept}): {e}"))?;
+    let policy = file
+        .policy()
+        .map_err(|e| anyhow::anyhow!("edited policy is not valid (kept at {kept}): {e}"))?;
     Allowlist::from_policy(&policy)
-        .map_err(|e| anyhow::anyhow!("edited policy is invalid (left in place): {e}"))?;
+        .map_err(|e| anyhow::anyhow!("edited policy is invalid (kept at {kept}): {e}"))?;
 
+    // Saving replaces the whole file, so anything written while the editor was
+    // open would be lost: refuse instead. The version is tool-managed; the user's
+    // typed one is overridden so the live push always registers as newer.
+    let _lock = PolicyFile::lock(&vm)?;
+    if std::fs::read_to_string(&path).unwrap_or_default() != before {
+        anyhow::bail!(
+            "policy.toml changed while you were editing; left it as it is (your edit is kept at {kept})"
+        );
+    }
+    let prior = PolicyFile::load(&vm).map(|f| f.version()).unwrap_or(0);
     file.set_version(prior + 1);
     file.save(&vm)?;
+    let _ = std::fs::remove_file(&copy);
     let policy = file.policy().map_err(|e| anyhow::anyhow!(e))?;
     println!("saved edited policy v{} for '{vm}'", policy.version);
     push_live(&vm, &policy)
