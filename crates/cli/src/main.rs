@@ -163,6 +163,17 @@ enum Cmd {
         #[arg(long, add = ArgValueCandidates::new(complete::vms))]
         vm: Option<String>,
     },
+    /// refuse a destination without asking
+    Block {
+        #[command(subcommand)]
+        what: BlockWhat,
+    },
+    /// remove a destination from a VM's blocklist
+    Unblock {
+        target: String,
+        #[arg(long, add = ArgValueCandidates::new(complete::vms))]
+        vm: Option<String>,
+    },
     /// show or edit a VM's policy
     Policy {
         #[command(subcommand)]
@@ -251,6 +262,35 @@ enum AllowWhat {
     Service {
         #[arg(add = ArgValueCandidates::new(complete::services))]
         name: String,
+        #[arg(long, add = ArgValueCandidates::new(complete::vms))]
+        vm: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BlockWhat {
+    /// refuse connections to an IP/CIDR
+    Ip {
+        cidr: String,
+        #[arg(long)]
+        ports: Option<String>,
+        #[arg(long, value_parser = ["tcp", "udp"])]
+        proto: Option<String>,
+        #[arg(long, add = ArgValueCandidates::new(complete::vms))]
+        vm: Option<String>,
+    },
+    /// refuse a name, or with --ports/--proto only those connections to what it
+    /// resolved to
+    Domain {
+        name: String,
+        #[arg(long, group = "scope")]
+        subdomains: bool,
+        #[arg(long, group = "scope")]
+        wildcard: bool,
+        #[arg(long)]
+        ports: Option<String>,
+        #[arg(long, value_parser = ["tcp", "udp"])]
+        proto: Option<String>,
         #[arg(long, add = ArgValueCandidates::new(complete::vms))]
         vm: Option<String>,
     },
@@ -382,6 +422,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Ls => ls(),
         Cmd::Allow { what } => allow(what),
         Cmd::Revoke { rule, vm } => revoke(&rule, vm),
+        Cmd::Block { what } => block(what),
+        Cmd::Unblock { target, vm } => unblock(&target, vm),
         Cmd::Policy { action } => policy(action),
         Cmd::Profile { action } => match action {
             ProfileAction::Ls => profile::ls(),
@@ -957,7 +999,7 @@ fn push_live(vm: &str, policy: &sodabox_common::policy::VmPolicy) -> anyhow::Res
 
 /// `soda allow ip|domain …` — add a rule (persist + push live).
 fn allow(what: AllowWhat) -> anyhow::Result<()> {
-    use sodabox_common::policy::DomainScope;
+    use sodabox_common::policy::{DomainScope, Rule};
     match what {
         AllowWhat::Ip { cidr, ports, vm } => {
             let vm = resolve_vm(vm)?;
@@ -972,7 +1014,15 @@ fn allow(what: AllowWhat) -> anyhow::Result<()> {
                         .unwrap_or_default();
                     format!("allow ip {cidr}{ps}")
                 }))
-            })
+            })?;
+            offer_unblock(
+                &vm,
+                &Rule::Ip {
+                    cidr,
+                    ports,
+                    proto: None,
+                },
+            )
         }
         AllowWhat::Domain {
             name,
@@ -1005,7 +1055,16 @@ fn allow(what: AllowWhat) -> anyhow::Result<()> {
                         .unwrap_or_default();
                     format!("allow domain {name} ({scope:?}){ps}{pr}")
                 }))
-            })
+            })?;
+            offer_unblock(
+                &vm,
+                &Rule::Domain {
+                    name,
+                    scope,
+                    ports,
+                    proto,
+                },
+            )
         }
         AllowWhat::Service { name, vm } => {
             let vm = resolve_vm(vm)?;
@@ -1027,6 +1086,67 @@ fn allow(what: AllowWhat) -> anyhow::Result<()> {
     }
 }
 
+/// An allow rule wins over a blocklist entry, so `rule` may have left entries that
+/// decide nothing but would come back into force if it were revoked. Whether they
+/// go is the user's call. Runs with the policy lock released: it waits on a person.
+fn offer_unblock(vm: &str, rule: &sodabox_common::policy::Rule) -> anyhow::Result<()> {
+    use sodabox_common::blocklist::overridden_by;
+    use sodabox_common::policy::PolicyFile;
+    use std::io::IsTerminal;
+
+    let policy = PolicyFile::load(vm)
+        .and_then(|f| {
+            f.policy()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+        .map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
+    let overridden: Vec<_> = overridden_by(std::slice::from_ref(rule), &policy.blocklist)
+        .into_iter()
+        .cloned()
+        .collect();
+    if overridden.is_empty() {
+        return Ok(());
+    }
+    println!("this rule overrides blocklist entries:");
+    for entry in &overridden {
+        println!("  {}", entry_line(entry));
+    }
+    // A script can't answer, and the rule it asked for is already in place.
+    if !std::io::stdin().is_terminal() {
+        println!("kept them; remove them with `soda unblock`");
+        return Ok(());
+    }
+    if !confirm("remove them from the blocklist?")? {
+        println!("kept them");
+        return Ok(());
+    }
+    apply_edit(vm, |p| {
+        let n = p
+            .remove_blocklist(|e| overridden.contains(e))
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok((n > 0).then(|| format!("removed from the blocklist: {n}")))
+    })
+}
+
+/// A blocklist entry on one line, for the terminal.
+fn entry_line(entry: &sodabox_common::policy::BlocklistEntry) -> String {
+    use sodabox_common::policy::BlocklistEntry;
+    let (kind, target, ports, proto) = match entry {
+        BlocklistEntry::Ip { cidr, ports, proto } => ("ip", cidr, ports, proto),
+        BlocklistEntry::Domain {
+            name, ports, proto, ..
+        } => ("domain", name, ports, proto),
+    };
+    let mut line = format!("{kind} {target}");
+    if let Some(p) = ports {
+        line.push_str(&format!(" ports {p}"));
+    }
+    if let Some(p) = proto {
+        line.push_str(&format!(" proto {p}"));
+    }
+    line
+}
+
 /// `soda revoke <rule>` — remove matching rule(s) (persist + push live).
 fn revoke(rule: &str, vm: Option<String>) -> anyhow::Result<()> {
     let vm = resolve_vm(vm)?;
@@ -1036,6 +1156,74 @@ fn revoke(rule: &str, vm: Option<String>) -> anyhow::Result<()> {
             anyhow::bail!("no allow rule matching '{rule}' — nothing to revoke");
         }
         Ok(Some(format!("removed {n} rule(s) matching '{rule}'")))
+    })
+}
+
+/// `soda block ip|domain …` — add a blocklist entry (persist + push live).
+fn block(what: BlockWhat) -> anyhow::Result<()> {
+    use sodabox_common::blocklist::overridden_by;
+    use sodabox_common::policy::{BlocklistEntry, DomainScope};
+
+    let (entry, vm) = match what {
+        BlockWhat::Ip {
+            cidr,
+            ports,
+            proto,
+            vm,
+        } => (BlocklistEntry::Ip { cidr, ports, proto }, vm),
+        BlockWhat::Domain {
+            name,
+            subdomains,
+            wildcard,
+            ports,
+            proto,
+            vm,
+        } => {
+            let scope = if subdomains {
+                DomainScope::Subdomains
+            } else if wildcard {
+                DomainScope::Wildcard
+            } else {
+                DomainScope::Exact
+            };
+            (
+                BlocklistEntry::Domain {
+                    name,
+                    scope,
+                    ports,
+                    proto,
+                },
+                vm,
+            )
+        }
+    };
+    let vm = resolve_vm(vm)?;
+    apply_edit(&vm, |p| {
+        let added = p.add_blocklist(&entry).map_err(|e| anyhow::anyhow!(e))?;
+        // A hand-written entry an allow rule overrides would otherwise do nothing
+        // without a word.
+        let rules = p.policy().map_err(|e| anyhow::anyhow!(e))?.rules;
+        if !overridden_by(&rules, std::slice::from_ref(&entry)).is_empty() {
+            println!("note: an allow rule covers this and takes precedence");
+        }
+        Ok(added.then(|| format!("block {}", entry_line(&entry))))
+    })
+}
+
+/// `soda unblock <target>` — remove matching blocklist entries (persist + push
+/// live).
+fn unblock(target: &str, vm: Option<String>) -> anyhow::Result<()> {
+    let vm = resolve_vm(vm)?;
+    apply_edit(&vm, |p| {
+        let n = p
+            .remove_blocklist(|e| e.target() == target)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if n == 0 {
+            anyhow::bail!("no blocklist entry matching '{target}' — nothing to unblock");
+        }
+        Ok(Some(format!(
+            "removed from the blocklist: {n} matching '{target}'"
+        )))
     })
 }
 

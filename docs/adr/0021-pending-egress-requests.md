@@ -38,8 +38,9 @@ does not refuse immediately. Instead it parks the request in a per-VM
 panel**. The user can **approve** — the flow proceeds exactly as if it had been
 allowed from the start, and a **persistent allowlist rule** is added — or
 **deny** — the flow is terminated as today. On TTL expiry the request is
-**denied** (and the panel row disappears). An explicit deny rule still denies
-instantly; holding is only for the undecided case.
+**refused** (and the panel row disappears). Denying records the decision on the
+VM's **blocklist**, so it isn't asked again. A blocklist entry refuses instantly;
+holding is only for the undecided case.
 
 ## Details
 
@@ -80,13 +81,14 @@ Owned by the supervisor, one table per VM:
   instead of an address.
 - **TTL:** 30 s, static (not configurable).
 - **Capacity cap:** e.g. 64 concurrent pending entries per VM. On overflow the
-  **oldest is denied early** (FIFO eviction, deny verdict). The cap bounds
-  rows and event-stream pressure from a chatty or malicious guest.
+  **oldest is refused early** (FIFO eviction, `queue-full` verdict: nobody decided
+  this, so the audit log must not say someone denied it). The cap bounds rows and
+  event-stream pressure from a chatty or malicious guest.
 - **Waiter cap:** 256 held enforcement calls per VM across all entries, since
   coalesced calls share one entry but each pins its own socket/task. At the cap
-  a further call for a held destination is denied on the spot; a new destination
-  makes room by denying the oldest entries. This bounds memory and held
-  sockets/fds.
+  a further call for a held destination is refused on the spot; a new destination
+  makes room by refusing the oldest entries (`queue-full` too). This bounds memory
+  and held sockets/fds.
 - A held enforcement call awaits its entry via a per-request channel; the
   resolving side (control socket) completes it with approve/deny.
 - **Release by rule:** the 1 s sweep also re-checks each entry against the live
@@ -168,6 +170,80 @@ because the held connection's re-check would find no permit yet: the sweep
 restores the permit and releases that row, and its siblings, within a second. A
 row the chosen rule doesn't cover stays held for the user to decide.
 
+### Denial = a blocklist entry
+
+Some requests repeat for as long as the guest runs and will never be allowed.
+Refusing one and forgetting it means asking again on the next retry, so denying
+records the decision in `[[blocklist]]` in `policy.toml` (ADR-0006), applied live
+the same way as an approval. Letting a row expire records nothing, which is the
+"not now".
+
+```text
+block udp 203.0.113.5:443 via example.com
+  This IP:port only | This name on udp 443 | All of this name
+                                                       [confirm]
+```
+
+| Row | Recorded |
+| --- | --- |
+| dns | The exact name, without asking |
+| Address with no name, or a non-public address | Its protocol, address and port, without asking |
+| Address with a name: This IP:port only | The same |
+| Address with a name: This name on `<proto> <port>` (preselected) | `domain` entry, exact name, that protocol and port |
+| Address with a name: All of this name | `domain` entry, exact name, nothing else |
+
+The preselected choice is what stops a loop: with a TCP-only rule on a name,
+HTTP/3 asks about UDP 443 on each of its addresses, and the name has to keep
+resolving. So only a `domain` entry with neither ports nor protocol refuses
+lookups. Scope is exact by default, since a guest can ask for subdomains the user
+has never seen, and refusing those silently should be a choice. `soda block` can
+choose `--subdomains` or `--wildcard`.
+
+**The order is allow rule, then blocklist, then hold.** The check sits in the
+request table, which every enforcement path already reaches only after the allow
+rules said no. So an entry can only turn a question into a refusal: it never
+grants anything, `Allowlist::evaluate` doesn't know about it, and losing the list
+costs a prompt rather than a hole. The sweep releases what a rule covers before
+refusing what an entry covers, for the same reason, and that is also how the rows
+an entry newly covers go away.
+
+An entry therefore can't carve an exception out of a wider allow: next to
+`domain example.com`, an entry for `tracker.example.com` does nothing, and
+`soda block` says so. Exceptions would have to reach evaluation, DNS admission and
+remembered lookups, and are a separate decision.
+
+**Allowing over an entry asks.** An entry a new allow rule overlaps no longer
+decides anything, but would come back into force if that rule were revoked. The
+TUI and `soda allow` ask whether it should go, and it stays unless the answer is
+yes; a `soda allow` with no terminal keeps it and says so. Entries on another port
+or protocol aren't overlapped, so a TCP rule doesn't ask about a UDP entry on the
+same name. A profile merge doesn't ask, and a profile can't carry entries.
+
+**A name entry reaches addresses through remembered lookups**, so it is as good as
+what they remember: past the hour, or after a supervisor restart, a cached address
+is `no recent lookup` and asks again. A guest can also dodge a name entry by
+looking the address up under another name it may resolve, or raise new requests
+with new names. Neither gets it any egress; the caps above still bound the rows.
+
+### Why a request was refused
+
+A silent refusal is the cost of not asking, so every refused flow and query says
+why, on its row in the TUI (right after the tag, as a long name gets cut off) and
+in `soda logs`:
+
+| Reason | When |
+| --- | --- |
+| `blocklist` | An entry matched, so nobody was asked |
+| `timed out` | Nobody answered within the hold |
+| `queue full` | A cap was hit, so nobody was asked |
+| `not covered` | Approved, but no rule covered it on the re-check |
+| `denied` | Refused over the control socket with nothing recorded, which the TUI no longer does |
+| `no access` | A connection to the gateway (ADR-0020) while it is off or not granted |
+
+The Policy panel lists the two sides as **Allowlist** and **Blocklist** under one
+cursor. `d`/Enter revokes a rule (every rule on its target, like `soda revoke`) or
+unblocks one entry (they differ by what they refuse), and the footer says which.
+
 ### Control protocol & events
 
 - Control socket (ADR-0007) gains `RequestResolve { id, allow }` (idempotent;
@@ -177,7 +253,8 @@ row the chosen rule doesn't cover stays held for the user to decide.
 - Two new `Event` variants (ADR-0009), also written to `events.log` for audit:
   - `RequestPending { id, kind, proto, destination, port?, via?, expires_ts }`
   - `RequestResolved { id, verdict }` — verdict is `approved`, `denied`,
-    `expired`, or `abandoned`.
+    `expired`, `abandoned`, `queue-full`, or `blocklisted`.
+- `Egress` and `Dns` events gain an optional `reason` (above).
 
 ### TUI (ADR-0009)
 
@@ -194,11 +271,14 @@ row the chosen rule doesn't cover stays held for the user to decide.
   anything. So it is shown dim rather than as a verified identity, and long names
   keep their end (the part that says who runs them). A rule granted on that name
   covers an address only while the name's lookups keep explaining it.
-- `Enter`/`a` approves, opening the popup on a row with a name; `d` denies. In the
-  popup `←`/`→` or `Tab` choose, typing fills the TCP or UDP port field, `Enter`
-  confirms and `Esc` cancels without deciding, leaving the row counting down. The
-  popup shows the row's remaining time, and while it is open the Status logo is
-  taken down, since it would be drawn over it. The cursor/panel-focus model is the
+- `Enter`/`a` approves, opening the popup on a row with a name; `d` denies, opening
+  the block popup on an address with a name. In a popup `←`/`→` or `Tab` choose,
+  typing fills the TCP or UDP port field, `Enter`
+  confirms and `Esc` cancels without deciding, leaving the row counting down. A
+  popup shows the row's remaining time, and while one is open the Status logo is
+  taken down, since it would be drawn over it. The question whether a new allow
+  should clear blocklist entries takes `y` or `n`, not `Enter`, which has just
+  confirmed the allow. The cursor/panel-focus model is the
   existing one (the new panel joins the focus cycle). The cursor follows the
   request, not the row position: when the highlighted request goes away the
   selection clears, so a key press never acts on a request the user didn't pick.
@@ -250,6 +330,13 @@ row the chosen rule doesn't cover stays held for the user to decide.
     popup shows the name; the user has to judge it. A shared hosting name carries
     the same risk through its subdomains. A remembered lookup extends this by up to
     an hour past the record's TTL.
+  - **Recording a mistake:** `d` on a dns row is one key with a lasting effect, and
+    what it refuses then fails with no prompt. The row's reason and the Policy
+    panel are how it gets noticed and undone.
+  - **Retry loops:** a held connection stalled for 30 s, a blocklisted one fails at
+    once, so a guest retrying in a loop spins faster and logs a blocked event per
+    attempt. The event ring and `events.log` are bounded, but a loop can push
+    useful history out. Coalescing them is open.
   - **Prompt fatigue:** an interactive path can train users to reflexively
     approve. This is a UX feature, not a security boundary — deny-by-default
     and the audit log remain the boundary, and the approval is a *recorded*
@@ -280,8 +367,16 @@ row the chosen rule doesn't cover stays held for the user to decide.
   rejected: the user is always one guest-side retry too late.
 - **Ask via desktop notification** — out of scope (rootless, no host
   integration) and duplicative; the TUI-local OSC 9/bell covers it.
-- **Hold explicit deny rules too** — rejected: an explicit deny is a decision
-  the user already made; holding it would make "deny" mean "maybe".
+- **Hold blocklisted requests too** — rejected: an entry is a decision the user
+  already made; holding it would make "deny" mean "maybe".
+- **A deny that only refuses that attempt** — the earlier behaviour. Rejected:
+  a request that repeats forever asked forever. Expiry remains for "not now".
+- **Deny rules as a `Rule` kind** — rejected: `rules` is treated as allow-only
+  throughout (`soda revoke`, the sweep's "a rule matched" check, DNS matching), and
+  an older binary fails to parse an unknown kind but ignores an unknown table.
+- **A blocklist that wins over allow rules** — would allow exceptions, but has to
+  reach evaluation, DNS admission and remembered lookups, and a blocked shared CDN
+  address would then break a name allowed later. Rejected for now.
 - **One-shot grants** — rejected: the same destination would ask again on every
   connection, and a grant would leave no audit trail in policy.
 - **Always prompting per IP:Port after a DNS approval** — the earlier decision

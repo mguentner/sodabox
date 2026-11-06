@@ -39,6 +39,11 @@ restart required.
 Both IPv4 and IPv6 are first-class, **including the `:PORT`/proto qualifier on
 both** (unlike cogbox, whose `:PORT` qualifier is IPv4-only in v1).
 
+*Amended 2026-11-06 ([ADR-0021](0021-pending-egress-requests.md)).* A policy also
+holds a `[[blocklist]]`, separate from its rules: `ip` and `domain` entries that
+refuse a request instead of asking about it. An entry is only reached once the
+rules have said no, so it grants nothing and an allow rule wins over it.
+
 ### Data model (illustrative)
 
 ```
@@ -74,7 +79,8 @@ EphemeralAllow { ip, ports?, proto?, expires_at, origin_domain }
 ### Runtime updates
 
 - CLI verbs: `soda allow ip …`, `soda allow domain …`, `soda revoke …`,
-  `soda policy show|edit|push`, scoped to a VM.
+  `soda block ip|domain …`, `soda unblock …`, `soda policy show|edit|push`, scoped
+  to a VM.
 - The CLI writes the persisted policy **and** pushes the new version to the
   running supervisor over the control socket; the supervisor atomically swaps the
   effective policy (copy-on-write; in-flight allowed connections are unaffected,

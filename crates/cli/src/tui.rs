@@ -12,7 +12,7 @@
 //!     (`off|notification|bell|all`, persisted in `tui.toml`).
 //!   - **Egress** — flow verdicts (proto, dst:port, matched rule).
 //!   - **DNS** — query verdicts (name, resolved IPs, TTL).
-//!   - **Policy** — the live policy version and its rules.
+//!   - **Policy** — the live policy version, its allowlist and its blocklist.
 //!   - **Status** — the sodabox logo beside VM state, configured CPU/RAM, and
 //!     uptime. The logo is the PNG itself, placed over the panel's cells via
 //!     the kitty graphics protocol (kitty, Ghostty, WezTerm, Konsole, foot, …)
@@ -66,10 +66,11 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use sodabox_common::allowlist::{is_public_ip, PortSpec};
+use sodabox_common::blocklist::overridden_by;
 use sodabox_common::event::{DnsVerdict, Event, RefusalReason, Verdict};
 use sodabox_common::paths;
 use sodabox_common::policy::{
-    DomainScope, GatewayConfig, ModelAlias, PolicyFile, QuotaMode, Rule, VmPolicy,
+    BlocklistEntry, DomainScope, GatewayConfig, ModelAlias, PolicyFile, QuotaMode, Rule, VmPolicy,
 };
 use sodabox_common::protocol::{Request, Response};
 use sodabox_common::quota::{self, Balances, Entry, Ledger, Reason};
@@ -334,6 +335,7 @@ fn scroll_window(scroll: usize, sel: Option<usize>, height: usize, len: usize) -
 struct PolicyView {
     version: u32,
     rules: Vec<Rule>,
+    blocklist: Vec<BlocklistEntry>,
     models: Vec<ModelAlias>,
     gateway: Option<GatewayConfig>,
 }
@@ -343,6 +345,7 @@ impl From<VmPolicy> for PolicyView {
         Self {
             version: p.version,
             rules: p.rules,
+            blocklist: p.blocklist,
             models: p.models,
             gateway: p.gateway,
         }
@@ -350,6 +353,22 @@ impl From<VmPolicy> for PolicyView {
 }
 
 impl PolicyView {
+    /// How many rows the Policy panel's cursor moves over.
+    fn rows(&self) -> usize {
+        self.rules.len() + self.blocklist.len()
+    }
+
+    /// The row at a Policy panel cursor position.
+    fn row(&self, at: usize) -> Option<PolicyRow<'_>> {
+        match self.rules.get(at) {
+            Some(rule) => Some(PolicyRow::Rule(rule)),
+            None => self
+                .blocklist
+                .get(at - self.rules.len())
+                .map(PolicyRow::Blocked),
+        }
+    }
+
     /// Whether this VM uses the inference gateway, so its panels are shown.
     fn gateway_used(&self) -> bool {
         self.gateway.as_ref().is_some_and(|g| g.enabled) || !self.models.is_empty()
@@ -369,8 +388,8 @@ impl PolicyView {
 }
 
 /// Which panel the selection cursor is on. Egress/DNS are the flow panels (allow
-/// a just-blocked destination); Policy is the rule list (revoke a selected
-/// rule). Inference (gateway requests) and Gateway (the alias table: grant
+/// a just-blocked destination); Policy is the rule list and blocklist (revoke a
+/// selected rule, unblock a selected entry). Inference (gateway requests) and Gateway (the alias table: grant
 /// tokens, switch metering) are on the Inference tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
@@ -573,6 +592,208 @@ fn request_allow_target(req: &PendingRequest) -> AllowTarget {
             proto: req.proto.clone(),
         },
         None => AllowTarget::Resolve(req.destination.clone()),
+    }
+}
+
+/// The choices of the block popup, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockChoice {
+    /// The row's own IP, protocol and port.
+    Address,
+    /// The name its address came from, on the row's protocol and port.
+    NamePort,
+    /// All of that name, lookups included.
+    Name,
+}
+
+const BLOCK_CHOICES: [BlockChoice; 3] = [
+    BlockChoice::Address,
+    BlockChoice::NamePort,
+    BlockChoice::Name,
+];
+
+/// The popup asking what denying an address with a name should record (ADR-0021).
+/// A name returns several addresses, so the name on the row's port is preselected:
+/// recording the address alone would leave its siblings asking.
+struct BlockPopup {
+    request: PendingRequest,
+    name: String,
+    choice: BlockChoice,
+}
+
+impl BlockPopup {
+    fn step(&mut self, forward: bool) {
+        let n = BLOCK_CHOICES.len();
+        let at = BLOCK_CHOICES
+            .iter()
+            .position(|c| *c == self.choice)
+            .unwrap_or(0);
+        self.choice = BLOCK_CHOICES[(at + if forward { 1 } else { n - 1 }) % n];
+    }
+
+    fn entry(&self) -> BlocklistEntry {
+        let name = |ports: Option<String>, proto: Option<String>| BlocklistEntry::Domain {
+            name: self.name.clone(),
+            scope: DomainScope::Exact,
+            ports,
+            proto,
+        };
+        let port = self.request.port.map(|p| p.to_string());
+        let proto = Some(self.request.proto.clone());
+        match self.choice {
+            BlockChoice::Address => BlocklistEntry::Ip {
+                cidr: self.request.destination.clone(),
+                ports: port,
+                proto,
+            },
+            BlockChoice::NamePort => name(port, proto),
+            BlockChoice::Name => name(None, None),
+        }
+    }
+}
+
+/// What denying `req` records when there is nothing to ask: the exact name of a
+/// dns row, or the protocol, address and port of an address row.
+fn request_block_entry(req: &PendingRequest) -> BlocklistEntry {
+    match req.port {
+        Some(port) => BlocklistEntry::Ip {
+            cidr: req.destination.clone(),
+            ports: Some(port.to_string()),
+            proto: Some(req.proto.clone()),
+        },
+        None => BlocklistEntry::Domain {
+            name: strip_trailing_dot(&req.destination),
+            scope: DomainScope::Exact,
+            ports: None,
+            proto: None,
+        },
+    }
+}
+
+/// The rules `target` adds, to find what they override on the blocklist.
+fn allow_target_rules(target: &AllowTarget) -> Vec<Rule> {
+    match target {
+        AllowTarget::Resolve(name) => vec![Rule::Resolve {
+            name: name.clone(),
+            scope: DomainScope::Subdomains,
+        }],
+        AllowTarget::Flow { ip, port, proto } => vec![Rule::Ip {
+            cidr: ip.clone(),
+            ports: Some(port.to_string()),
+            proto: Some(proto.clone()),
+        }],
+        AllowTarget::Domain { name, grants } => grants
+            .iter()
+            .map(|g| Rule::Domain {
+                name: name.clone(),
+                scope: DomainScope::Subdomains,
+                ports: g.ports.clone(),
+                proto: g.proto.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// A row of the Policy panel: the two lists share one cursor, allowlist first.
+#[derive(Debug, PartialEq, Eq)]
+enum PolicyRow<'a> {
+    Rule(&'a Rule),
+    Blocked(&'a BlocklistEntry),
+}
+
+/// A line of the Policy panel below its version header.
+enum PolicyLine {
+    /// A section title.
+    Header(&'static str),
+    /// A placeholder for an empty section.
+    Note(&'static str),
+    /// An entry, by its cursor position.
+    Row(usize),
+}
+
+/// The Policy panel's lines, both sections in full.
+fn policy_lines(rules: usize, blocked: usize) -> Vec<PolicyLine> {
+    let mut lines = vec![PolicyLine::Header("Allowlist")];
+    if rules == 0 {
+        lines.push(PolicyLine::Note("(deny-all)"));
+    }
+    lines.extend((0..rules).map(PolicyLine::Row));
+    lines.push(PolicyLine::Header("Blocklist"));
+    if blocked == 0 {
+        lines.push(PolicyLine::Note("(empty)"));
+    }
+    lines.extend((rules..rules + blocked).map(PolicyLine::Row));
+    lines
+}
+
+/// Which of `lines` fit in `room` rows, keeping the selected one in view. Past the
+/// top of a section its title is repeated first, so a row can always be told apart
+/// from the other list's. `room` must leave one row for the "…" indicator if this
+/// returns fewer lines than there are.
+fn policy_window(lines: &[PolicyLine], room: usize, sel: Option<usize>) -> Vec<usize> {
+    if lines.len() <= room {
+        return (0..lines.len()).collect();
+    }
+    let cap = room.saturating_sub(1).max(1);
+    let sel_at = sel
+        .and_then(|s| {
+            lines
+                .iter()
+                .position(|l| matches!(l, PolicyLine::Row(r) if *r == s))
+        })
+        .unwrap_or(0);
+    let section_of = |at: usize| {
+        lines[..=at]
+            .iter()
+            .rposition(|l| matches!(l, PolicyLine::Header(_)))
+            .unwrap_or(0)
+    };
+    // Too short to spare a row for a repeated title.
+    if cap < 2 {
+        return vec![sel_at];
+    }
+    // The selected line last, with its title or whatever fits above it.
+    let body = cap - 1;
+    let start = (sel_at + 1)
+        .saturating_sub(body)
+        .min(lines.len().saturating_sub(body));
+    let section = section_of(start);
+    if section == start {
+        return (start..(start + cap).min(lines.len())).collect();
+    }
+    let mut window = vec![section];
+    window.extend(start..(start + body).min(lines.len()));
+    window
+}
+
+/// A blocklist entry as a concise one-liner for the panel, like [`fmt_rule`].
+fn fmt_block(entry: &BlocklistEntry) -> String {
+    match entry {
+        BlocklistEntry::Ip { cidr, ports, proto } => {
+            let mut s = format!("ip {cidr}");
+            if let Some(p) = ports {
+                s.push_str(&format!(":{p}"));
+            }
+            if let Some(pr) = proto {
+                s.push_str(&format!("/{pr}"));
+            }
+            s
+        }
+        BlocklistEntry::Domain {
+            name,
+            scope,
+            ports,
+            proto,
+        } => {
+            let mut s = format!("domain {name} ({})", scope_str(*scope));
+            if let Some(p) = ports {
+                s.push_str(&format!(" :{p}"));
+            }
+            if let Some(pr) = proto {
+                s.push_str(&format!("/{pr}"));
+            }
+            s
+        }
     }
 }
 
@@ -881,9 +1102,18 @@ pub struct App {
     /// Where `notify` persists.
     notify_path: PathBuf,
     /// A queued request verdict to apply after the select.
-    pending_resolve: Option<(PendingRequest, Option<AllowTarget>)>,
+    pending_resolve: Option<(PendingRequest, AllowTarget)>,
     /// The allow popup, when open: it takes the keys and covers the panels.
     allow_popup: Option<AllowPopup>,
+    /// An open block popup; while it is, keys go to it.
+    block_popup: Option<BlockPopup>,
+    /// Blocklist entries a new allow rule overrides, waiting for the user to say
+    /// whether they go; while this is set, keys go to it.
+    unblock_confirm: Option<Vec<BlocklistEntry>>,
+    /// A blocklist entry to add after the select.
+    pending_block: Option<BlocklistEntry>,
+    /// Blocklist entries to remove after the select.
+    pending_unblock: Option<Vec<BlocklistEntry>>,
     /// Set when `requests` may have missed events; re-fetched after the select.
     requests_dirty: bool,
     /// A notification to emit after the select (set by `ingest`).
@@ -915,8 +1145,9 @@ pub struct App {
     dropped: u64,
     /// Which panel the cursor is on.
     focus: Focus,
-    /// Cursor into `policy.rules` (top-down index; `None` = no selection). Unlike
-    /// the flow panels' cursors this is a plain list index, not an offset-from-newest.
+    /// Cursor into the Policy panel's rows, `policy.rules` then `policy.blocklist`
+    /// (top-down index; `None` = no selection). Unlike the flow panels' cursors
+    /// this is a plain list index, not an offset-from-newest.
     policy_sel: Option<usize>,
     /// A quick-action requested this frame, applied (async) after the select.
     pending_allow: Option<AllowTarget>,
@@ -960,6 +1191,10 @@ impl App {
             notify_path,
             pending_resolve: None,
             allow_popup: None,
+            block_popup: None,
+            unblock_confirm: None,
+            pending_block: None,
+            pending_unblock: None,
             requests_dirty: false,
             notify_msg: None,
             tab: Tab::Network,
@@ -1126,10 +1361,10 @@ impl App {
         self.inference.release();
     }
 
-    /// Move the Policy-panel cursor by `delta` rows, clamped to the rule list;
-    /// the first move from no-selection lands on the first rule.
+    /// Move the Policy-panel cursor by `delta` rows, clamped to the two lists;
+    /// the first move from no-selection lands on the first row.
     fn policy_select(&mut self, delta: i32) {
-        let len = self.policy.rules.len();
+        let len = self.policy.rows();
         if len == 0 {
             self.policy_sel = None;
             return;
@@ -1140,10 +1375,10 @@ impl App {
         });
     }
 
-    /// Keep the Policy cursor valid after the rule list changes (e.g. a revoke
-    /// removed rows or a re-fetch shrank the list).
+    /// Keep the Policy cursor valid after the lists change (e.g. a revoke removed
+    /// rows or a re-fetch shrank a list).
     fn clamp_policy_sel(&mut self) {
-        let len = self.policy.rules.len();
+        let len = self.policy.rows();
         self.policy_sel = match self.policy_sel {
             _ if len == 0 => None,
             Some(i) => Some(i.min(len - 1)),
@@ -1281,22 +1516,23 @@ impl App {
         p.rows(self.unique).nth(p.sel?).map(|(ev, _)| ev)
     }
 
-    /// The policy rule under the Policy-panel cursor, if any.
-    fn selected_rule(&self) -> Option<&Rule> {
-        self.policy_sel.and_then(|i| self.policy.rules.get(i))
+    /// Ask whether the blocklist entries `target`'s rules now override should go.
+    /// An allow rule wins either way, but they would come back into force if the
+    /// rule were revoked.
+    fn offer_unblock(&mut self, target: &AllowTarget) {
+        let rules = allow_target_rules(target);
+        let overridden: Vec<BlocklistEntry> = overridden_by(&rules, &self.policy.blocklist)
+            .into_iter()
+            .cloned()
+            .collect();
+        if !overridden.is_empty() {
+            self.unblock_confirm = Some(overridden);
+        }
     }
 
-    /// The `remove_matching` target for the highlighted rule (its IP cidr or
-    /// domain name), or why there is nothing to revoke. Mirrors
-    /// [`App::selected_allow_target`] for the revoke direction.
-    fn selected_revoke_target(&self) -> Result<String, &'static str> {
-        match self.selected_rule() {
-            None => Err("select a rule first (↑/↓)"),
-            Some(Rule::Ip { cidr, .. }) => Ok(cidr.clone()),
-            Some(Rule::Domain { name, .. })
-            | Some(Rule::Resolve { name, .. })
-            | Some(Rule::Service { name }) => Ok(name.clone()),
-        }
+    /// The row under the Policy-panel cursor, if any.
+    fn selected_policy_row(&self) -> Option<PolicyRow<'_>> {
+        self.policy_sel.and_then(|i| self.policy.row(i))
     }
 
     /// What allowing the highlighted row would do — or why it can't. Only a
@@ -1494,6 +1730,59 @@ fn save_bumped(vm: &str, file: &mut PolicyFile) -> anyhow::Result<VmPolicy> {
     file.policy().map_err(|e| anyhow::anyhow!(e))
 }
 
+/// Add `entry` to the blocklist and push the policy live, which is what denying a
+/// request does (ADR-0021): the supervisor's sweep refuses the row and any others
+/// the entry covers, with this as their reason. A duplicate writes nothing but
+/// still pushes, like [`apply_allow`]. A row that expired in the meantime still
+/// records: the decision was about the destination, not that one attempt.
+async fn apply_block(vm: &str, entry: &BlocklistEntry) -> anyhow::Result<(VmPolicy, String)> {
+    let _lock = PolicyFile::lock(vm)?;
+    let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
+    let added = file.add_blocklist(entry).map_err(|e| anyhow::anyhow!(e))?;
+    let policy = if added {
+        save_bumped(vm, &mut file)?
+    } else {
+        file.policy().map_err(|e| anyhow::anyhow!(e))?
+    };
+    push_policy(vm, &policy).await?;
+    let summary = format!("blocked {} (v{})", fmt_block(entry), policy.version);
+    Ok((policy, summary))
+}
+
+/// Remove `entries` from the blocklist and push the policy live.
+async fn apply_unblock(vm: &str, entries: &[BlocklistEntry]) -> anyhow::Result<(VmPolicy, String)> {
+    let _lock = PolicyFile::lock(vm)?;
+    let mut file = PolicyFile::load(vm).map_err(|e| anyhow::anyhow!("reading policy: {e}"))?;
+    let removed = file
+        .remove_blocklist(|e| entries.contains(e))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let policy = if removed > 0 {
+        save_bumped(vm, &mut file)?
+    } else {
+        file.policy().map_err(|e| anyhow::anyhow!(e))?
+    };
+    push_policy(vm, &policy).await?;
+    let summary = format!("unblocked {removed} (v{})", policy.version);
+    Ok((policy, summary))
+}
+
+/// Push the whole policy to the supervisor.
+async fn push_policy(vm: &str, policy: &VmPolicy) -> anyhow::Result<()> {
+    let mut client = ControlClient::connect(vm)
+        .await
+        .map_err(|e| anyhow::anyhow!("connecting to control socket: {e}"))?;
+    match client
+        .request(&Request::PolicySet {
+            policy: policy.clone(),
+        })
+        .await?
+    {
+        Response::Ok => Ok(()),
+        Response::Error { msg } => anyhow::bail!("supervisor rejected: {msg}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
 /// Apply a revoke quick-action: remove every rule matching `spec` from
 /// `vm`'s persisted policy, validate, version-bump, save `policy.toml`, and push
 /// the whole new policy live via `PolicySet` — the same edit-then-push path as
@@ -1556,44 +1845,41 @@ async fn fetch_requests(vm: &str) -> Option<Vec<PendingRequest>> {
     }
 }
 
-/// Apply a request verdict (ADR-0021): an **approve** (`target` is what it adds)
-/// first adds the persistent allowlist rule (the same quick-allow path as
-/// `soda allow` — approve *is* a rule, so the held flow proceeds through the
-/// normal allow path), then resolves the parked request over the control socket.
-/// A **deny** only resolves. Resolving an id that expired in between is `Ok`
-/// (idempotent), so an approve first checks the request is still pending: a stale
+/// Approve a request (ADR-0021): first add the persistent allowlist rule `target`
+/// describes (the same quick-allow path as `soda allow` — approve *is* a rule, so
+/// the held flow proceeds through the normal allow path), then resolve the parked
+/// request over the control socket. Resolving an id that expired in between is
+/// `Ok` (idempotent), so this first checks the request is still pending: a stale
 /// row must not add a persistent rule or report an approval that admitted nothing.
-/// Returns the new policy on approve (so the panel refreshes) and a summary.
+/// Returns the new policy (so the panel refreshes) and a summary.
 async fn apply_resolve(
     vm: &str,
     req: &PendingRequest,
-    target: Option<&AllowTarget>,
-) -> anyhow::Result<(Option<VmPolicy>, String)> {
-    let mut policy = None;
-    let allow = target.is_some();
-    if let Some(target) = target {
-        let live = fetch_requests(vm)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("couldn't list pending requests"))?;
-        if !live.iter().any(|r| r.id == req.id) {
-            anyhow::bail!("request #{} is no longer pending", req.id);
-        }
-        let (p, summary) = apply_allow(vm, target).await?;
-        // A `domain` rule picked on an address row isn't resolved here: the sweep
-        // releases this row and its siblings once it has restored their permits,
-        // and only if the rule covers them. Approving now would fail the proxy's
-        // re-check.
-        if matches!(target, AllowTarget::Domain { .. }) && req.port.is_some() {
-            return Ok((Some(p), summary));
-        }
-        policy = Some(p);
+    target: &AllowTarget,
+) -> anyhow::Result<(VmPolicy, String)> {
+    let live = fetch_requests(vm)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("couldn't list pending requests"))?;
+    if !live.iter().any(|r| r.id == req.id) {
+        anyhow::bail!("request #{} is no longer pending", req.id);
+    }
+    let (policy, summary) = apply_allow(vm, target).await?;
+    // A `domain` rule picked on an address row isn't resolved here: the sweep
+    // releases this row and its siblings once it has restored their permits,
+    // and only if the rule covers them. Approving now would fail the proxy's
+    // re-check.
+    if matches!(target, AllowTarget::Domain { .. }) && req.port.is_some() {
+        return Ok((policy, summary));
     }
 
     let mut client = ControlClient::connect(vm)
         .await
         .map_err(|e| anyhow::anyhow!("connecting to control socket: {e}"))?;
     match client
-        .request(&Request::RequestResolve { id: req.id, allow })
+        .request(&Request::RequestResolve {
+            id: req.id,
+            allow: true,
+        })
         .await?
     {
         Response::Ok => {
@@ -1601,8 +1887,7 @@ async fn apply_resolve(
                 Some(p) => format!("{}:{p}", req.destination),
                 None => req.destination.clone(),
             };
-            let what = if allow { "approved" } else { "denied" };
-            Ok((policy, format!("{what} {where_to} (request #{})", req.id)))
+            Ok((policy, format!("approved {where_to} (request #{})", req.id)))
         }
         Response::Error { msg } => anyhow::bail!("supervisor rejected: {msg}"),
         other => anyhow::bail!("unexpected response: {other:?}"),
@@ -1703,6 +1988,36 @@ async fn event_loop(
                 Ok((policy, summary)) => {
                     app.policy = PolicyView::from(policy);
                     app.clamp_policy_sel();
+                    app.offer_unblock(&target);
+                    app.notice = Some(Notice {
+                        text: summary,
+                        error: false,
+                    });
+                }
+                Err(e) => {
+                    app.notice = Some(Notice {
+                        text: e.to_string(),
+                        error: true,
+                    })
+                }
+            }
+        }
+
+        // Denying a request records it (`d` on the Egress Requests panel, through
+        // the popup on an address with a name), and a blocklist row or a confirmed
+        // offer takes entries away again: edit + push live, as below.
+        let blocklist_edit = if let Some(entry) = app.pending_block.take() {
+            Some(apply_block(&app.vm, &entry).await)
+        } else if let Some(entries) = app.pending_unblock.take() {
+            Some(apply_unblock(&app.vm, &entries).await)
+        } else {
+            None
+        };
+        if let Some(result) = blocklist_edit {
+            match result {
+                Ok((policy, summary)) => {
+                    app.policy = PolicyView::from(policy);
+                    app.clamp_policy_sel();
                     app.notice = Some(Notice {
                         text: summary,
                         error: false,
@@ -1738,16 +2053,14 @@ async fn event_loop(
             }
         }
 
-        // A request verdict (ADR-0021: `a`/Enter approves, `d` denies on the
-        // Egress Requests panel): approve adds the rule then resolves the held
-        // request over the control socket; deny just resolves.
+        // An approval (ADR-0021: `a`/Enter on the Egress Requests panel): add the
+        // rule then resolve the held request over the control socket.
         if let Some((req, target)) = app.pending_resolve.take() {
-            match apply_resolve(&app.vm, &req, target.as_ref()).await {
+            match apply_resolve(&app.vm, &req, &target).await {
                 Ok((policy, summary)) => {
-                    if let Some(p) = policy {
-                        app.policy = PolicyView::from(p);
-                        app.clamp_policy_sel();
-                    }
+                    app.policy = PolicyView::from(policy);
+                    app.clamp_policy_sel();
+                    app.offer_unblock(&target);
                     app.notice = Some(Notice {
                         text: summary,
                         error: false,
@@ -1880,10 +2193,10 @@ struct KeyPress {
 /// switch panel within the tab (`Tab`), move the cursor (`↑`/`↓`, `k`/`j`),
 /// toggle the unique view of the flow panels (`u`). On the Egress/DNS panels
 /// `a`/Enter allows the highlighted blocked destination; on the Policy panel
-/// `d`/Enter revokes the highlighted rule; on the Gateway panel `g`/Enter grants
-/// tokens to the highlighted alias and `m` switches it between limited and
-/// unlimited. While the grant prompt or the allow popup is open, keys edit it
-/// instead.
+/// `d`/Enter revokes the highlighted rule or unblocks the highlighted entry; on the
+/// Gateway panel `g`/Enter grants tokens to the highlighted alias and `m` switches
+/// it between limited and unlimited. While the grant prompt, a popup or the unblock
+/// question is open, keys go to it instead.
 fn handle_key(app: &mut App, k: KeyPress) {
     if app.prompt.is_some() {
         prompt_key(app, k);
@@ -1891,6 +2204,14 @@ fn handle_key(app: &mut App, k: KeyPress) {
     }
     if app.allow_popup.is_some() {
         allow_popup_key(app, k);
+        return;
+    }
+    if app.block_popup.is_some() {
+        block_popup_key(app, k);
+        return;
+    }
+    if app.unblock_confirm.is_some() {
+        unblock_confirm_key(app, k);
         return;
     }
     match k.code {
@@ -1912,8 +2233,8 @@ fn handle_key(app: &mut App, k: KeyPress) {
             Focus::Requests => app.request_select(1),
             _ => app.select_newer(),
         },
-        // `a` allows (Egress/DNS/Requests); `d` revokes (Policy) or denies (Requests);
-        // `g` grants and `m` switches metering (Gateway); `n` cycles the
+        // `a` allows (Egress/DNS/Requests); `d` denies (Requests), revokes or
+        // unblocks (Policy); `g` grants and `m` switches metering (Gateway); `n` cycles the
         // pending-request notification mode (off|notification|bell|all).
         // Enter is "act on the selection".
         KeyCode::Char('n') => {
@@ -1925,16 +2246,16 @@ fn handle_key(app: &mut App, k: KeyPress) {
             });
         }
         KeyCode::Char('a') if matches!(app.focus, Focus::Egress | Focus::Dns) => request_allow(app),
-        KeyCode::Char('a') if app.focus == Focus::Requests => request_resolve(app, true),
-        KeyCode::Char('d') if app.focus == Focus::Policy => request_revoke(app),
-        KeyCode::Char('d') if app.focus == Focus::Requests => request_resolve(app, false),
+        KeyCode::Char('a') if app.focus == Focus::Requests => request_approve(app),
+        KeyCode::Char('d') if app.focus == Focus::Policy => request_policy_remove(app),
+        KeyCode::Char('d') if app.focus == Focus::Requests => request_block(app),
         KeyCode::Char('g') if app.focus == Focus::Gateway => open_grant_prompt(app),
         KeyCode::Char('m') if app.focus == Focus::Gateway => request_metering(app),
         KeyCode::Enter => match app.focus {
-            Focus::Policy => request_revoke(app),
+            Focus::Policy => request_policy_remove(app),
             Focus::Gateway => open_grant_prompt(app),
             Focus::Egress | Focus::Dns => request_allow(app),
-            Focus::Requests => request_resolve(app, true),
+            Focus::Requests => request_approve(app),
             Focus::Inference => {}
         },
         _ => {}
@@ -2003,12 +2324,42 @@ fn allow_popup_key(app: &mut App, k: KeyPress) {
             Err(e) => popup.error = Some(e),
             Ok(target) => {
                 match popup.request.take() {
-                    Some(req) => app.pending_resolve = Some((req, Some(target))),
+                    Some(req) => app.pending_resolve = Some((req, target)),
                     None => app.pending_allow = Some(target),
                 }
                 app.allow_popup = None;
             }
         },
+        _ => {}
+    }
+}
+
+/// Keys while the block popup is open: `←`/`→` or `Tab` move between the choices,
+/// Enter confirms, Esc cancels without deciding, leaving the row counting down.
+fn block_popup_key(app: &mut App, k: KeyPress) {
+    let Some(popup) = app.block_popup.as_mut() else {
+        return;
+    };
+    match k.code {
+        KeyCode::Esc => app.block_popup = None,
+        KeyCode::Char('c') if k.mods.contains(KeyModifiers::CONTROL) => app.block_popup = None,
+        KeyCode::Left | KeyCode::BackTab => popup.step(false),
+        KeyCode::Right | KeyCode::Tab => popup.step(true),
+        KeyCode::Enter => {
+            app.pending_block = Some(popup.entry());
+            app.block_popup = None;
+        }
+        _ => {}
+    }
+}
+
+/// Keys while the unblock question is open: only `y` removes anything. Enter
+/// doesn't answer, since it just confirmed the allow that raised the question.
+fn unblock_confirm_key(app: &mut App, k: KeyPress) {
+    match k.code {
+        KeyCode::Char('y') => app.pending_unblock = app.unblock_confirm.take(),
+        KeyCode::Char('n') | KeyCode::Esc => app.unblock_confirm = None,
+        KeyCode::Char('c') if k.mods.contains(KeyModifiers::CONTROL) => app.unblock_confirm = None,
         _ => {}
     }
 }
@@ -2071,39 +2422,64 @@ fn request_allow(app: &mut App) {
     }
 }
 
-/// Queue a revoke of the highlighted policy rule, or surface why it can't.
-fn request_revoke(app: &mut App) {
-    match app.selected_revoke_target() {
-        Ok(spec) => app.pending_revoke = Some(spec),
-        Err(msg) => {
+/// Queue removing the highlighted Policy panel row: revoking a rule, unblocking an
+/// entry. Only that entry: unlike rules, they differ by what they refuse.
+fn request_policy_remove(app: &mut App) {
+    match app.selected_policy_row() {
+        Some(PolicyRow::Rule(rule)) => app.pending_revoke = Some(rule.target().to_string()),
+        Some(PolicyRow::Blocked(entry)) => app.pending_unblock = Some(vec![entry.clone()]),
+        None => {
             app.notice = Some(Notice {
-                text: msg.to_string(),
+                text: "select a rule first (↑/↓)".into(),
                 error: true,
             })
         }
     }
 }
 
-/// Queue an approve (`allow == true`) or deny of the highlighted pending
-/// egress request (ADR-0021). Applied in the async loop: an approve first adds
-/// the persistent rule (the quick-allow path), then resolves the request over
-/// the control socket. Approving a row with a name asks what to grant first.
-fn request_resolve(app: &mut App, allow: bool) {
-    match app.selected_request() {
-        Some(req) if !allow => app.pending_resolve = Some((req, None)),
-        Some(req) => {
-            let narrow = request_allow_target(&req);
-            match request_allow_name(&req) {
-                Some(name) => app.allow_popup = Some(AllowPopup::new(Some(req), name, narrow)),
-                None => app.pending_resolve = Some((req, Some(narrow))),
-            }
-        }
-        None => {
-            app.notice = Some(Notice {
-                text: "no pending request selected".into(),
-                error: true,
+/// The highlighted pending egress request, or a notice that there is none.
+fn selected_request_or_notice(app: &mut App) -> Option<PendingRequest> {
+    let req = app.selected_request();
+    if req.is_none() {
+        app.notice = Some(Notice {
+            text: "no pending request selected".into(),
+            error: true,
+        });
+    }
+    req
+}
+
+/// Queue approving the highlighted pending egress request (ADR-0021). Applied in
+/// the async loop: first the persistent rule (the quick-allow path), then resolving
+/// the request over the control socket. A row with a name asks what to grant first.
+fn request_approve(app: &mut App) {
+    let Some(req) = selected_request_or_notice(app) else {
+        return;
+    };
+    let narrow = request_allow_target(&req);
+    match request_allow_name(&req) {
+        Some(name) => app.allow_popup = Some(AllowPopup::new(Some(req), name, narrow)),
+        None => app.pending_resolve = Some((req, narrow)),
+    }
+}
+
+/// Queue denying the highlighted pending egress request, which records it on the
+/// blocklist (ADR-0021). An address with a name asks whether to record the address
+/// or the name; a dns row is its exact name and an address with no name is itself,
+/// so there is nothing to ask.
+fn request_block(app: &mut App) {
+    let Some(req) = selected_request_or_notice(app) else {
+        return;
+    };
+    match req.port.and_then(|_| request_allow_name(&req)) {
+        Some(name) => {
+            app.block_popup = Some(BlockPopup {
+                request: req,
+                name,
+                choice: BlockChoice::NamePort,
             })
         }
+        None => app.pending_block = Some(request_block_entry(&req)),
     }
 }
 
@@ -2130,6 +2506,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     if let Some(popup) = &app.allow_popup {
         render_allow_popup(f, popup);
         // The logo is an image above the cells, and would cover the popup.
+        app.logo_place = None;
+    }
+    if let Some(popup) = &app.block_popup {
+        render_block_popup(f, popup);
+        app.logo_place = None;
+    }
+    if let Some(entries) = &app.unblock_confirm {
+        render_unblock_confirm(f, entries);
         app.logo_place = None;
     }
     for cell in &mut f.buffer_mut().content {
@@ -2271,18 +2655,6 @@ fn render_allow_popup(f: &mut Frame, popup: &AllowPopup) {
         )),
     };
 
-    let area = f.area();
-    let width = area.width.min(POPUP_WIDTH);
-    let inner_width = width.saturating_sub(2).max(1);
-    let option_rows = (options.width() as u16).div_ceil(inner_width) + 1;
-    let height = area.height.min(option_rows + 4);
-    let rect = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
-        width,
-        height,
-    };
-
     let what = match (&popup.narrow, &popup.request) {
         (AllowTarget::Flow { ip, port, proto }, _) => {
             format!("{proto} {ip}:{port} via {}", name_tail(&popup.name))
@@ -2291,17 +2663,39 @@ fn render_allow_popup(f: &mut Frame, popup: &AllowPopup) {
     };
     let mut title = vec![Span::raw(format!(" allow {what} "))];
     if let Some(req) = &popup.request {
-        let remaining = req
-            .expires_ts
-            .saturating_sub(sodabox_common::event::now_ts());
-        title.push(Span::styled(
-            format!("{remaining}s "),
-            Style::default().fg(ttl_color(remaining)),
-        ));
+        title.push(popup_countdown(req));
     }
+    render_popup(f, Line::from(title), options, true, bottom);
+}
+
+/// A popup title's countdown of the request being decided.
+fn popup_countdown(req: &PendingRequest) -> Span<'static> {
+    let remaining = req
+        .expires_ts
+        .saturating_sub(sodabox_common::event::now_ts());
+    Span::styled(
+        format!("{remaining}s "),
+        Style::default().fg(ttl_color(remaining)),
+    )
+}
+
+/// The frame of a popup, centered over the panels: `title` on the border, `body`
+/// wrapped inside, then a `[confirm]` marker if it has one, then the `bottom` hint.
+fn render_popup(f: &mut Frame, title: Line, body: Line, confirm: bool, bottom: Line) {
+    let area = f.area();
+    let width = area.width.min(POPUP_WIDTH);
+    let inner_width = width.saturating_sub(2).max(1);
+    let option_rows = (body.width() as u16).div_ceil(inner_width) + 1;
+    let height = area.height.min(option_rows + 4);
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
     let block = Block::bordered()
         .border_style(Style::default().fg(Color::Yellow))
-        .title(Line::from(title));
+        .title(title);
 
     let inner = block.inner(rect);
     f.render_widget(Clear, rect);
@@ -2314,18 +2708,76 @@ fn render_allow_popup(f: &mut Frame, popup: &AllowPopup) {
             Constraint::Length(1),
         ])
         .split(inner);
-    f.render_widget(Paragraph::new(options).wrap(Wrap { trim: true }), rows[0]);
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "[confirm] ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .alignment(ratatui::layout::Alignment::Right),
-        rows[1],
-    );
+    f.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), rows[0]);
+    if confirm {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "[confirm] ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(ratatui::layout::Alignment::Right),
+            rows[1],
+        );
+    }
     f.render_widget(Paragraph::new(bottom), rows[2]);
+}
+
+/// The block popup (see [`BlockPopup`]).
+fn render_block_popup(f: &mut Frame, popup: &BlockPopup) {
+    let chosen = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+    let hint = Style::default().fg(Color::DarkGray);
+    let req = &popup.request;
+    let port = req.port.unwrap_or_default();
+
+    let mut options = Vec::new();
+    for choice in BLOCK_CHOICES {
+        if !options.is_empty() {
+            options.push(Span::styled(" | ", hint));
+        }
+        let label = match choice {
+            BlockChoice::Address => "This IP:port only".to_string(),
+            BlockChoice::NamePort => format!("This name on {} {port}", req.proto),
+            BlockChoice::Name => "All of this name".to_string(),
+        };
+        options.push(if choice == popup.choice {
+            Span::styled(format!(" {label} "), chosen)
+        } else {
+            Span::raw(format!(" {label} "))
+        });
+    }
+
+    let title = Line::from(vec![
+        Span::raw(format!(
+            " block {} {}:{port} via {} ",
+            req.proto,
+            req.destination,
+            name_tail(&popup.name)
+        )),
+        popup_countdown(req),
+    ]);
+    let bottom = Line::from(Span::styled(
+        " ←/→ choose · Enter confirm · Esc cancel",
+        hint,
+    ));
+    render_popup(f, title, Line::from(options), true, bottom);
+}
+
+/// The question whether the blocklist entries a new allow rule overrides should go.
+fn render_unblock_confirm(f: &mut Frame, entries: &[BlocklistEntry]) {
+    let hint = Style::default().fg(Color::DarkGray);
+    let listed: Vec<String> = entries.iter().map(fmt_block).collect();
+    let bottom = Line::from(Span::styled(" y remove · n keep", hint));
+    render_popup(
+        f,
+        Line::from(" this rule overrides blocklist entries: remove them? "),
+        Line::from(listed.join(" · ")),
+        false,
+        bottom,
+    );
 }
 
 fn header(app: &App) -> Paragraph<'static> {
@@ -2630,42 +3082,42 @@ fn render_policy_panel(f: &mut Frame, area: Rect, app: &App) {
         ),
     ])];
 
-    let rules = &app.policy.rules;
-    if rules.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "(deny-all)",
-            Style::default().fg(Color::DarkGray),
-        )));
-        f.render_widget(Paragraph::new(lines).block(block), area);
-        return;
-    }
-
-    // Rows left below the version header; reserve one for the "…" indicator when
-    // the list doesn't fully fit, and keep the selected row inside the window.
+    // Rows left below the version header; the window reserves one for the "…"
+    // indicator when the lists don't fully fit, and keeps the selected row in view.
     let room = inner_h.saturating_sub(1).max(1);
-    let truncated = rules.len() > room;
-    let cap = if truncated {
-        room.saturating_sub(1).max(1)
-    } else {
-        room
-    };
-    let start = match app.policy_sel {
-        Some(i) if i >= cap => (i + 1 - cap).min(rules.len() - cap),
-        _ => 0,
-    };
-    for (idx, r) in rules.iter().enumerate().skip(start).take(cap) {
-        let mut line = Line::from(fmt_rule(r));
-        if focused && app.policy_sel == Some(idx) {
-            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
-        }
-        lines.push(line);
+    let dim = Style::default().fg(Color::DarkGray);
+    let all = policy_lines(app.policy.rules.len(), app.policy.blocklist.len());
+    let window = policy_window(&all, room, app.policy_sel);
+    let mut shown = Vec::new();
+    for &at in &window {
+        lines.push(match &all[at] {
+            PolicyLine::Header(title) => Line::from(Span::styled(
+                *title,
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            PolicyLine::Note(note) => Line::from(Span::styled(*note, dim)),
+            PolicyLine::Row(row) => {
+                shown.push(*row);
+                let text = match app.policy.row(*row) {
+                    Some(PolicyRow::Rule(r)) => fmt_rule(r),
+                    Some(PolicyRow::Blocked(e)) => fmt_block(e),
+                    None => String::new(),
+                };
+                let mut line = Line::from(format!("  {text}"));
+                if focused && app.policy_sel == Some(*row) {
+                    line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+                line
+            }
+        });
     }
-    if truncated {
-        let end = (start + cap).min(rules.len());
-        lines.push(Line::from(Span::styled(
-            format!("… {}–{} of {}", start + 1, end, rules.len()),
-            Style::default().fg(Color::DarkGray),
-        )));
+    if window.len() < all.len() {
+        if let (Some(first), Some(last)) = (shown.first(), shown.last()) {
+            lines.push(Line::from(Span::styled(
+                format!("… {}–{} of {}", first + 1, last + 1, app.policy.rows()),
+                dim,
+            )));
+        }
     }
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -2697,7 +3149,10 @@ fn footer(app: &App) -> Paragraph<'static> {
     let action = match app.focus {
         Focus::Egress | Focus::Dns => "a allow  ",
         Focus::Requests => "a approve  d deny  ",
-        Focus::Policy => "d revoke  ",
+        Focus::Policy => match app.selected_policy_row() {
+            Some(PolicyRow::Blocked(_)) => "d unblock  ",
+            _ => "d revoke  ",
+        },
         Focus::Gateway => "g grant  m unlimited/limited  ",
         Focus::Inference => "",
     };
@@ -3090,23 +3545,281 @@ mod tests {
         // An address with no recent lookup has no name to ask about.
         press(&mut a, KeyCode::Enter);
         assert!(a.allow_popup.is_none());
-        assert_eq!(
-            a.pending_resolve
-                .as_ref()
-                .map(|(r, target)| (r.id, target.is_some())),
-            Some((1, true))
-        );
+        assert_eq!(a.pending_resolve.as_ref().map(|(r, _)| r.id), Some(1));
         a.pending_resolve = None;
+
+        // Denying a dns row records its exact name, with nothing to ask.
+        press(&mut a, KeyCode::Char('j'));
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.allow_popup.is_none() && a.block_popup.is_none());
+        assert!(a.pending_resolve.is_none());
+        assert!(matches!(
+            a.pending_block,
+            Some(BlocklistEntry::Domain {
+                scope: DomainScope::Exact,
+                ports: None,
+                proto: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn denying_an_address_with_no_name_records_exactly_what_the_row_shows() {
+        let mut a = app_with_address_row("203.0.113.5", 22, "tcp", None);
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.block_popup.is_none());
+        assert_eq!(
+            a.pending_block.take(),
+            Some(BlocklistEntry::Ip {
+                cidr: "203.0.113.5".into(),
+                ports: Some("22".into()),
+                proto: Some("tcp".into()),
+            })
+        );
+    }
+
+    /// A non-public address can't be judged through a name, as when approving.
+    #[test]
+    fn denying_a_non_public_address_records_the_address() {
+        let mut a = app_with_address_row("192.168.1.1", 443, "tcp", Some("example.com"));
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.block_popup.is_none());
+        assert!(matches!(a.pending_block, Some(BlocklistEntry::Ip { .. })));
+    }
+
+    #[test]
+    fn denying_an_address_with_a_name_asks_and_prefers_the_name_on_that_port() {
+        let mut a = app_with_address_row("203.0.113.5", 443, "udp", Some("example.com"));
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.pending_block.is_none());
+        assert_eq!(
+            a.block_popup.as_ref().unwrap().choice,
+            BlockChoice::NamePort
+        );
+
+        // Keys go to the popup, and Esc leaves the row undecided.
+        press(&mut a, KeyCode::Esc);
+        assert!(a.block_popup.is_none() && a.pending_block.is_none() && !a.should_quit);
+
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(
+            a.pending_block.take(),
+            Some(BlocklistEntry::Domain {
+                name: "example.com".into(),
+                scope: DomainScope::Exact,
+                ports: Some("443".into()),
+                proto: Some("udp".into()),
+            })
+        );
+
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(
+            a.pending_block.take(),
+            Some(BlocklistEntry::Domain {
+                name: "example.com".into(),
+                scope: DomainScope::Exact,
+                ports: None,
+                proto: None,
+            })
+        );
+
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Left);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(
+            a.pending_block.take(),
+            Some(BlocklistEntry::Ip {
+                cidr: "203.0.113.5".into(),
+                ports: Some("443".into()),
+                proto: Some("udp".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn the_block_popup_renders_over_the_panels() {
+        let mut a = app_with_address_row("203.0.113.5", 443, "udp", Some("example.com"));
+        press(&mut a, KeyCode::Char('d'));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &mut a)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("via example.com"), "{text}");
+        assert!(text.contains("This name on udp 443"), "{text}");
+    }
+
+    fn blocked(name: &str) -> BlocklistEntry {
+        BlocklistEntry::Domain {
+            name: name.into(),
+            scope: DomainScope::Exact,
+            ports: None,
+            proto: None,
+        }
+    }
+
+    /// Allowing a blocked name asks, and nothing goes without a `y`.
+    #[test]
+    fn an_allow_that_overrides_an_entry_asks_before_removing_it() {
+        let mut a = app();
+        a.policy.blocklist = vec![blocked("example.com"), blocked("other.test")];
+        let target = domain_target("example.com", &[(Some("443"), None)]);
+
+        a.offer_unblock(&target);
+        assert_eq!(a.unblock_confirm, Some(vec![blocked("example.com")]));
+
+        // Enter just confirmed the allow; it is no answer to this.
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('q'));
+        assert!(a.unblock_confirm.is_some() && !a.should_quit);
+        assert!(a.pending_unblock.is_none());
+
+        press(&mut a, KeyCode::Char('n'));
+        assert!(a.unblock_confirm.is_none() && a.pending_unblock.is_none());
+
+        a.offer_unblock(&target);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.unblock_confirm.is_none());
+        assert_eq!(a.pending_unblock, Some(vec![blocked("example.com")]));
+    }
+
+    #[test]
+    fn an_allow_that_overrides_nothing_does_not_ask() {
+        let mut a = app();
+        a.policy.blocklist = vec![BlocklistEntry::Domain {
+            name: "example.com".into(),
+            scope: DomainScope::Exact,
+            ports: Some("443".into()),
+            proto: Some("udp".into()),
+        }];
+        a.offer_unblock(&domain_target("example.com", &[(Some("443"), Some("tcp"))]));
+        assert!(a.unblock_confirm.is_none());
+    }
+
+    #[test]
+    fn the_policy_cursor_runs_through_both_lists_and_removes_by_kind() {
+        let mut a = app_with_rules(vec![ip_rule("203.0.113.0/24")]);
+        a.policy.blocklist = vec![blocked("a.test"), blocked("b.test")];
+        a.focus = Focus::Policy;
+
+        // Nothing selected yet: declined with a notice.
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.pending_revoke.is_none() && a.pending_unblock.is_none());
+        assert!(a.notice.is_some());
 
         press(&mut a, KeyCode::Char('j'));
         press(&mut a, KeyCode::Char('d'));
-        assert!(a.allow_popup.is_none());
-        assert_eq!(
-            a.pending_resolve
-                .as_ref()
-                .map(|(r, target)| (r.id, target.is_some())),
-            Some((2, false))
+        assert_eq!(a.pending_revoke.take().as_deref(), Some("203.0.113.0/24"));
+        assert!(a.pending_unblock.is_none());
+
+        // Only the entry under the cursor goes.
+        press(&mut a, KeyCode::Char('j'));
+        press(&mut a, KeyCode::Char('j'));
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.pending_unblock.take(), Some(vec![blocked("b.test")]));
+        assert!(a.pending_revoke.is_none());
+
+        // The cursor stops at the end of the blocklist, and follows it shrinking.
+        press(&mut a, KeyCode::Char('j'));
+        assert_eq!(a.policy_sel, Some(2));
+        a.policy.blocklist.pop();
+        a.clamp_policy_sel();
+        assert_eq!(a.policy_sel, Some(1));
+    }
+
+    fn rendered_policy(a: &mut App, height: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, height)).unwrap();
+        term.draw(|f| render_policy_panel(f, f.area(), a)).unwrap();
+        let buf = term.backend().buffer().clone();
+        buf.content
+            .chunks(60)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    /// An empty allowlist must not hide the blocklist.
+    #[test]
+    fn the_policy_panel_shows_both_sections_even_with_no_rules() {
+        let mut a = app();
+        a.policy.blocklist = vec![blocked("a.test")];
+        let text = rendered_policy(&mut a, 10);
+        assert!(
+            text.contains("Allowlist") && text.contains("(deny-all)"),
+            "{text}"
         );
+        assert!(
+            text.contains("Blocklist") && text.contains("a.test"),
+            "{text}"
+        );
+    }
+
+    /// Scrolled past its title, a row still says which list it is on.
+    #[test]
+    fn a_short_policy_panel_keeps_the_selection_and_its_section_in_view() {
+        let rules = (1..=6).map(|n| ip_rule(&format!("10.0.0.{n}"))).collect();
+        let mut a = app_with_rules(rules);
+        a.policy.blocklist = (1..=6).map(|n| blocked(&format!("b{n}.test"))).collect();
+        a.focus = Focus::Policy;
+
+        // Last of the blocklist.
+        a.policy_sel = Some(11);
+        let text = rendered_policy(&mut a, 7);
+        assert!(text.contains("b6.test"), "{text}");
+        assert!(
+            text.contains("Blocklist") && !text.contains("Allowlist"),
+            "{text}"
+        );
+        assert!(text.contains("of 12"), "{text}");
+
+        // Last of the allowlist.
+        a.policy_sel = Some(5);
+        let text = rendered_policy(&mut a, 7);
+        assert!(text.contains("10.0.0.6"), "{text}");
+        assert!(text.contains("Allowlist"), "{text}");
+
+        // Every position stays visible, down to one row besides the version.
+        for height in 4..12 {
+            for sel in 0..12 {
+                a.policy_sel = Some(sel);
+                let text = rendered_policy(&mut a, height);
+                let want = match sel {
+                    0..=5 => format!("10.0.0.{}", sel + 1),
+                    _ => format!("b{}.test", sel - 5),
+                };
+                assert!(text.contains(&want), "height {height} sel {sel}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_footer_names_what_d_does_on_the_selected_row() {
+        let footer_text = |a: &App| -> String {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 1)).unwrap();
+            term.draw(|f| f.render_widget(footer(a), f.area())).unwrap();
+            term.backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+        let mut a = app_with_rules(vec![ip_rule("10.0.0.1")]);
+        a.policy.blocklist = vec![blocked("a.test")];
+        a.focus = Focus::Policy;
+        a.policy_sel = Some(0);
+        assert!(footer_text(&a).contains("d revoke"));
+        a.policy_sel = Some(1);
+        assert!(footer_text(&a).contains("d unblock"));
     }
 
     /// The Requests panel with one held address row selected.
@@ -3149,10 +3862,7 @@ mod tests {
         assert!(a.allow_popup.is_none());
         let (req, target) = a.pending_resolve.take().unwrap();
         assert_eq!(req.id, 7);
-        assert_eq!(
-            target,
-            Some(domain_target("maybe.test", &[(Some("443"), None)]))
-        );
+        assert_eq!(target, domain_target("maybe.test", &[(Some("443"), None)]));
     }
 
     #[test]
@@ -3217,10 +3927,7 @@ mod tests {
         press(&mut a, KeyCode::Enter);
         assert_eq!(
             a.pending_resolve.take().unwrap().1,
-            Some(domain_target(
-                "maybe.test",
-                &[(Some("8,9-10"), Some("tcp"))]
-            ))
+            domain_target("maybe.test", &[(Some("8,9-10"), Some("tcp"))])
         );
     }
 
@@ -3289,11 +3996,11 @@ mod tests {
         assert!(a.allow_popup.is_none());
         assert_eq!(
             a.pending_resolve.take().unwrap().1,
-            Some(AllowTarget::Flow {
+            AllowTarget::Flow {
                 ip: "192.168.1.1".into(),
                 port: 443,
                 proto: "tcp".into(),
-            })
+            }
         );
     }
 
@@ -3722,10 +4429,10 @@ mod tests {
             qname: "evil.test".into(),
             answers: vec![],
             ttl: 0,
-            reason: Some(RefusalReason::Denied),
+            reason: Some(RefusalReason::Blocklist),
         });
         assert!(text.contains("REFUSED"), "{text}");
-        assert!(text.contains("denied evil.test"), "{text}");
+        assert!(text.contains("blocklist evil.test"), "{text}");
 
         let text = line(&Event::Egress {
             ts: 0,
@@ -3923,13 +4630,16 @@ mod tests {
         ]);
         a.focus = Focus::Policy;
         // Nothing selected yet -> declined gracefully.
-        assert!(a.selected_revoke_target().is_err());
+        request_policy_remove(&mut a);
+        assert!(a.pending_revoke.is_none());
 
         a.policy_select(1); // first rule (ip)
-        assert_eq!(a.selected_revoke_target(), Ok("203.0.113.0/24".to_string()));
+        request_policy_remove(&mut a);
+        assert_eq!(a.pending_revoke.take().as_deref(), Some("203.0.113.0/24"));
 
         a.policy_select(1); // second rule (domain) -> its name is the revoke spec
-        assert_eq!(a.selected_revoke_target(), Ok("example.com".to_string()));
+        request_policy_remove(&mut a);
+        assert_eq!(a.pending_revoke.take().as_deref(), Some("example.com"));
     }
 
     fn egress_to(daddr: &str, dport: u16, verdict: Verdict, ts: u64) -> Event {
@@ -4100,7 +4810,7 @@ mod tests {
         a.policy_select(1);
         a.policy_select(1);
         assert_eq!(a.policy_sel, Some(1));
-        // Simulate a revoke removing the last rule; the cursor clamps into range.
+        // Simulate a deny removing the last rule; the cursor clamps into range.
         a.policy = PolicyView {
             version: 2,
             rules: vec![ip_rule("10.0.0.0/8")],

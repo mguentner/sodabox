@@ -288,10 +288,10 @@ mod tests {
             qname: "evil.test".into(),
             answers: Vec::new(),
             ttl: 0,
-            reason: Some(sodabox_common::event::RefusalReason::TimedOut),
+            reason: Some(sodabox_common::event::RefusalReason::Blocklist),
         })
         .unwrap();
-        assert!(render(&refused).contains("evil.test (timed out)"));
+        assert!(render(&refused).contains("evil.test (blocklist)"));
 
         // A line from before reasons existed still reads.
         let old =

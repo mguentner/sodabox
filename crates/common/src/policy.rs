@@ -23,6 +23,76 @@ pub struct VmPolicy {
     /// allowlist of models: a name without one is rejected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelAlias>,
+    /// What the user decided never to be asked about again (ADR-0021). An entry
+    /// only answers a request no rule covers, so it never grants anything and an
+    /// allow rule wins over it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocklist: Vec<BlocklistEntry>,
+}
+
+/// One `[[blocklist]]` table. An address request matches a `domain` entry through
+/// the name its address came from. Only a `domain` entry with neither `ports` nor
+/// `proto` refuses the name's lookups as well.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum BlocklistEntry {
+    Ip {
+        /// IPv4/IPv6 address or CIDR.
+        cidr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ports: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proto: Option<String>,
+    },
+    Domain {
+        name: String,
+        /// Exact by default, unlike a rule: guests ask for subdomains the user
+        /// hasn't seen, and refusing those silently should be a choice.
+        #[serde(default = "exact_scope")]
+        scope: DomainScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ports: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proto: Option<String>,
+    },
+}
+
+fn exact_scope() -> DomainScope {
+    DomainScope::Exact
+}
+
+impl BlocklistEntry {
+    /// What `soda unblock <spec>` matches: the CIDR or domain name.
+    pub fn target(&self) -> &str {
+        match self {
+            BlocklistEntry::Ip { cidr, .. } => cidr,
+            BlocklistEntry::Domain { name, .. } => name,
+        }
+    }
+
+    /// Check the entry with the parsers it is compiled with.
+    pub fn validate(&self) -> Result<(), String> {
+        use crate::allowlist::{IpCidr, PortSpec, Proto};
+        let (ports, proto) = match self {
+            BlocklistEntry::Ip { cidr, ports, proto } => {
+                IpCidr::parse(cidr)?;
+                (ports, proto)
+            }
+            BlocklistEntry::Domain {
+                name, ports, proto, ..
+            } => {
+                validate_domain(name)?;
+                (ports, proto)
+            }
+        };
+        // Parsing reads an empty list as any port, which nobody means by it.
+        if ports.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            return Err("empty port list".to_string());
+        }
+        PortSpec::parse(ports.as_deref())?;
+        proto.as_deref().map(Proto::parse).transpose()?;
+        Ok(())
+    }
 }
 
 /// The services sodabox itself offers the guest (ADR-0020). A `service` rule
@@ -154,6 +224,24 @@ pub enum DomainScope {
     Subdomains,
     Exact,
     Wildcard,
+}
+
+impl DomainScope {
+    /// Whether this scope on `name` takes in `qname`. Both must be normalized
+    /// (see [`normalize_name`]).
+    pub fn matches(self, name: &str, qname: &str) -> bool {
+        match self {
+            DomainScope::Exact => qname == name,
+            DomainScope::Subdomains => qname == name || qname.ends_with(&format!(".{name}")),
+            DomainScope::Wildcard => qname.ends_with(&format!(".{name}")),
+        }
+    }
+}
+
+/// Lowercase and strip a single trailing dot (FQDN form) for comparison.
+pub fn normalize_name(name: &str) -> String {
+    let n = name.trim().to_ascii_lowercase();
+    n.strip_suffix('.').unwrap_or(&n).to_string()
 }
 
 /// Anti-abuse bounds on the DNS-derived ephemeral egress set (ADR-0005).
@@ -429,7 +517,7 @@ impl Rule {
 
 /// Header written into a freshly-created `policy.toml`.
 pub const POLICY_HEADER: &str =
-    "# sodabox egress policy (deny-by-default). Edit via `soda allow/revoke/policy edit`.\n\
+    "# sodabox egress policy (deny-by-default). Edit via `soda allow/revoke/block/unblock/policy edit`.\n\
      # `version` is managed automatically — it bumps on every change.\n";
 
 /// How long [`PolicyFile::lock`] waits for another writer. Writers hold the lock
@@ -508,7 +596,11 @@ impl PolicyFile {
     pub fn parse(text: &str) -> Result<PolicyFile, String> {
         let doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
         let file = PolicyFile { doc };
-        file.policy()?.validate_models()?;
+        let policy = file.policy()?;
+        policy.validate_models()?;
+        for entry in &policy.blocklist {
+            entry.validate()?;
+        }
         Ok(file)
     }
 
@@ -635,6 +727,49 @@ impl PolicyFile {
         rules.retain(|t| match table_rule(t) {
             Ok(rule) => {
                 let keep = rule.target() != spec;
+                removed += usize::from(!keep);
+                keep
+            }
+            Err(e) => {
+                err.get_or_insert(e);
+                true
+            }
+        });
+        match err {
+            Some(e) => Err(e),
+            None => Ok(removed),
+        }
+    }
+
+    /// Add a `[[blocklist]]` table. Returns `Ok(false)` if an identical entry
+    /// exists.
+    pub fn add_blocklist(&mut self, entry: &BlocklistEntry) -> Result<bool, String> {
+        entry.validate()?;
+        if self.policy()?.blocklist.contains(entry) {
+            return Ok(false);
+        }
+        let text = toml::to_string(entry).map_err(|e| format!("{e}"))?;
+        let doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+        let mut table = fresh_table(doc.as_table());
+        table.decor_mut().set_prefix("\n");
+        self.aot_or_insert("blocklist")?.push(table);
+        Ok(true)
+    }
+
+    /// Remove the `[[blocklist]]` tables `remove` selects, together with the
+    /// comments attached to them. Returns how many were removed.
+    pub fn remove_blocklist(
+        &mut self,
+        remove: impl Fn(&BlocklistEntry) -> bool,
+    ) -> Result<usize, String> {
+        let Some(tables) = self.aot_mut("blocklist") else {
+            return Ok(0);
+        };
+        let mut removed = 0;
+        let mut err = None;
+        tables.retain(|t| match table_entry(t) {
+            Ok(entry) => {
+                let keep = !remove(&entry);
                 removed += usize::from(!keep);
                 keep
             }
@@ -874,6 +1009,12 @@ impl std::fmt::Display for PolicyFile {
 
 /// Deserialize one `[[rules]]` table.
 pub(crate) fn table_rule(table: &toml_edit::Table) -> Result<Rule, String> {
+    toml::from_str(&toml_edit::DocumentMut::from(table.clone()).to_string())
+        .map_err(|e| format!("{e}"))
+}
+
+/// Deserialize one `[[blocklist]]` table.
+fn table_entry(table: &toml_edit::Table) -> Result<BlocklistEntry, String> {
     toml::from_str(&toml_edit::DocumentMut::from(table.clone()).to_string())
         .map_err(|e| format!("{e}"))
 }
@@ -1282,6 +1423,67 @@ initial_quota = 1000
         assert_eq!(f.add_service("inference"), Ok(true));
         // The edited document still parses as a policy.
         PolicyFile::parse(&f.to_string()).unwrap();
+    }
+
+    #[test]
+    fn blocklist_edits_keep_comments_and_leave_rules_alone() {
+        let text =
+            "version = 1\n\n# keep me\n[[rules]]\nkind = \"domain\"\nname = \"example.com\"\n";
+        let mut f = PolicyFile::parse(text).unwrap();
+        let entry = BlocklistEntry::Domain {
+            name: "example.com".into(),
+            scope: DomainScope::Exact,
+            ports: Some("443".into()),
+            proto: Some("udp".into()),
+        };
+        assert_eq!(f.add_blocklist(&entry), Ok(true));
+        assert_eq!(f.add_blocklist(&entry), Ok(false));
+        let ip = BlocklistEntry::Ip {
+            cidr: "203.0.113.5".into(),
+            ports: None,
+            proto: None,
+        };
+        assert_eq!(f.add_blocklist(&ip), Ok(true));
+
+        let parsed = PolicyFile::parse(&f.to_string()).unwrap();
+        assert!(parsed.to_string().contains("# keep me"));
+        let p = parsed.policy().unwrap();
+        assert_eq!(p.blocklist, vec![entry.clone(), ip]);
+        assert_eq!(p.rules.len(), 1);
+
+        // Revoking the name takes the rule and leaves the entry on the same name.
+        assert_eq!(f.remove_matching("example.com"), Ok(1));
+        assert_eq!(f.policy().unwrap().blocklist.len(), 2);
+        // Unblocking the name leaves the address.
+        assert_eq!(f.remove_blocklist(|e| e.target() == "example.com"), Ok(1));
+        assert_eq!(f.remove_blocklist(|e| e.target() == "example.com"), Ok(0));
+        assert_eq!(f.policy().unwrap().blocklist.len(), 1);
+        PolicyFile::parse(&f.to_string()).unwrap();
+    }
+
+    #[test]
+    fn blocklist_domain_scope_defaults_to_exact_and_bad_entries_are_rejected() {
+        let p =
+            PolicyFile::parse("version = 1\n[[blocklist]]\nkind = \"domain\"\nname = \"a.test\"\n")
+                .unwrap()
+                .policy()
+                .unwrap();
+        assert!(matches!(
+            p.blocklist[0],
+            BlocklistEntry::Domain {
+                scope: DomainScope::Exact,
+                ..
+            }
+        ));
+        for bad in [
+            "kind = \"ip\"\ncidr = \"nope\"",
+            "kind = \"domain\"\nname = \"https://x.test/\"",
+            "kind = \"ip\"\ncidr = \"1.2.3.4\"\nports = \"\"",
+            "kind = \"ip\"\ncidr = \"1.2.3.4\"\nproto = \"icmp\"",
+        ] {
+            let text = format!("version = 1\n[[blocklist]]\n{bad}\n");
+            assert!(PolicyFile::parse(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]

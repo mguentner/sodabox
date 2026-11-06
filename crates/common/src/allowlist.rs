@@ -162,6 +162,18 @@ impl PortSpec {
     pub fn contains(&self, port: u16) -> bool {
         self.any || self.ranges.iter().any(|&(lo, hi)| lo <= port && port <= hi)
     }
+
+    /// Whether any port is in both sets.
+    pub fn overlaps(&self, other: &PortSpec) -> bool {
+        self.any
+            || other.any
+            || self.ranges.iter().any(|&(lo, hi)| {
+                other
+                    .ranges
+                    .iter()
+                    .any(|&(other_lo, other_hi)| lo <= other_hi && other_lo <= hi)
+            })
+    }
 }
 
 /// An IPv4/IPv6 address or CIDR network.
@@ -218,6 +230,11 @@ impl IpCidr {
             }
             _ => false, // v4 rule never matches a v6 dst and vice versa
         }
+    }
+
+    /// Does this network contain all of `other`?
+    pub fn covers(&self, other: &IpCidr) -> bool {
+        self.prefix <= other.prefix && self.contains(other.addr)
     }
 }
 
@@ -402,8 +419,8 @@ impl Allowlist {
         let ip = dst.ip();
         let port = dst.port();
 
-        // Static: prefer the most specific match (matters once deny rules exist;
-        // harmless for a pure allowlist, and gives deterministic ordering).
+        // Static: prefer the most specific match, for deterministic ordering. The
+        // blocklist doesn't come in here: it only answers what this denies.
         let mut best: Option<&StaticRule> = None;
         for r in &self.static_rules {
             if r.matches(ip, port, proto)

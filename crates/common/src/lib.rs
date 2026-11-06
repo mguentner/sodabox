@@ -7,6 +7,7 @@
 //!   - control protocol  -> ADR-0007
 
 pub mod allowlist;
+pub mod blocklist;
 pub mod dotfiles;
 pub mod event;
 pub mod git;

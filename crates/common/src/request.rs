@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::allowlist::Proto;
+use crate::blocklist::Blocklist;
 use crate::event::{now_ts, Event, RefusalReason};
 
 /// How long a request is held before it is denied by expiry. Fixed (ADR-0021).
@@ -52,6 +53,8 @@ pub enum RequestVerdict {
     /// The table was at a cap, so it was refused to make room or on the spot.
     /// Nobody decided this, which is why it isn't `Denied`.
     QueueFull,
+    /// A blocklist entry covers it.
+    Blocklisted,
 }
 
 impl RequestVerdict {
@@ -62,6 +65,7 @@ impl RequestVerdict {
             RequestVerdict::Expired => "expired",
             RequestVerdict::Abandoned => "abandoned",
             RequestVerdict::QueueFull => "queue-full",
+            RequestVerdict::Blocklisted => "blocklisted",
         }
     }
 }
@@ -74,6 +78,7 @@ pub fn refusal_reason(verdict: Option<RequestVerdict>) -> RefusalReason {
         Some(RequestVerdict::Approved) => RefusalReason::NotCovered,
         Some(RequestVerdict::Denied) => RefusalReason::Denied,
         Some(RequestVerdict::QueueFull) => RefusalReason::QueueFull,
+        Some(RequestVerdict::Blocklisted) => RefusalReason::Blocklist,
         Some(RequestVerdict::Expired | RequestVerdict::Abandoned) | None => RefusalReason::TimedOut,
     }
 }
@@ -153,6 +158,8 @@ struct Inner {
     origins: Mutex<HashMap<IpAddr, Origin>>,
     /// See [`Readmit`].
     readmit: Mutex<Option<Readmit>>,
+    /// What is refused instead of held.
+    blocklist: Mutex<Blocklist>,
 }
 
 impl Default for Inner {
@@ -163,6 +170,7 @@ impl Default for Inner {
             events: Mutex::new(None),
             origins: Mutex::new(HashMap::new()),
             readmit: Mutex::new(None),
+            blocklist: Mutex::new(Blocklist::default()),
         }
     }
 }
@@ -185,6 +193,39 @@ impl PendingRequests {
     /// built around this table.
     pub fn set_readmit(&self, readmit: Readmit) {
         *self.inner.readmit.lock().unwrap() = Some(readmit);
+    }
+
+    /// Replace what is refused instead of held. Rows it now covers go on the next
+    /// [`Self::refuse_blocklisted`].
+    pub fn set_blocklist(&self, blocklist: Blocklist) {
+        *self.inner.blocklist.lock().unwrap() = blocklist;
+    }
+
+    /// Whether a blocklist entry covers this request.
+    fn blocklisted(&self, proto: &str, destination: &str, port: Option<u16>) -> bool {
+        let blocklist = self.inner.blocklist.lock().unwrap();
+        let Some(port) = port else {
+            return blocklist.blocks_name(destination);
+        };
+        let (Ok(ip), Ok(proto)) = (destination.parse::<IpAddr>(), Proto::parse(proto)) else {
+            return false;
+        };
+        let via = self.origin_of(destination);
+        blocklist.blocks_address(SocketAddr::new(ip, port), proto, via.as_deref())
+    }
+
+    /// Refuse every held request a blocklist entry now covers. The sweep runs this
+    /// after releasing what a rule covers, since an allow rule wins.
+    pub fn refuse_blocklisted(&self) {
+        let mut entries = self.inner.entries.lock().unwrap();
+        let covered: Vec<u64> = entries
+            .iter()
+            .filter(|e| self.blocklisted(&e.info.proto, &e.info.destination, e.info.port))
+            .map(|e| e.info.id)
+            .collect();
+        for id in covered {
+            self.finish_locked(&mut entries, id, RequestVerdict::Blocklisted);
+        }
     }
 
     /// Try to restore the permit for an address request from the name remembered
@@ -249,6 +290,7 @@ impl PendingRequests {
     ///
     /// An address a rule already covers through its remembered name is approved
     /// right here: there is no decision to ask for, so no row and no notification.
+    /// The same goes for a request a blocklist entry covers, which is refused.
     pub fn hold(
         &self,
         proto: &str,
@@ -256,8 +298,15 @@ impl PendingRequests {
         port: Option<u16>,
     ) -> (PendingRequest, oneshot::Receiver<RequestVerdict>) {
         let (tx, rx) = oneshot::channel();
-        if port.is_some_and(|p| self.readmit(proto, destination, p)) {
-            let _ = tx.send(RequestVerdict::Approved);
+        let decided = if port.is_some_and(|p| self.readmit(proto, destination, p)) {
+            Some(RequestVerdict::Approved)
+        } else if self.blocklisted(proto, destination, port) {
+            Some(RequestVerdict::Blocklisted)
+        } else {
+            None
+        };
+        if let Some(verdict) = decided {
+            let _ = tx.send(verdict);
             let info = PendingRequest {
                 id: self.next_id(),
                 proto: proto.to_string(),
@@ -635,6 +684,105 @@ mod tests {
             .all(|rx| rx.try_recv() == Ok(RequestVerdict::QueueFull)));
     }
 
+    fn table_blocking(blocklist: Vec<crate::policy::BlocklistEntry>) -> PendingRequests {
+        let table = shared();
+        table.set_blocklist(
+            Blocklist::from_policy(&crate::policy::VmPolicy {
+                blocklist,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        table
+    }
+
+    fn blocked_name(ports: Option<&str>, proto: Option<&str>) -> crate::policy::BlocklistEntry {
+        crate::policy::BlocklistEntry::Domain {
+            name: "example.com".into(),
+            scope: crate::policy::DomainScope::Exact,
+            ports: ports.map(Into::into),
+            proto: proto.map(Into::into),
+        }
+    }
+
+    /// No row and no notification: that is the point of the blocklist.
+    #[tokio::test]
+    async fn a_blocklisted_request_is_refused_without_a_row_or_an_event() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = events.clone();
+        let table = shared().with_events(Arc::new(move |e: Event| {
+            sink_events.lock().unwrap().push(e);
+        }));
+        table.set_blocklist(
+            Blocklist::from_policy(&crate::policy::VmPolicy {
+                blocklist: vec![blocked_name(None, None)],
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let (_, mut dns) = table.hold("dns", "example.com.", None);
+        assert_eq!(dns.try_recv(), Ok(RequestVerdict::Blocklisted));
+        assert!(table.list().is_empty());
+        assert!(events.lock().unwrap().is_empty());
+
+        // Its neighbour is still a question.
+        let (_, mut other) = table.hold("dns", "www.example.com", None);
+        assert!(other.try_recv().is_err());
+        assert_eq!(table.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_name_entry_refuses_addresses_through_their_remembered_lookup() {
+        let table = table_blocking(vec![blocked_name(Some("443"), Some("udp"))]);
+        table.note_resolved("203.0.113.5".parse().unwrap(), "example.com.");
+
+        let (_, mut quic) = table.hold("udp", "203.0.113.5", Some(443));
+        assert_eq!(quic.try_recv(), Ok(RequestVerdict::Blocklisted));
+        // The rest of that address, and an address with no lookup, still ask.
+        let (_, mut tcp) = table.hold("tcp", "203.0.113.5", Some(443));
+        let (_, mut unknown) = table.hold("udp", "198.51.100.1", Some(443));
+        assert!(tcp.try_recv().is_err());
+        assert!(unknown.try_recv().is_err());
+    }
+
+    /// An allow wins: a request a rule covers through its name is approved, not
+    /// refused, whatever the blocklist says.
+    #[tokio::test]
+    async fn a_covering_rule_beats_a_blocklist_entry() {
+        let table = table_blocking(vec![blocked_name(None, None)]);
+        table.note_resolved("203.0.113.5".parse().unwrap(), "example.com");
+        table.set_readmit(Arc::new(|_, _, _| true));
+
+        let (_, mut rx) = table.hold("tcp", "203.0.113.5", Some(443));
+        assert_eq!(rx.try_recv(), Ok(RequestVerdict::Approved));
+    }
+
+    #[tokio::test]
+    async fn a_new_entry_clears_the_rows_it_covers_on_the_next_sweep() {
+        let table = shared();
+        table.note_resolved("203.0.113.5".parse().unwrap(), "example.com");
+        table.note_resolved("203.0.113.6".parse().unwrap(), "example.com");
+        let (_, mut a) = table.hold("udp", "203.0.113.5", Some(443));
+        let (_, mut b) = table.hold("udp", "203.0.113.6", Some(443));
+        let (_, mut c) = table.hold("tcp", "203.0.113.6", Some(443));
+        table.refuse_blocklisted();
+        assert_eq!(table.list().len(), 3);
+
+        table.set_blocklist(
+            Blocklist::from_policy(&crate::policy::VmPolicy {
+                blocklist: vec![blocked_name(Some("443"), Some("udp"))],
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        table.refuse_blocklisted();
+        assert_eq!(a.try_recv(), Ok(RequestVerdict::Blocklisted));
+        assert_eq!(b.try_recv(), Ok(RequestVerdict::Blocklisted));
+        assert!(c.try_recv().is_err());
+        assert_eq!(table.list().len(), 1);
+    }
+
     #[test]
     fn every_verdict_explains_a_refusal() {
         use RefusalReason as R;
@@ -643,6 +791,7 @@ mod tests {
             (Some(RequestVerdict::Denied), R::Denied),
             (Some(RequestVerdict::Expired), R::TimedOut),
             (Some(RequestVerdict::QueueFull), R::QueueFull),
+            (Some(RequestVerdict::Blocklisted), R::Blocklist),
             (None, R::TimedOut),
         ] {
             assert_eq!(refusal_reason(verdict), reason);

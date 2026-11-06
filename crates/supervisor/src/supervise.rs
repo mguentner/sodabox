@@ -43,6 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sodabox_common::allowlist::{Allowlist, Proto, SharedAllowlist};
+use sodabox_common::blocklist::Blocklist;
 use sodabox_common::event::Event;
 use sodabox_common::policy::VmPolicy;
 use sodabox_common::vm::{LaunchDisks, Persist, VmMeta};
@@ -623,6 +624,9 @@ async fn serve(
     // onto the same ring so the CLI/TUI and the audit log both see them. Its
     // sweep starts below, once the resolver's domain rules exist.
     let pending = sodabox_common::request::shared().with_events(event_sink.clone().as_sink());
+    pending.set_blocklist(
+        Blocklist::from_policy(&plan.policy).map_err(|e| anyhow::anyhow!("invalid policy: {e}"))?,
+    );
 
     // Filter proxy: enforce the allowlist, dial the allow-path from *this* (host)
     // netns so it isn't re-intercepted, and emit allowed/blocked events.
@@ -702,6 +706,7 @@ async fn serve(
             loop {
                 tick.tick().await;
                 release_covered(&pending, &allowlist, &domains);
+                pending.refuse_blocklisted();
                 pending.expire_due();
             }
         });
@@ -1069,8 +1074,9 @@ impl ControlHandler for SupervisorState {
     }
 
     fn policy_set(&self, policy: VmPolicy) -> Result<(), String> {
-        // Reject bad model aliases before anything changes.
+        // Reject bad model aliases and blocklist entries before anything changes.
         policy.validate_models()?;
+        let blocklist = Blocklist::from_policy(&policy)?;
         // Live swap: atomically replace static rules + version and
         // purge only the ephemerals of removed domains, keeping surviving domains'
         // cached IPs (working flows are not disrupted). `swap_policy` validates the
@@ -1094,6 +1100,11 @@ impl ControlHandler for SupervisorState {
                 .write()
                 .map_err(|_| "domain allowlist poisoned".to_string())?;
             d.swap_policy(&policy)?;
+        }
+        // Rows the new entries cover go on the next sweep, after the rules have
+        // released theirs.
+        if let Some(pending) = &self.pending {
+            pending.set_blocklist(blocklist);
         }
         // The gateway's aliases, quota modes and access, and its DNS name.
         if let Some(g) = &self.gateway {
@@ -1464,6 +1475,95 @@ mod tests {
         };
         assert!(state.policy_set(bad).is_err());
         assert_eq!(state.policy_get().version, 9);
+    }
+
+    #[tokio::test]
+    async fn policy_set_applies_the_blocklist_and_a_bad_one_changes_nothing() {
+        use sodabox_common::policy::BlocklistEntry;
+        use sodabox_common::request::RequestVerdict;
+
+        let (tx, _rx) = broadcast::channel(4);
+        let al = shared(Allowlist::from_policy(&VmPolicy::default()).unwrap());
+        let pending = sodabox_common::request::shared();
+        let state = SupervisorState::new(VmPolicy::default(), al.clone(), empty_domains(), tx)
+            .with_pending(pending.clone());
+        let entry = |cidr: &str| BlocklistEntry::Ip {
+            cidr: cidr.into(),
+            ports: None,
+            proto: None,
+        };
+
+        // Held before the entry exists; the sweep clears it afterwards.
+        let (_, mut held) = pending.hold("tcp", "203.0.113.5", Some(22));
+        let good = VmPolicy {
+            version: 2,
+            blocklist: vec![entry("203.0.113.5")],
+            ..VmPolicy::default()
+        };
+        state.policy_set(good).unwrap();
+        pending.refuse_blocklisted();
+        assert_eq!(held.try_recv(), Ok(RequestVerdict::Blocklisted));
+        let (_, mut again) = pending.hold("tcp", "203.0.113.5", Some(22));
+        assert_eq!(again.try_recv(), Ok(RequestVerdict::Blocklisted));
+
+        // A bad entry rejects the policy before the good rule beside it applies.
+        let bad = VmPolicy {
+            version: 3,
+            rules: vec![Rule::Ip {
+                cidr: "10.0.0.0/8".into(),
+                ports: None,
+                proto: None,
+            }],
+            blocklist: vec![entry("not-a-cidr")],
+            ..VmPolicy::default()
+        };
+        assert!(state.policy_set(bad).is_err());
+        assert_eq!(state.policy_get().version, 2);
+        assert!(!al
+            .read()
+            .unwrap()
+            .evaluate(
+                "10.0.0.1:443".parse().unwrap(),
+                Proto::Tcp,
+                std::time::Instant::now()
+            )
+            .is_allow());
+        let (_, mut still) = pending.hold("tcp", "203.0.113.5", Some(22));
+        assert_eq!(still.try_recv(), Ok(RequestVerdict::Blocklisted));
+    }
+
+    /// An allow wins: the sweep releases what a rule covers before it refuses what
+    /// an entry covers, so a row covered by both is approved.
+    #[tokio::test]
+    async fn the_sweep_order_lets_an_allow_win_over_a_blocklist_entry() {
+        use sodabox_common::blocklist::Blocklist;
+        use sodabox_common::policy::{BlocklistEntry, DomainScope};
+        use sodabox_common::request::RequestVerdict;
+
+        let pending = sodabox_common::request::shared();
+        let (_, mut held) = pending.hold("dns", "both.test", None);
+        let policy = VmPolicy {
+            rules: vec![Rule::Resolve {
+                name: "both.test".into(),
+                scope: DomainScope::Exact,
+            }],
+            blocklist: vec![BlocklistEntry::Domain {
+                name: "both.test".into(),
+                scope: DomainScope::Exact,
+                ports: None,
+                proto: None,
+            }],
+            ..VmPolicy::default()
+        };
+        let al = shared(Allowlist::from_policy(&policy).unwrap());
+        let domains = sodabox_dns::domain::shared(
+            sodabox_dns::domain::DomainAllowlist::from_policy(&policy).unwrap(),
+        );
+        pending.set_blocklist(Blocklist::from_policy(&policy).unwrap());
+
+        release_covered(&pending, &al, &domains);
+        pending.refuse_blocklisted();
+        assert_eq!(held.try_recv(), Ok(RequestVerdict::Approved));
     }
 
     #[test]

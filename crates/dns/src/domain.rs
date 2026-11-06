@@ -10,7 +10,7 @@
 use std::sync::{Arc, RwLock};
 
 use sodabox_common::allowlist::{PortSpec, Proto};
-use sodabox_common::policy::{DomainScope, Rule, VmPolicy};
+use sodabox_common::policy::{normalize_name as normalize, DomainScope, Rule, VmPolicy};
 
 /// The live domain allowlist shared between the DNS filter (reader, on every
 /// query) and the control plane (writer, on a live policy swap). Mirrors
@@ -41,13 +41,7 @@ pub struct DomainRule {
 
 impl DomainRule {
     fn matches(&self, qname: &str) -> bool {
-        match self.scope {
-            DomainScope::Exact => qname == self.name,
-            DomainScope::Subdomains => {
-                qname == self.name || qname.ends_with(&format!(".{}", self.name))
-            }
-            DomainScope::Wildcard => qname.ends_with(&format!(".{}", self.name)),
-        }
+        self.scope.matches(&self.name, qname)
     }
 }
 
@@ -122,12 +116,6 @@ impl DomainAllowlist {
         self.rules = rebuilt.rules;
         Ok(())
     }
-}
-
-/// Lowercase and strip a single trailing dot (FQDN form) for comparison.
-fn normalize(name: &str) -> String {
-    let n = name.trim().to_ascii_lowercase();
-    n.strip_suffix('.').unwrap_or(&n).to_string()
 }
 
 #[cfg(test)]

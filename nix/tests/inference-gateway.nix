@@ -232,7 +232,7 @@ in
         assert status == 404 and json.loads(text)["error"]["code"] == "model_not_found", text
 
     with subtest("revoking access hides the gateway"):
-        sb("deny inference")
+        sb("revoke inference")
         # The guest may cache the answer for its TTL (30 s).
         machine.wait_until_succeeds(
             f"sb ssh {VM} -- '! getent hosts inference.sodabox.internal'", timeout=120

@@ -37,6 +37,9 @@ soda ls
 soda allow ip <cidr> [--ports …] [--vm <vm>]
 soda allow domain <name> [--exact|--wildcard] [--vm <vm>]
 soda revoke <rule>
+soda block ip <cidr> [--ports …] [--proto …] [--vm <vm>]
+soda block domain <name> [--subdomains|--wildcard] [--ports …] [--proto …] [--vm <vm>]
+soda unblock <target> [--vm <vm>]
 soda policy show|edit|push
 soda tui <vm>          # live monitor
 soda logs <vm>
@@ -60,8 +63,9 @@ bash, zsh and fish stubs; anyone else sources `COMPLETE=<shell> soda`.
     matched rule / reason, counts. Blocked entries highlighted.
   - **DNS panel:** queries with name, verdict (allowed/refused), resolved IPs,
     TTL, and which egress entries they authorized.
-  - **Policy panel:** current effective policy version + a quick view of rules;
-    hotkeys to allow/deny a highlighted blocked destination on the spot.
+  - **Policy panel:** current effective policy version + the allowlist and the
+    blocklist ([ADR-0021](0021-pending-egress-requests.md)); hotkeys to revoke a
+    highlighted rule or unblock a highlighted entry on the spot.
   - **VM status:** state, cpu/mem, uptime.
 - Read-primary but supports quick actions (e.g. press to allow a just-blocked
   IP/domain), which issue control-socket commands (ADR-0006 live update).

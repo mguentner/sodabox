@@ -134,6 +134,8 @@ impl Tokens {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RefusalReason {
+    /// A `[[blocklist]]` entry matched, so nobody was asked.
+    Blocklist,
     /// Refused over the control socket, with nothing recorded.
     Denied,
     /// Nobody answered within the hold.
@@ -150,6 +152,7 @@ impl RefusalReason {
     /// The label on TUI rows and in `soda logs`.
     pub fn label(self) -> &'static str {
         match self {
+            RefusalReason::Blocklist => "blocklist",
             RefusalReason::Denied => "denied",
             RefusalReason::TimedOut => "timed out",
             RefusalReason::QueueFull => "queue full",

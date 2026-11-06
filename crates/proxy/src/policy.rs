@@ -351,6 +351,52 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
+    /// Nobody is asked, and the refusal says why.
+    #[tokio::test]
+    async fn a_blocklisted_dst_is_refused_at_once_with_its_reason() {
+        use sodabox_common::blocklist::Blocklist;
+        use sodabox_common::event::RefusalReason;
+        use sodabox_common::policy::BlocklistEntry;
+
+        struct Sink(std::sync::Mutex<Vec<Event>>);
+        impl EgressEvents for Sink {
+            fn emit(&self, event: Event) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let echo = spawn_echo().await;
+        let al = allowlist_allowing("203.0.113.1:9".parse().unwrap());
+        let pending = sodabox_common::request::shared();
+        pending.set_blocklist(
+            Blocklist::from_policy(&VmPolicy {
+                blocklist: vec![BlocklistEntry::Ip {
+                    cidr: echo.ip().to_string(),
+                    ports: None,
+                    proto: None,
+                }],
+                ..VmPolicy::default()
+            })
+            .unwrap(),
+        );
+        let sink = Arc::new(Sink(std::sync::Mutex::new(Vec::new())));
+        let dialer = PolicyDialer::new(al, Arc::new(DirectDialer), Proto::Tcp)
+            .with_pending(pending.clone())
+            .with_events(sink.clone());
+
+        let err = dialer.dial(echo).await.expect_err("must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(pending.list().is_empty());
+        assert!(matches!(
+            sink.0.lock().unwrap().as_slice(),
+            [Event::Egress {
+                verdict: Verdict::Blocked,
+                reason: Some(RefusalReason::Blocklist),
+                ..
+            }]
+        ));
+    }
+
     #[tokio::test]
     async fn emits_allowed_and_blocked_events() {
         use crate::events::ChannelEvents;

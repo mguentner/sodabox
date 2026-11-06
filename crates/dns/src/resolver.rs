@@ -721,6 +721,57 @@ mod tests {
         }
     }
 
+    /// Nobody is asked, nothing goes upstream, and the refusal says why. An allowed
+    /// name on the blocklist still resolves: an allow rule wins.
+    #[tokio::test]
+    async fn a_blocklisted_name_is_refused_at_once_with_its_reason() {
+        use sodabox_common::blocklist::Blocklist;
+        use sodabox_common::event::RefusalReason;
+        use sodabox_common::policy::BlocklistEntry;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (r, _al) = resolver_with_domain("allowed.test");
+        let pending = sodabox_common::request::shared();
+        let entry = |name: &str| BlocklistEntry::Domain {
+            name: name.into(),
+            scope: DomainScope::Exact,
+            ports: None,
+            proto: None,
+        };
+        pending.set_blocklist(
+            Blocklist::from_policy(&VmPolicy {
+                blocklist: vec![entry("nope.test"), entry("allowed.test")],
+                ..VmPolicy::default()
+            })
+            .unwrap(),
+        );
+        let r = r
+            .with_pending(pending.clone())
+            .with_events(Arc::new(ChannelEvents::new(tx)));
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let query = |name| wire::parse_query(&wire::build_query(0x22, name, TYPE_A).unwrap());
+
+        match r.handle(query("nope.test").unwrap(), peer).await {
+            Response::Packet(p) => assert_eq!(p[3] & 0x0f, RCODE_REFUSED),
+            Response::Drop => panic!("should have replied"),
+        }
+        assert!(pending.list().is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Event::Dns {
+                verdict: DnsVerdict::Refused,
+                reason: Some(RefusalReason::Blocklist),
+                ..
+            })
+        ));
+
+        // No upstreams are configured: SERVFAIL is proof it got past the filter.
+        match r.handle(query("allowed.test").unwrap(), peer).await {
+            Response::Packet(p) => assert_eq!(p[3] & 0x0f, RCODE_SERVFAIL),
+            Response::Drop => panic!("should have replied"),
+        }
+    }
+
     #[tokio::test]
     async fn unlisted_name_proceeds_past_the_filter_on_approval() {
         // Approve *is* a persistent rule: the domain lands in the (live) domain
