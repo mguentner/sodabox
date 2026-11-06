@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use sodabox_common::allowlist::{is_public_ip, EphemeralEntry, Proto, SharedAllowlist};
 use sodabox_common::event::{now_ts, DnsVerdict, Event};
 use sodabox_common::policy::{Limits, VmPolicy};
-use sodabox_common::request::{PendingRequests, RequestVerdict, REQUEST_TTL};
+use sodabox_common::request::{refusal_reason, PendingRequests, RequestVerdict, REQUEST_TTL};
 use tokio::net::UdpSocket;
 
 use crate::domain::{self, DomainAllowlist, DomainRule, SharedDomainAllowlist};
@@ -344,6 +344,7 @@ impl QueryHandler for FilteringResolver {
                 qname: name,
                 answers: answers.iter().filter_map(answer_ip).collect(),
                 ttl: LOCAL_TTL,
+                reason: None,
             });
             let packet = wire::build_response(&query, RCODE_NOERROR, &answers);
             return Box::pin(async move { Response::Packet(packet) });
@@ -367,17 +368,20 @@ impl QueryHandler for FilteringResolver {
             // leaks to the host resolver (the ADR-0005 anti-exfil property
             // holds); retransmissions coalesce in the request table.
             let mut matched = matched;
+            let mut reason = None;
             if matched.is_empty() {
                 if let Some(pending) = &pending {
                     let (_, rx) = pending.hold("dns", &name, None);
-                    if matches!(
-                        tokio::time::timeout(REQUEST_TTL, rx).await,
-                        Ok(Ok(RequestVerdict::Approved))
-                    ) {
+                    let verdict = tokio::time::timeout(REQUEST_TTL, rx)
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                    if verdict == Some(RequestVerdict::Approved) {
                         // Approve *is* a persistent rule: re-read the (just
                         // updated) domain allowlist, exactly like the live swap.
                         matched = rules_for(&domains, &name);
                     }
+                    reason = Some(refusal_reason(verdict));
                 }
             }
             if matched.is_empty() {
@@ -389,6 +393,7 @@ impl QueryHandler for FilteringResolver {
                     qname: name,
                     answers: Vec::new(),
                     ttl: 0,
+                    reason,
                 });
                 return Response::Packet(wire::build_response(&query, RCODE_REFUSED, &[]));
             }
@@ -431,6 +436,7 @@ impl QueryHandler for FilteringResolver {
                 qname: name,
                 answers: answers.iter().filter_map(answer_ip).collect(),
                 ttl: answers.iter().map(|a| a.ttl).min().unwrap_or(0),
+                reason: None,
             });
 
             Response::Packet(wire::build_response(&query, parsed.rcode, &answers))

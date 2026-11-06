@@ -70,8 +70,8 @@ bash, zsh and fish stubs; anyone else sources `COMPLETE=<shell> soda`.
 
 ```
 Event =
-  | Egress   { ts, verdict: Allowed|Blocked, proto, saddr, daddr, dport, rule? }
-  | Dns      { ts, verdict: Allowed|Refused, qname, qtype, answers[], ttl }
+  | Egress   { ts, verdict: Allowed|Blocked, proto, saddr, daddr, dport, rule?, reason? }
+  | Dns      { ts, verdict: Allowed|Refused, qname, qtype, answers[], ttl, reason? }
   | Policy   { ts, version, change }
   | Lifecycle{ ts, state }
 ```

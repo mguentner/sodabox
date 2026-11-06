@@ -134,6 +134,7 @@ mod tests {
             daddr: "203.0.113.1".into(),
             dport: 443,
             rule: None,
+            reason: None,
         })
         .unwrap();
         tx.send(Event::Policy { ts: 2, version: 7 }).unwrap();

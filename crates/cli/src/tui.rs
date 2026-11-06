@@ -66,7 +66,7 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use sodabox_common::allowlist::{is_public_ip, PortSpec};
-use sodabox_common::event::{DnsVerdict, Event, Verdict};
+use sodabox_common::event::{DnsVerdict, Event, RefusalReason, Verdict};
 use sodabox_common::paths;
 use sodabox_common::policy::{
     DomainScope, GatewayConfig, ModelAlias, PolicyFile, QuotaMode, Rule, VmPolicy,
@@ -2809,16 +2809,15 @@ fn event_line(ev: &Event) -> Line<'static> {
             daddr,
             dport,
             rule,
+            reason,
         } => {
             let (tag, color) = match verdict {
                 Verdict::Allowed => ("ALLOW", Color::Green),
                 Verdict::Blocked => ("BLOCK", Color::Red),
             };
-            let mut spans = vec![
-                ts_span(*ts),
-                tag_span(tag, color),
-                Span::raw(format!("{proto} {daddr}:{dport}")),
-            ];
+            let mut spans = vec![ts_span(*ts), tag_span(tag, color)];
+            spans.extend(reason_span(*reason));
+            spans.push(Span::raw(format!("{proto} {daddr}:{dport}")));
             if let Some(r) = rule {
                 spans.push(Span::styled(
                     format!("  ({r})"),
@@ -2833,6 +2832,7 @@ fn event_line(ev: &Event) -> Line<'static> {
             qname,
             answers,
             ttl,
+            reason,
         } => {
             let (tag, color) = match verdict {
                 DnsVerdict::Allowed => ("OK", Color::Green),
@@ -2843,7 +2843,10 @@ fn event_line(ev: &Event) -> Line<'static> {
             } else {
                 format!("{qname} -> {} (ttl {ttl})", answers.join(","))
             };
-            Line::from(vec![ts_span(*ts), tag_span(tag, color), Span::raw(detail)])
+            let mut spans = vec![ts_span(*ts), tag_span(tag, color)];
+            spans.extend(reason_span(*reason));
+            spans.push(Span::raw(detail));
+            Line::from(spans)
         }
         Event::Inference { ts, verdict, .. } => {
             let color = match verdict {
@@ -2974,6 +2977,12 @@ fn ts_span(ts: u64) -> Span<'static> {
     )
 }
 
+/// Why a row was refused, right after its tag: a long name gets cut off at the
+/// panel's edge, and must not take the reason with it.
+fn reason_span(reason: Option<RefusalReason>) -> Option<Span<'static>> {
+    reason.map(|r| Span::styled(format!("{} ", r.label()), Style::default().fg(Color::Red)))
+}
+
 fn tag_span(tag: &str, color: Color) -> Span<'static> {
     Span::styled(
         format!(" {tag:<8} "),
@@ -2993,6 +3002,7 @@ mod tests {
             daddr: "203.0.113.1".into(),
             dport: 443,
             rule: None,
+            reason: None,
         }
     }
 
@@ -3012,6 +3022,7 @@ mod tests {
             qname: "example.com".into(),
             answers: vec!["93.184.216.34".into()],
             ttl: 300,
+            reason: None,
         }
     }
 
@@ -3297,6 +3308,7 @@ mod tests {
             qname: "www.example.com.".into(),
             answers: Vec::new(),
             ttl: 0,
+            reason: None,
         });
         a.focus = Focus::Dns;
         a.dns.sel = Some(0);
@@ -3685,12 +3697,46 @@ mod tests {
             qname: "evil.test".into(),
             answers: vec![],
             ttl: 0,
+            reason: None,
         });
         let text: String = refused.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text.contains("REFUSED") && text.contains("evil.test"),
             "got {text:?}"
         );
+    }
+
+    /// The reason sits before the name, which may get cut off at the panel's edge.
+    #[test]
+    fn a_refused_row_says_why_before_its_destination() {
+        let line = |ev: &Event| -> String {
+            event_line(ev)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let text = line(&Event::Dns {
+            ts: 0,
+            verdict: DnsVerdict::Refused,
+            qname: "evil.test".into(),
+            answers: vec![],
+            ttl: 0,
+            reason: Some(RefusalReason::Denied),
+        });
+        assert!(text.contains("REFUSED"), "{text}");
+        assert!(text.contains("denied evil.test"), "{text}");
+
+        let text = line(&Event::Egress {
+            ts: 0,
+            verdict: Verdict::Blocked,
+            proto: "tcp".into(),
+            daddr: "203.0.113.5".into(),
+            dport: 443,
+            rule: None,
+            reason: Some(RefusalReason::TimedOut),
+        });
+        assert!(text.contains("timed out tcp 203.0.113.5:443"), "{text}");
     }
 
     fn allowed_egress(ts: u64) -> Event {
@@ -3701,6 +3747,7 @@ mod tests {
             daddr: "10.0.0.5".into(),
             dport: 443,
             rule: Some("ip 10.0.0.0/8".into()),
+            reason: None,
         }
     }
 
@@ -3711,6 +3758,7 @@ mod tests {
             qname: "evil.test.".into(),
             answers: vec![],
             ttl: 0,
+            reason: None,
         }
     }
 
@@ -3892,6 +3940,7 @@ mod tests {
             daddr: daddr.into(),
             dport,
             rule: None,
+            reason: None,
         }
     }
 
@@ -3992,6 +4041,7 @@ mod tests {
             qname: "Evil.Test".into(),
             answers: vec![],
             ttl: 0,
+            reason: None,
         });
         a.ingest(dns(2)); // example.com
         assert_eq!(a.dns.len(true), 2);
@@ -4387,6 +4437,7 @@ mod tests {
             qname: hostile.into(),
             answers: Vec::new(),
             ttl: 0,
+            reason: None,
         });
         // A highlighted row takes its own rendering path.
         a.request_sel = Some(1);

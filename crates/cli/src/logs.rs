@@ -136,6 +136,7 @@ fn render_event(ev: &Event) -> String {
             daddr,
             dport,
             rule,
+            reason,
         } => {
             let tag = match verdict {
                 Verdict::Allowed => "ALLOW",
@@ -145,6 +146,9 @@ fn render_event(ev: &Event) -> String {
             if let Some(r) = rule {
                 d.push_str(&format!(" ({r})"));
             }
+            if let Some(r) = reason {
+                d.push_str(&format!(" ({})", r.label()));
+            }
             (*ts, tag, d)
         }
         Event::Dns {
@@ -153,16 +157,20 @@ fn render_event(ev: &Event) -> String {
             qname,
             answers,
             ttl,
+            reason,
         } => {
             let tag = match verdict {
                 DnsVerdict::Allowed => "DNS-OK",
                 DnsVerdict::Refused => "DNS-REF",
             };
-            let d = if answers.is_empty() {
+            let mut d = if answers.is_empty() {
                 qname.clone()
             } else {
                 format!("{qname} -> {} (ttl {ttl})", answers.join(","))
             };
+            if let Some(r) = reason {
+                d.push_str(&format!(" ({})", r.label()));
+            }
             (*ts, tag, d)
         }
         Event::Inference { ts, verdict, .. } => {
@@ -256,6 +264,7 @@ mod tests {
             daddr: "203.0.113.1".into(),
             dport: 443,
             rule: None,
+            reason: None,
         })
         .unwrap();
         let line = render(&block);
@@ -268,9 +277,26 @@ mod tests {
             qname: "example.com".into(),
             answers: vec!["93.184.216.34".into()],
             ttl: 300,
+            reason: None,
         })
         .unwrap();
         assert!(render(&dns).contains("example.com -> 93.184.216.34 (ttl 300)"));
+
+        let refused = serde_json::to_string(&Event::Dns {
+            ts: 0,
+            verdict: DnsVerdict::Refused,
+            qname: "evil.test".into(),
+            answers: Vec::new(),
+            ttl: 0,
+            reason: Some(sodabox_common::event::RefusalReason::TimedOut),
+        })
+        .unwrap();
+        assert!(render(&refused).contains("evil.test (timed out)"));
+
+        // A line from before reasons existed still reads.
+        let old =
+            r#"{"type":"dns","ts":0,"verdict":"refused","qname":"evil.test","answers":[],"ttl":0}"#;
+        assert!(render(old).contains("DNS-REF"));
 
         // A torn/garbage line is surfaced with a `?` marker, not dropped.
         assert!(render("{not json").contains('?'));
@@ -287,6 +313,7 @@ mod tests {
                 qname: HOSTILE.into(),
                 answers: Vec::new(),
                 ttl: 0,
+                reason: None,
             },
             Event::RequestPending {
                 ts: 0,

@@ -39,8 +39,8 @@ use tokio::net::UdpSocket;
 use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrIn};
 
 use sodabox_common::allowlist::{Decision, Proto, SharedAllowlist};
-use sodabox_common::event::{Event, Verdict};
-use sodabox_common::request::{PendingRequests, RequestVerdict, REQUEST_TTL};
+use sodabox_common::event::{Event, RefusalReason, Verdict};
+use sodabox_common::request::{refusal_reason, PendingRequests, RequestVerdict, REQUEST_TTL};
 
 use crate::events::{now_ts, null_sink, EgressEvents};
 
@@ -286,7 +286,7 @@ impl TransparentUdpProxy {
                         tokio::spawn(hold_udp_flow(holder, guest, dst, datagram.to_vec()));
                         continue;
                     }
-                    emit(&self.events, dst, Verdict::Blocked, None);
+                    emit(&self.events, dst, Verdict::Blocked, None, None);
                     None
                 }
                 allow => {
@@ -295,7 +295,7 @@ impl TransparentUdpProxy {
                         Decision::AllowEphemeral { domain } => domain,
                         Decision::Deny => unreachable!(),
                     };
-                    emit(&self.events, dst, Verdict::Allowed, Some(rule));
+                    emit(&self.events, dst, Verdict::Allowed, Some(rule), None);
                     open_flow(&self.connector, &self.sink, guest, dst, datagram)
                 }
             };
@@ -362,8 +362,11 @@ async fn hold_udp_flow(args: HoldArgs, guest: SocketAddrV4, dst: SocketAddrV4, f
     let (_, rx) = args
         .pending
         .hold("udp", &dst.ip().to_string(), Some(dst.port()));
-    let verdict = tokio::time::timeout(REQUEST_TTL, rx).await;
-    let approved = matches!(verdict, Ok(Ok(RequestVerdict::Approved)));
+    let verdict = tokio::time::timeout(REQUEST_TTL, rx)
+        .await
+        .ok()
+        .and_then(Result::ok);
+    let approved = verdict == Some(RequestVerdict::Approved);
     let decision = match args.allowlist.read() {
         Ok(al) if approved => al.evaluate(SocketAddr::V4(dst), Proto::Udp, Instant::now()),
         _ => Decision::Deny,
@@ -375,11 +378,18 @@ async fn hold_udp_flow(args: HoldArgs, guest: SocketAddrV4, dst: SocketAddrV4, f
                 dst,
                 Verdict::Allowed,
                 Some("granted".to_string()),
+                None,
             );
             open_flow(&args.connector, &args.sink, guest, dst, &first)
         }
         Decision::Deny => {
-            emit(&args.events, dst, Verdict::Blocked, None);
+            emit(
+                &args.events,
+                dst,
+                Verdict::Blocked,
+                None,
+                Some(refusal_reason(verdict)),
+            );
             None
         }
     };
@@ -395,7 +405,13 @@ async fn hold_udp_flow(args: HoldArgs, guest: SocketAddrV4, dst: SocketAddrV4, f
 
 /// Emit one egress verdict event (free-standing so spawned hold tasks share
 /// the receive loop's emission shape).
-fn emit(events: &Arc<dyn EgressEvents>, dst: SocketAddrV4, verdict: Verdict, rule: Option<String>) {
+fn emit(
+    events: &Arc<dyn EgressEvents>,
+    dst: SocketAddrV4,
+    verdict: Verdict,
+    rule: Option<String>,
+    reason: Option<RefusalReason>,
+) {
     events.emit(Event::Egress {
         ts: now_ts(),
         verdict,
@@ -403,6 +419,7 @@ fn emit(events: &Arc<dyn EgressEvents>, dst: SocketAddrV4, verdict: Verdict, rul
         daddr: dst.ip().to_string(),
         dport: dst.port(),
         rule,
+        reason,
     });
 }
 

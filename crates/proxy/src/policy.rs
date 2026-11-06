@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use sodabox_common::allowlist::{Decision, Proto};
 use sodabox_common::event::{Event, Verdict};
-use sodabox_common::request::{RequestVerdict, REQUEST_TTL};
+use sodabox_common::request::{refusal_reason, RequestVerdict, REQUEST_TTL};
 // Re-exported so proxy callers keep a single import site.
 pub use sodabox_common::allowlist::{shared, SharedAllowlist};
 
@@ -76,6 +76,7 @@ impl<D: Dialer> PolicyDialer<D> {
             daddr: dst.ip().to_string(),
             dport: dst.port(),
             rule,
+            reason: None,
         });
     }
 }
@@ -117,23 +118,24 @@ impl<D: Dialer> Dialer for PolicyDialer<D> {
                     .to_string();
                     let (info, rx) = pending.hold("tcp", &dst.ip().to_string(), Some(dst.port()));
                     return Box::pin(async move {
-                        let verdict = tokio::time::timeout(REQUEST_TTL, rx).await;
-                        match verdict {
-                            Ok(Ok(RequestVerdict::Approved)) => {}
-                            _ => {
-                                events.emit(Event::Egress {
-                                    ts: now_ts(),
-                                    verdict: Verdict::Blocked,
-                                    proto: proto_s.clone(),
-                                    daddr: dst.ip().to_string(),
-                                    dport: dst.port(),
-                                    rule: None,
-                                });
-                                return Err(io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    format!("egress denied by policy: {dst}"),
-                                ));
-                            }
+                        let verdict = tokio::time::timeout(REQUEST_TTL, rx)
+                            .await
+                            .ok()
+                            .and_then(Result::ok);
+                        if verdict != Some(RequestVerdict::Approved) {
+                            events.emit(Event::Egress {
+                                ts: now_ts(),
+                                verdict: Verdict::Blocked,
+                                proto: proto_s.clone(),
+                                daddr: dst.ip().to_string(),
+                                dport: dst.port(),
+                                rule: None,
+                                reason: Some(refusal_reason(verdict)),
+                            });
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                format!("egress denied by policy: {dst}"),
+                            ));
                         }
                         // Re-check the (just-updated) allowlist.
                         let decision = match allowlist.read() {
@@ -149,6 +151,7 @@ impl<D: Dialer> Dialer for PolicyDialer<D> {
                                     daddr: dst.ip().to_string(),
                                     dport: dst.port(),
                                     rule: Some(format!("granted (request {})", info.id)),
+                                    reason: None,
                                 });
                                 inner.dial(dst).await
                             }
@@ -160,6 +163,7 @@ impl<D: Dialer> Dialer for PolicyDialer<D> {
                                     daddr: dst.ip().to_string(),
                                     dport: dst.port(),
                                     rule: None,
+                                    reason: Some(refusal_reason(verdict)),
                                 });
                                 Err(io::Error::new(
                                     io::ErrorKind::PermissionDenied,

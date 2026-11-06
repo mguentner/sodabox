@@ -17,6 +17,9 @@ pub enum Event {
         dport: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule: Option<String>,
+        /// Why a blocked flow was refused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<RefusalReason>,
     },
     /// A DNS decision from the filtering resolver (ADR-0005).
     Dns {
@@ -26,6 +29,9 @@ pub enum Event {
         #[serde(default)]
         answers: Vec<String>,
         ttl: u32,
+        /// Why a refused query was refused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<RefusalReason>,
     },
     /// One request through the inference gateway (ADR-0020). Metadata only:
     /// prompts and completions are never part of an event.
@@ -121,6 +127,35 @@ impl Tokens {
 
     pub fn total(&self) -> u64 {
         self.input + self.output
+    }
+}
+
+/// Why a request ended in a refusal (ADR-0021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RefusalReason {
+    /// Refused over the control socket, with nothing recorded.
+    Denied,
+    /// Nobody answered within the hold.
+    TimedOut,
+    /// The request table was full, so nobody was asked.
+    QueueFull,
+    /// Approved, but no rule covered it when it was re-checked.
+    NotCovered,
+    /// The gateway is off or the guest has no `service` rule for it.
+    NoAccess,
+}
+
+impl RefusalReason {
+    /// The label on TUI rows and in `soda logs`.
+    pub fn label(self) -> &'static str {
+        match self {
+            RefusalReason::Denied => "denied",
+            RefusalReason::TimedOut => "timed out",
+            RefusalReason::QueueFull => "queue full",
+            RefusalReason::NotCovered => "not covered",
+            RefusalReason::NoAccess => "no access",
+        }
     }
 }
 

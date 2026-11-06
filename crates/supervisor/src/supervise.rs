@@ -976,6 +976,7 @@ impl LocalService for GatewayService {
                     daddr: GATEWAY_IP.to_string(),
                     dport: GATEWAY_PORT,
                     rule: None,
+                    reason: Some(sodabox_common::event::RefusalReason::NoAccess),
                 });
             }
         })
@@ -1592,6 +1593,7 @@ mod tests {
             daddr: "203.0.113.1".into(),
             dport: 443,
             rule: None,
+            reason: None,
         };
         tx.send(ev).unwrap();
         let got = sub.try_recv().unwrap();

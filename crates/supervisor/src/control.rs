@@ -522,6 +522,7 @@ mod tests {
             daddr: "203.0.113.9".into(),
             dport: 443,
             rule: None,
+            reason: None,
         };
         loop {
             if handler.events.receiver_count() > 0 {

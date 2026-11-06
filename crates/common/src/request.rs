@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::allowlist::Proto;
-use crate::event::{now_ts, Event};
+use crate::event::{now_ts, Event, RefusalReason};
 
 /// How long a request is held before it is denied by expiry. Fixed (ADR-0021).
 pub const REQUEST_TTL: Duration = Duration::from_secs(30);
@@ -49,6 +49,9 @@ pub enum RequestVerdict {
     Expired,
     /// Every enforcement call waiting on it went away (the client gave up).
     Abandoned,
+    /// The table was at a cap, so it was refused to make room or on the spot.
+    /// Nobody decided this, which is why it isn't `Denied`.
+    QueueFull,
 }
 
 impl RequestVerdict {
@@ -58,7 +61,20 @@ impl RequestVerdict {
             RequestVerdict::Denied => "denied",
             RequestVerdict::Expired => "expired",
             RequestVerdict::Abandoned => "abandoned",
+            RequestVerdict::QueueFull => "queue-full",
         }
+    }
+}
+
+/// Why a held call ended up refused, from the verdict it received (`None` if its
+/// own wait ran out first). `Approved` here means the re-check that follows an
+/// approval found no rule.
+pub fn refusal_reason(verdict: Option<RequestVerdict>) -> RefusalReason {
+    match verdict {
+        Some(RequestVerdict::Approved) => RefusalReason::NotCovered,
+        Some(RequestVerdict::Denied) => RefusalReason::Denied,
+        Some(RequestVerdict::QueueFull) => RefusalReason::QueueFull,
+        Some(RequestVerdict::Expired | RequestVerdict::Abandoned) | None => RefusalReason::TimedOut,
     }
 }
 
@@ -261,7 +277,7 @@ impl PendingRequests {
             e.info.proto == proto && e.info.destination == destination && e.info.port == port
         }) {
             if held(&entries) >= MAX_WAITERS {
-                let _ = tx.send(RequestVerdict::Denied);
+                let _ = tx.send(RequestVerdict::QueueFull);
             } else {
                 entries[idx].waiters.push(tx);
             }
@@ -273,7 +289,7 @@ impl PendingRequests {
         while entries.len() >= MAX_PENDING || held(&entries) >= MAX_WAITERS {
             if let Some(oldest) = entries.first() {
                 let id = oldest.info.id;
-                self.finish_locked(&mut entries, id, RequestVerdict::Denied);
+                self.finish_locked(&mut entries, id, RequestVerdict::QueueFull);
             } else {
                 break;
             }
@@ -590,7 +606,7 @@ mod tests {
         // One more: the oldest is denied early (FIFO).
         let (_newest, _nrx) = table.hold("tcp", "198.51.100.200", Some(80));
         let (info, mut rx) = first.unwrap();
-        assert_eq!(rx.try_recv(), Ok(RequestVerdict::Denied));
+        assert_eq!(rx.try_recv(), Ok(RequestVerdict::QueueFull));
         assert_eq!(table.list().len(), MAX_PENDING);
         assert!(table.list().iter().all(|r| r.id != info.id));
     }
@@ -606,7 +622,7 @@ mod tests {
 
         // One call too many for the held destination: denied now, row kept.
         let (info, mut extra) = table.hold("tcp", "203.0.113.5", Some(443));
-        assert_eq!(extra.try_recv(), Ok(RequestVerdict::Denied));
+        assert_eq!(extra.try_recv(), Ok(RequestVerdict::QueueFull));
         assert_eq!(table.list().len(), 1);
         assert_eq!(table.list()[0].id, info.id);
 
@@ -616,6 +632,20 @@ mod tests {
         assert_eq!(table.list(), vec![new]);
         assert!(held
             .iter_mut()
-            .all(|rx| rx.try_recv() == Ok(RequestVerdict::Denied)));
+            .all(|rx| rx.try_recv() == Ok(RequestVerdict::QueueFull)));
+    }
+
+    #[test]
+    fn every_verdict_explains_a_refusal() {
+        use RefusalReason as R;
+        for (verdict, reason) in [
+            (Some(RequestVerdict::Approved), R::NotCovered),
+            (Some(RequestVerdict::Denied), R::Denied),
+            (Some(RequestVerdict::Expired), R::TimedOut),
+            (Some(RequestVerdict::QueueFull), R::QueueFull),
+            (None, R::TimedOut),
+        ] {
+            assert_eq!(refusal_reason(verdict), reason);
+        }
     }
 }
