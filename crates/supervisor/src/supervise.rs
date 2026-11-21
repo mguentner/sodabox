@@ -1118,7 +1118,15 @@ impl ControlHandler for SupervisorState {
             .policy
             .lock()
             .map_err(|_| "policy poisoned".to_string())?;
+        let version = policy.version;
         *p = policy;
+        drop(p);
+        // Tell subscribers (the TUI re-fetches the rules on a new version). No
+        // subscriber is not an error.
+        let _ = self.events.send(Event::Policy {
+            ts: sodabox_common::event::now_ts(),
+            version,
+        });
         Ok(())
     }
 
@@ -1614,6 +1622,29 @@ mod tests {
         .unwrap();
         assert!(state.policy_set(dup).is_err());
         assert_eq!(state.status().1, 3);
+    }
+
+    #[test]
+    fn policy_set_announces_the_new_version() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let al = shared(Allowlist::from_policy(&VmPolicy::default()).unwrap());
+        let state = SupervisorState::new(VmPolicy::default(), al, empty_domains(), tx);
+
+        let next: VmPolicy = toml::from_str("version = 5\n").unwrap();
+        state.policy_set(next).unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Event::Policy { version: 5, .. })
+        ));
+
+        // A rejected policy changes nothing, so it announces nothing.
+        let dup: VmPolicy = toml::from_str(
+            "version = 6\n[[models]]\nalias = \"a\"\nprovider = \"p\"\nmodel = \"m\"\n\
+             [[models]]\nalias = \"a\"\nprovider = \"p\"\nmodel = \"n\"\n",
+        )
+        .unwrap();
+        assert!(state.policy_set(dup).is_err());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
