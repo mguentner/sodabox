@@ -176,6 +176,7 @@
                 openssh
                 rsync
                 git
+                go-grip
               ]);
           };
         }
