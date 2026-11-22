@@ -9,9 +9,9 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "26c3794de36bba9afdb0cb269fa4ab390e09f9ca",
-      "url": "https://github.com/numtide/llm-agents.nix/archive/26c3794de36bba9afdb0cb269fa4ab390e09f9ca.tar.gz",
-      "hash": "sha256-rqeK3hPxa6960ivXTRb+wO74tKKecqeH2CiKIxxFJuU="
+      "revision": "63d305102e15a499ae19e54cbbff715382590a1c",
+      "url": "https://github.com/numtide/llm-agents.nix/archive/63d305102e15a499ae19e54cbbff715382590a1c.tar.gz",
+      "hash": "sha256-RPjEcxvqjtbqVbyIHviPV8IDiMnMitu0VlowFnd8pXw="
     },
     "nixpkgs": {
       "type": "Git",
@@ -22,9 +22,9 @@
       },
       "branch": "nixos-unstable",
       "submodules": false,
-      "revision": "3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2",
-      "url": "https://github.com/NixOS/nixpkgs/archive/3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2.tar.gz",
-      "hash": "sha256-bc7rSpXIdn9QWGNqfWcPZWOhEVF8NoeAZkWq0XWnf/k="
+      "revision": "2786a2a72088ecf32aea5b3ec52099e6a7cff78f",
+      "url": "https://github.com/NixOS/nixpkgs/archive/2786a2a72088ecf32aea5b3ec52099e6a7cff78f.tar.gz",
+      "hash": "sha256-f/VVvxf5RsQgWVhUtefoca5ktVg0DA2bnkMOcmSnozo="
     }
   },
   "version": 8
