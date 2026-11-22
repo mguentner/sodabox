@@ -4,6 +4,8 @@
 
 microVMs for agents, analyses and experiments powered by NixOS
 
+![sodabox tui](./assets/tui.gif)
+
 - run multiple VMs on a single host
 - fully filtered traffic egress using policies and profiles
 - ssh access
