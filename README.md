@@ -46,6 +46,8 @@ from which traffic is routed out using `TPROXY` nftables commands to a final pro
 running in the host. This combination makes sodabox a 100% user-space solution without needing
 to modify the host (no tun/tap interfaces, `CAP_NET_ADMIN`, custom firewall chains)!
 
+![sodabox architecture](./assets/architecture.png)
+
 ## Usage
 
 ### Check requirements
