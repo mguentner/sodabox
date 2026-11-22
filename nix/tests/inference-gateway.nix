@@ -73,9 +73,18 @@ in
     services.ollama.enable = true;
     # Lay the model out in Ollama's (writable) models dir as symlinks into the
     # store: no 500 MB copy, and Ollama sees an ordinary pulled model.
+    # Except the manifest: cp -rs leaves it a symlink to a file called "0.6b",
+    # which newer Ollama refuses (a pull stores the manifest as a
+    # blobs/sha256-<digest> blob and symlinks the tag to it, and a manifest
+    # symlink that points at anything else is bad). A plain file — the legacy
+    # manifest layout — is still parsed, and it's ~1 KiB, so copy that for
+    # real.
     systemd.services.ollama.preStart = ''
       mkdir -p "$OLLAMA_MODELS"
       cp -rsf --no-preserve=mode ${model}/. "$OLLAMA_MODELS"/
+      cp --remove-destination \
+        ${model}/manifests/registry.ollama.ai/library/qwen3/0.6b \
+        "$OLLAMA_MODELS"/manifests/registry.ollama.ai/library/qwen3/0.6b
     '';
 
     users.users.alice = {

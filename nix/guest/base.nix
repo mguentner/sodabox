@@ -37,15 +37,6 @@
   # No bootloader — cloud-hypervisor boots the kernel + initrd directly.
   boot.loader.grub.enable = false;
 
-  # systemd in stage-1: the writable-store upper lives on the
-  # persistent disk, so the disk must be formatted (`x-systemd.makefs`) and
-  # mounted in the initrd *before* the /nix/store overlay assembles.
-  # `systemd-makefs` and the mount-dependency ordering (overlay-after-disk, via
-  # the upperdir path) only exist under systemd initrd; the scripted initrd
-  # cannot makefs. Stage-1 is also where the folder layout is created (see
-  # `persistent-layout` below).
-  boot.initrd.systemd.enable = true;
-
   # Drivers stage-1 needs to reach the virtio store image and assemble the
   # overlay, plus console/net/data.
   boot.initrd.availableKernelModules = [
