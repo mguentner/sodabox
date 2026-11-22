@@ -359,6 +359,10 @@ then review these commits (e.g. `git show examplevm/main`) and merge / cherry-pi
 - https://github.com/illustris/cogbox
 - https://github.com/microvm-nix/microvm.nix
 
+## Transparency
+
+Built mostly using agents. Human facing content (documentation, TUI) was edited by an human.
+
 ## License
 
 MIT
