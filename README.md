@@ -35,6 +35,46 @@ the host.
 * User + Network Namespaces enabled
 * for one running VM, 8GiB Disk and 2 GiB RAM
 
+## Installation
+
+### With flakes
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.sodabox.url = "github:mguentner/sodabox";
+
+  outputs =
+    { nixpkgs, sodabox, ... }:
+    {
+      nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+        modules = [
+          (
+            { pkgs, ... }:
+            {
+              nixpkgs.overlays = [ sodabox.overlays.default ];
+              environment.systemPackages = [ pkgs.sodabox ];
+            }
+          )
+        ];
+      };
+    };
+}
+```
+
+### Without flakes
+
+```nix
+{ pkgs, ... }:
+let
+  sodabox = fetchTarball "https://github.com/mguentner/sodabox/archive/main.tar.gz";
+in
+{
+  nixpkgs.overlays = [ (import "${sodabox}/nix/overlay.nix") ];
+  environment.systemPackages = [ pkgs.sodabox ];
+}
+```
+
 ## Architecture
 
 The architecture of sodabox tries to keep the trusted computing base (TCB) as minimal as possible.
