@@ -12,7 +12,7 @@ interface Props {
 const { code, lang = "plaintext", title } = Astro.props;
 ---
 
-<div class="border border-dim bg-surface">
+<div class="min-w-0 border border-dim bg-surface">
   {title && <div class="border-b border-dim px-3 py-1 text-sm text-muted">{title}</div>}
   <Shiki
     code={code.replace(/^\n|\n\s*$/g, "")}
