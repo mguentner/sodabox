@@ -184,8 +184,26 @@ in
       // Highlight the tab of the panel in view, and jump with number keys like the TUI.
       const tabs = [...document.querySelectorAll<HTMLAnchorElement>("[data-tab]")];
       const byId = new Map(tabs.map((t) => [t.dataset.tab!, t]));
-      const setActive = (id: string | null) =>
+      // On narrow screens the tab list scrolls sideways; keep the active tab in view.
+      // Only the list scrolls horizontally, never the page.
+      const tabList = tabs[0]?.closest("ul");
+      let lastActive: string | null = null;
+      const revealTab = (tab: HTMLElement) => {
+        if (!tabList || tabList.scrollWidth <= tabList.clientWidth) return;
+        const list = tabList.getBoundingClientRect();
+        const item = tab.getBoundingClientRect();
+        // centre the tab so its neighbours peek out on both sides
+        const left = tabList.scrollLeft + (item.left + item.right) / 2 - (list.left + list.right) / 2;
+        const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+        tabList.scrollTo({ left, behavior: reduce ? "auto" : "smooth" });
+      };
+      const setActive = (id: string | null) => {
         tabs.forEach((t) => t.toggleAttribute("data-active", t.dataset.tab === id));
+        if (id === lastActive) return;
+        lastActive = id;
+        if (id === null) tabList?.scrollTo({ left: 0, behavior: "smooth" });
+        else revealTab(byId.get(id)!);
+      };
 
       // Active = last section whose top has passed a line just below the sticky header.
       // This matches where anchor jumps land (scroll-padding-top), even for short panels.
