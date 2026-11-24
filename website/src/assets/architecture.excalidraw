@@ -39,6 +39,6 @@
 
     {"type":"arrow","id":"arr_soda_net","x":1042,"y":400,"width":116,"height":0,"strokeColor":"#047857","backgroundColor":"transparent","fillStyle":"solid","strokeWidth":2,"strokeStyle":"solid","roughness":0,"opacity":100,"angle":0,"seed":900005,"version":1,"versionNonce":900006,"isDeleted":false,"groupIds":[],"boundElements":null,"link":null,"locked":false,"points":[[0,0],[116,0]],"startBinding":{"elementId":"soda_rect","focus":0,"gap":2},"endBinding":{"elementId":"net_ellipse","focus":0,"gap":2},"startArrowhead":null,"endArrowhead":"arrow"}
   ],
-  "appState": {"viewBackgroundColor":"#ffffff","gridSize":20},
+  "appState": {"viewBackgroundColor":"transparent","exportBackground":false,"gridSize":20},
   "files": {}
 }

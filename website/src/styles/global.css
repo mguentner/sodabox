@@ -1,0 +1,157 @@
+@import "tailwindcss";
+
+/* Source Code Pro, vendored (SIL OFL 1.1, see ../fonts/OFL.txt) */
+@font-face {
+  font-family: "Source Code Pro";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url("../fonts/source-code-pro-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "Source Code Pro";
+  font-style: italic;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url("../fonts/source-code-pro-latin-wght-italic.woff2") format("woff2-variations");
+}
+
+/*
+ * Palette.
+ * Dark values are sampled from the sodabox TUI (screenshot.png).
+ * Light values keep the same hues, darkened so text stays readable on paper.
+ *
+ *   bg       terminal background
+ *   surface  slightly raised background (code blocks, hover)
+ *   fg       default text, focused borders of inactive panels
+ *   dim      DarkGray: inactive borders, timestamps, hints
+ *   muted    readable secondary text (between dim and fg)
+ *   yellow   focus, active tab, panel titles
+ *   green    ALLOW / OK / running
+ *   red      REFUSED / blocklist
+ *   cyan     values (policy version)
+ */
+:root {
+  color-scheme: light;
+  --c-bg: #f7f6f2;
+  --c-surface: #ecebe5;
+  --c-fg: #1c1e22;
+  --c-dim: #b4b5b9;
+  --c-muted: #5f6168;
+  --c-yellow: #8f6210;
+  --c-yellow-bg: #deb566;
+  --c-green: #2a7d45;
+  --c-red: #a8352b;
+  --c-cyan: #1d6b7e;
+}
+
+/* dark: follows the system unless the theme switcher forced light (data-theme on <html>) */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --c-bg: #1c1e22;
+    --c-surface: #26282d;
+    --c-fg: #e6e8ef;
+    --c-dim: #494b51;
+    --c-muted: #8d9099;
+    --c-yellow: #deb566;
+    --c-yellow-bg: #deb566;
+    --c-green: #5ab977;
+    --c-red: #b54036;
+    --c-cyan: #3f94a8;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --c-bg: #1c1e22;
+  --c-surface: #26282d;
+  --c-fg: #e6e8ef;
+  --c-dim: #494b51;
+  --c-muted: #8d9099;
+  --c-yellow: #deb566;
+  --c-yellow-bg: #deb566;
+  --c-green: #5ab977;
+  --c-red: #b54036;
+  --c-cyan: #3f94a8;
+}
+
+@theme {
+  --font-mono: "Source Code Pro", ui-monospace, monospace;
+  --color-bg: var(--c-bg);
+  --color-surface: var(--c-surface);
+  --color-fg: var(--c-fg);
+  --color-dim: var(--c-dim);
+  --color-muted: var(--c-muted);
+  --color-yellow: var(--c-yellow);
+  --color-yellow-bg: var(--c-yellow-bg);
+  --color-green: var(--c-green);
+  --color-red: var(--c-red);
+  --color-cyan: var(--c-cyan);
+}
+
+@layer base {
+  html {
+    font-family: var(--font-mono);
+    background: var(--c-bg);
+    color: var(--c-fg);
+    scroll-padding-top: 3rem;
+  }
+  body {
+    background: var(--c-bg);
+    font-size: 15px;
+    line-height: 1.6;
+  }
+  ::selection {
+    background: var(--c-yellow-bg);
+    color: #1c1e22;
+  }
+  a {
+    color: var(--c-cyan);
+    text-decoration: underline;
+    text-decoration-color: var(--c-dim);
+    text-underline-offset: 3px;
+  }
+  a:hover {
+    text-decoration-color: currentColor;
+  }
+  :focus-visible {
+    outline: 1px solid var(--c-yellow);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* prose inside panels: inline code and paragraphs */
+  .tui-prose p + p {
+    margin-top: 0.75rem;
+  }
+  /* Markdown pages (imprint): headings like TUI section labels */
+  .tui-prose h2,
+  .tui-prose h3 {
+    margin-top: 1.5rem;
+    margin-bottom: 0.25rem;
+    font-weight: 700;
+  }
+  .tui-prose h3 {
+    font-weight: 400;
+    color: var(--c-muted);
+  }
+  .tui-prose > :first-child {
+    margin-top: 0;
+  }
+  .tui-prose ul,
+  .tui-prose ol {
+    margin-top: 0.5rem;
+    padding-left: 2ch;
+  }
+  .tui-prose ul > li::marker {
+    content: "* ";
+    color: var(--c-dim);
+  }
+  .tui-prose ol {
+    list-style: decimal;
+  }
+  .tui-prose code {
+    color: var(--c-yellow);
+  }
+}

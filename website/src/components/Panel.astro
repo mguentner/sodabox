@@ -1,0 +1,36 @@
+---
+// A bordered box with its title set into the top border, like a ratatui Block.
+interface Props {
+  title?: string;
+  id?: string;
+  focused?: boolean;
+  class?: string;
+}
+
+const { title, id, focused = false, class: className } = Astro.props;
+---
+
+<section
+  id={id}
+  data-panel
+  class:list={[
+    "relative min-w-0 border px-3 pt-4 pb-3 sm:px-4",
+    focused ? "border-yellow" : "border-dim",
+    className,
+  ]}
+>
+  {
+    title && (
+      <h2
+        class:list={[
+          "absolute -top-[0.8em] left-3 bg-bg px-1 text-base font-normal leading-normal",
+          focused ? "text-yellow" : "text-muted",
+        ]}
+      >
+        {title}
+        {focused && <span aria-hidden="true"> ◂</span>}
+      </h2>
+    )
+  }
+  <slot />
+</section>

@@ -42,6 +42,8 @@
       packages = forAllSystems (
         _system: pkgs: rec {
           sodabox = pkgs.callPackage ./nix/package.nix { };
+          # Static landing page (website/), `nix build .#website` -> result/ is the site root.
+          website = pkgs.callPackage ./nix/website.nix { };
           default = sodabox;
         }
       );
@@ -85,6 +87,7 @@
                 rsync
                 git
                 go-grip
+                excalidraw-cli
               ]);
           };
         }

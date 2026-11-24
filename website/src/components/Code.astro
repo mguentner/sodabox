@@ -1,0 +1,23 @@
+---
+// Syntax-highlighted block in TUI colours (Shiki at build time, no client JS).
+import { Code as Shiki } from "astro:components";
+import { tuiTheme } from "./shikiTheme";
+
+interface Props {
+  code: string;
+  lang?: string;
+  title?: string;
+}
+
+const { code, lang = "plaintext", title } = Astro.props;
+---
+
+<div class="border border-dim bg-surface">
+  {title && <div class="border-b border-dim px-3 py-1 text-sm text-muted">{title}</div>}
+  <Shiki
+    code={code.replace(/^\n|\n\s*$/g, "")}
+    lang={lang as any}
+    theme={tuiTheme}
+    class="px-3 py-2 text-[13px] leading-relaxed"
+  />
+</div>

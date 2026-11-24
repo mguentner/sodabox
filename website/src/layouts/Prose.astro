@@ -1,0 +1,15 @@
+---
+// Layout for Markdown pages (e.g. imprint.md): one panel titled with the page title.
+import Base from "./Base.astro";
+import Panel from "../components/Panel.astro";
+
+const { frontmatter } = Astro.props;
+---
+
+<Base title={frontmatter.title}>
+  <main class="mx-auto max-w-3xl px-4 pt-8 pb-10">
+    <Panel title={frontmatter.title} focused>
+      <div class="tui-prose"><slot /></div>
+    </Panel>
+  </main>
+</Base>

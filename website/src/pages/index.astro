@@ -1,0 +1,244 @@
+---
+// All human-readable text on this page is taken verbatim from ../../../README.md.
+// See AGENTS.md: do not write new copy here, ask the operator.
+// Tabs in the top bar are defined in ../layouts/Base.astro.
+import Base from "../layouts/Base.astro";
+import Panel from "../components/Panel.astro";
+import Code from "../components/Code.astro";
+import header from "../assets/readme_header.png";
+import tui from "../assets/tui.webm";
+import architecture from "../assets/architecture.png";
+
+const features = [
+  "run multiple VMs on a single host",
+  "fully filtered traffic egress using policies and profiles",
+  "ssh access",
+  "an inference gateway: LLM providers without API keys in the VM, with token quotas",
+  "file transfer via rsync or git",
+  "ephemeral, home-persisted or full-persisted VMs",
+  "disk, memory and CPU cores are configurable",
+  "user-space only, no need to change system configuration!",
+];
+
+// `backticks` render as inline code
+const requirements = [
+  "Linux only, WSL might work",
+  "KVM enabled, available to your user (part of group `kvm`)",
+  "Nix daemon installed",
+  "User + Network Namespaces enabled",
+  "for one running VM, 8GiB Disk and 2 GiB RAM",
+];
+
+const influences = [
+  "https://github.com/finbarr/yolobox",
+  "https://github.com/illustris/cogbox",
+  "https://github.com/microvm-nix/microvm.nix",
+];
+
+const withFlakes = `
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.sodabox.url = "github:mguentner/sodabox";
+
+  outputs =
+    { nixpkgs, sodabox, ... }:
+    {
+      nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+        modules = [
+          (
+            { pkgs, ... }:
+            {
+              nixpkgs.overlays = [ sodabox.overlays.default ];
+              environment.systemPackages = [ pkgs.sodabox ];
+            }
+          )
+        ];
+      };
+    };
+}`;
+
+const withoutFlakes = `
+{ pkgs, ... }:
+let
+  sodabox = fetchTarball "https://github.com/mguentner/sodabox/archive/main.tar.gz";
+in
+{
+  nixpkgs.overlays = [ (import "\${sodabox}/nix/overlay.nix") ];
+  environment.systemPackages = [ pkgs.sodabox ];
+}`;
+---
+
+<Base>
+    <main id="top" class="mx-auto grid max-w-6xl grid-cols-1 gap-x-3 gap-y-7 px-4 pt-8 pb-10 lg:grid-cols-3">
+      <Panel focused class="lg:col-span-2">
+        <img src={header.src} width={header.width} height={header.height} alt="sodabox" class="h-auto w-full max-w-xl" />
+        <p class="mt-4 text-lg">microVMs for agents, analyses and experiments powered by NixOS</p>
+        <ul class="mt-4 space-y-0.5">
+          {
+            features.map((f) => (
+              <li class="flex gap-3">
+                <span class="shrink-0 text-green" aria-hidden="true">[ ok ]</span>
+                <span>{f}</span>
+              </li>
+            ))
+          }
+        </ul>
+      </Panel>
+
+      <Panel id="requirements" title="Requirements">
+        <ul class="tui-prose space-y-2">
+          {
+            requirements.map((r) => (
+              <li class="flex gap-2">
+                <span class="text-dim" aria-hidden="true">*</span>
+                <span>{r.split("`").map((part, i) => (i % 2 ? <code>{part}</code> : part))}</span>
+              </li>
+            ))
+          }
+        </ul>
+      </Panel>
+
+      <Panel id="why" title="Why" class="lg:col-span-3">
+        Running agents directly on your host can be dangerous as they may have access to private
+        data and can easily wreak havoc. Moreover through prompt injections attackers can target
+        developer machines and exfiltrate secrets or install malware.
+        That is why more and more people start sandboxing their agents.
+      </Panel>
+
+      <Panel class="lg:col-span-3">
+        <video
+          src={tui}
+          width="1078"
+          height="550"
+          autoplay
+          loop
+          muted
+          playsinline
+          aria-label="sodabox tui"
+          class="h-auto w-full"
+        ></video>
+      </Panel>
+
+      <Panel id="threat-model" title="Threat model" class="tui-prose lg:col-span-3">
+        <p>sodabox is created for coding agents but can be used to execute arbitrary untrusted applications.</p>
+        <p>
+          Its threat model assumes that the whole guest system is untrusted and thus all network access
+          must be fully controlled by policies.
+          A sodabox VM has its own data disks. Data is copied into these disks and from them intentionally
+          as the VM itself is regarded untrusted. That way, a VM cannot, by accident, delete the content
+          of a folder that has been mounted using e.g. virtiofs.
+        </p>
+        <p>
+          A guiding idea is that the guest application itself can be run as <code>root</code> without compromising
+          the host.
+        </p>
+      </Panel>
+
+      <Panel id="installation" title="Installation" class="lg:col-span-3">
+        <div class="grid gap-3 lg:grid-cols-2">
+          <Code title="With flakes" lang="nix" code={withFlakes} />
+          <Code title="Without flakes" lang="nix" code={withoutFlakes} />
+        </div>
+      </Panel>
+
+      <Panel id="architecture" title="Architecture" class="tui-prose lg:col-span-3">
+        <p>
+          The architecture of sodabox tries to keep the trusted computing base (TCB) as minimal as possible.
+          Instead of trying to lock in applications using namespaces, seccomp, landlocks etc. it creates
+          a dedicated virtual machine around the Kernel-based Virtual Machine (KVM) using{" "}
+          <a href="https://www.cloudhypervisor.org/">Cloud Hypervisor</a>.
+          Cloud Hypervisor has been chosen as it is written in the Rust language. It only has a limited amount
+          of device options, does not support emulation and in general does not have much legacy debt.
+          For networking, each VM gets its own <a href="https://passt.top/passt/about/">passt</a> instance.
+          The hypervisor together with the passt instance is executed in a dedicated user networking namespace
+          from which traffic is routed out using <code>TPROXY</code> nftables commands to a final proxy (again, per VM)
+          running in the host. This combination makes sodabox a 100% user-space solution without needing
+          to modify the host (no tun/tap interfaces, <code>CAP_NET_ADMIN</code>, custom firewall chains)!
+        </p>
+        <img
+          src={architecture.src}
+          width={architecture.width}
+          height={architecture.height}
+          alt="sodabox architecture"
+          loading="lazy"
+          class="mt-4 h-auto w-full"
+        />
+      </Panel>
+
+      <Panel title="Influences">
+        <ul class="space-y-0.5">
+          {influences.map((u) => <li class="truncate"><a href={u}>{u.replace("https://", "")}</a></li>)}
+        </ul>
+      </Panel>
+
+      <Panel title="Transparency">
+        <p>Built mostly using agents. Human facing content (documentation, TUI) was edited by an human.</p>
+      </Panel>
+
+      <Panel title="License">
+        <p>MIT</p>
+      </Panel>
+    </main>
+
+    <script>
+      // Highlight the tab of the panel in view, and jump with number keys like the TUI.
+      const tabs = [...document.querySelectorAll<HTMLAnchorElement>("[data-tab]")];
+      const byId = new Map(tabs.map((t) => [t.dataset.tab!, t]));
+      const setActive = (id: string | null) =>
+        tabs.forEach((t) => t.toggleAttribute("data-active", t.dataset.tab === id));
+
+      // Active = last section whose top has passed a line just below the sticky header.
+      // This matches where anchor jumps land (scroll-padding-top), even for short panels.
+      const sections = [...byId.keys()]
+        .map((id) => document.getElementById(id))
+        .filter((el): el is HTMLElement => el !== null);
+      // A jump (tab click, number key, #hash on load) pins its tab until the user scrolls
+      // by hand; near the page end the target may not reach the line at all.
+      let pinned: string | null = byId.has(location.hash.slice(1)) ? location.hash.slice(1) : null;
+      const unpin = () => {
+        if (pinned === null) return;
+        pinned = null;
+        schedule();
+      };
+      for (const ev of ["wheel", "touchmove", "mousedown"]) addEventListener(ev, unpin, { passive: true });
+      addEventListener("keydown", (e) => {
+        if (!byId.has(tabs[Number(e.key) - 1]?.dataset.tab ?? "")) unpin();
+      });
+      for (const t of tabs) t.addEventListener("click", () => ((pinned = t.dataset.tab!), setActive(pinned)));
+
+      const update = () => {
+        if (pinned !== null) return setActive(pinned);
+        const line = document.querySelector("header")!.getBoundingClientRect().bottom + 32;
+        let active: string | null = null;
+        for (const s of sections) if (s.getBoundingClientRect().top <= line) active = s.id;
+        // at the very bottom the last section may never reach the line
+        if (innerHeight + scrollY >= document.documentElement.scrollHeight - 2) active = sections.at(-1)?.id ?? active;
+        setActive(active);
+      };
+      let queued = false;
+      const schedule = () => {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(() => {
+          queued = false;
+          update();
+        });
+      };
+      addEventListener("scroll", schedule, { passive: true });
+      addEventListener("resize", schedule);
+      update();
+
+      document.addEventListener("keydown", (e) => {
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.target instanceof HTMLElement && e.target.closest("input, textarea, [contenteditable]")) return;
+        const tab = tabs[Number(e.key) - 1];
+        if (tab) {
+          e.preventDefault();
+          pinned = tab.dataset.tab!;
+          setActive(pinned);
+          document.getElementById(tab.dataset.tab!)?.scrollIntoView({ behavior: "smooth" });
+          history.replaceState(null, "", `#${tab.dataset.tab}`);
+        }
+      });
+    </script>
+</Base>

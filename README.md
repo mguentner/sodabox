@@ -1,10 +1,10 @@
 # sodabox
 
-![sodabox](./assets/readme_header.png)
+![sodabox](./website/src/assets/readme_header.png)
 
 microVMs for agents, analyses and experiments powered by NixOS
 
-![sodabox tui](./assets/tui.gif)
+![sodabox tui](./website/src/assets/tui.gif)
 
 - run multiple VMs on a single host
 - fully filtered traffic egress using policies and profiles
@@ -30,6 +30,7 @@ the host.
 
 ## Requirements
 
+* Linux only, WSL might work
 * KVM enabled, available to your user (part of group `kvm`)
 * Nix daemon installed
 * User + Network Namespaces enabled
@@ -88,7 +89,7 @@ from which traffic is routed out using `TPROXY` nftables commands to a final pro
 running in the host. This combination makes sodabox a 100% user-space solution without needing
 to modify the host (no tun/tap interfaces, `CAP_NET_ADMIN`, custom firewall chains)!
 
-![sodabox architecture](./assets/architecture.png)
+![sodabox architecture](./website/src/assets/architecture.png)
 
 ## Usage
 
@@ -167,7 +168,7 @@ Afterwards, ssh into the VM: `soda ssh examplevm`. The command automatically add
 the correct ssh identity. Inside the VM, try `curl https://example.com`. You will
 see the egress attempts in the TUI. It also allows you to `allow` or `deny` them.
 
-![sodabox](./assets/tui_empty.png)
+![sodabox](./website/src/assets/tui_empty.png)
 
 ### Stopping a VM
 
