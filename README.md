@@ -15,6 +15,9 @@ microVMs for agents, analyses and experiments powered by NixOS
 - disk, memory and CPU cores are configurable
 - user-space only, no need to change system configuration!
 
+
+*There are [many sandboxes](https://pleasedonotescape.com/). But this one is [mine](https://mguentner.de).*
+
 ## Threat model
 
 sodabox is created for coding agents but can be used to execute arbitrary untrusted applications.
