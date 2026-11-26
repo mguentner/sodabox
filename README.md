@@ -377,6 +377,9 @@ You can also copy individual files:
 $ soda cp README.md examplevm:/tmp/.
 ```
 
+Pay attention when using `rsync` to sync a `git` repository it may contain
+hostile [git hooks](https://git-scm.com/book/en/v2/Customizing-Git-Git-Hooks).
+
 ### git
 
 The best way to handle multiple versions of your project folder is to use native git.
