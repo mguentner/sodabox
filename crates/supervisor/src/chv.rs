@@ -182,7 +182,9 @@ impl GuestBoot {
         // profile. Pin a static one (some Intel i7) once
         // https://github.com/cloud-hypervisor/cloud-hypervisor/issues/7068 lands.
         a.push("--cpus".into());
-        a.push(format!("boot={}", self.cpus).into());
+        // enable nested virtualization after cloud-hypervisor disabled it in v54.0:
+        // https://github.com/cloud-hypervisor/cloud-hypervisor/pull/9045
+        a.push(format!("boot={},nested=on", self.cpus).into());
 
         // shared=on is required for the vhost-user net backend (passt).
         a.push("--memory".into());
@@ -354,7 +356,7 @@ mod tests {
     #[test]
     fn cpus_and_cmdline_and_console() {
         let a = args_str(&sample());
-        assert_eq!(value_after(&a, "--cpus"), "boot=2");
+        assert_eq!(value_after(&a, "--cpus"), "boot=2,nested=on");
         assert_eq!(
             value_after(&a, "--cmdline"),
             "console=ttyS0 root=fstab loglevel=4 init=/nix/store/top/init"
